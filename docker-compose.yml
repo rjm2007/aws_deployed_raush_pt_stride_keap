@@ -1,0 +1,42 @@
+services:
+  api:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MOCK_BASE_URL: http://mock-provider:9000
+    command: uvicorn rpt_agent.api:app --host 0.0.0.0 --port 8000
+    ports: ["${API_PORT:-8000}:8000"]
+    volumes:
+      - ./src:/app/src
+      - ./logs:/app/logs
+      - ./supabase:/app/supabase:ro
+  worker:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MOCK_BASE_URL: http://mock-provider:9000
+    command: rpt-worker
+    volumes:
+      - ./src:/app/src
+      - ./logs:/app/logs
+  mock-provider:
+    profiles: ["mock"]
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    command: uvicorn rpt_agent.mock_server:app --host 0.0.0.0 --port 9000 --reload
+    ports: ["${MOCK_PORT:-9000}:9000"]
+    volumes:
+      - ./src:/app/src
+      - ./fixtures:/app/fixtures:ro
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 3s
+      timeout: 2s
+      retries: 10

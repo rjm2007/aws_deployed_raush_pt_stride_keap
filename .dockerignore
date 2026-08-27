@@ -1,0 +1,36 @@
+# Keep credentials and local state out of the build context entirely.
+# Runtime config is supplied by env_file at container start, never baked in.
+.env
+.env.*
+*.pem
+*.ppk
+*.key
+*.crt
+*.p12
+*.pfx
+secrets.*
+
+.git
+.github
+.claude
+.vscode
+.idea
+
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+
+logs
+dist
+build
+*.egg-info
+
+refrences_git_clone
+scratch
+docker-compose.override.yml

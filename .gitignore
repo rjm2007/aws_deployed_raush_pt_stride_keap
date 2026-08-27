@@ -1,0 +1,68 @@
+# ---- Secrets: never commit -------------------------------------------
+# Real credentials live only in .env on the server.
+.env
+.env.*
+!.env.example
+
+# SSH / TLS material. Covers the EC2 key pair if it ever lands in here.
+*.pem
+*.ppk
+*.key
+*.crt
+*.csr
+*.der
+*.p12
+*.pfx
+*.jks
+secrets.*
+credentials.*
+
+# ---- Python ----------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+
+# ---- Tooling caches --------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.cover
+
+# ---- Runtime output --------------------------------------------------
+# Worker/API JSONL logs are bind-mounted from the host at ./logs.
+logs/
+*.log
+*.sqlite3
+*.db
+
+# ---- Docker / Caddy local state --------------------------------------
+docker-compose.override.yml
+caddy_data/
+caddy_config/
+
+# ---- Editors, tooling, OS -------------------------------------------
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# ---- Local-only scratch ---------------------------------------------
+refrences_git_clone/
+scratch/

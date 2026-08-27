@@ -1,0 +1,5 @@
+# Replace with the subdomain you point at this EC2 instance.
+# Caddy obtains and renews the TLS certificate automatically.
+stride.aibolt.ai {
+    reverse_proxy api:8000
+}

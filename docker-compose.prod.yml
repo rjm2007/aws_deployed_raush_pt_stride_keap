@@ -1,0 +1,42 @@
+# Production stack. Run with:
+#   docker compose -f docker-compose.prod.yml up -d --build
+# The dev docker-compose.yml stays for local work (mock provider, source mounts).
+services:
+  api:
+    build: .
+    container_name: stride-api
+    restart: unless-stopped
+    env_file: .env
+    expose:
+      - "8000"
+    volumes:
+      - ./logs:/app/logs
+
+  # Exactly one worker: the rate governors are process-local.
+  worker:
+    build: .
+    container_name: stride-worker
+    restart: unless-stopped
+    env_file: .env
+    command: rpt-worker
+    volumes:
+      - ./logs:/app/logs
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: stride-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+volumes:
+  caddy_data:
+  caddy_config:
