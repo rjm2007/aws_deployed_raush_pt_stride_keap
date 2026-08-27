@@ -6,8 +6,17 @@ import hmac
 import time
 
 from fastapi import HTTPException, Request
+from fastapi.security import APIKeyHeader
 
 from .config import get_settings
+
+# Documentation only: makes Swagger's Authorize button send the header that
+# require_vapi_auth() checks. auto_error=False so it never enforces on its own.
+vapi_secret_scheme = APIKeyHeader(
+    name="x-vapi-secret",
+    auto_error=False,
+    description="Paste VAPI_WEBHOOK_SECRET to use Try it out.",
+)
 
 
 async def require_vapi_auth(request: Request) -> None:

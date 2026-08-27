@@ -1,9 +1,11 @@
 import re
 from datetime import date
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
+from ..api_schemas import CheckAvailabilityBody, documented_body
 from ..providers import ProviderError
+from ..security import vapi_secret_scheme
 from ..services.booking import BookingService
 from ..vapi_contract import direct_tool_response
 from .tool_request import authenticated_tool_request
@@ -11,7 +13,17 @@ from .tool_request import authenticated_tool_request
 router = APIRouter(prefix="/api/v1/tools", tags=["availability"])
 
 
-@router.post("/check-availability")
+@router.post(
+    "/check-availability",
+    summary="Check open appointment slots in Stride",
+    description=(
+        "Reads live Stride availability for the lead's practice. Read-only - it creates "
+        "nothing and contacts nobody. Omit `date` for the next openings, or give a date "
+        "(and optionally a time) to check one day."
+    ),
+    dependencies=[Depends(vapi_secret_scheme)],
+    openapi_extra=documented_body(CheckAvailabilityBody),
+)
 async def check_availability(request: Request):
     trace = None
     tool_call_id = None

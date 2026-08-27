@@ -1,7 +1,9 @@
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
+from ..api_schemas import UpdateLeadStatusBody, documented_body
+from ..security import vapi_secret_scheme
 from ..services.lead_status import report_lead_status
 from ..vapi_contract import direct_tool_response
 from .tool_request import authenticated_tool_request
@@ -9,7 +11,17 @@ from .tool_request import authenticated_tool_request
 router = APIRouter(prefix="/api/v1/webhooks/vapi", tags=["leads"])
 
 
-@router.post("/lead-status")
+@router.post(
+    "/lead-status",
+    summary="Record the outcome of a call on the lead",
+    description=(
+        "**Changes lead state.** Writes the call outcome, advances or stops the cadence, "
+        "and is idempotent per call id and status. `booked` is refused unless a confirmed "
+        "appointment exists."
+    ),
+    dependencies=[Depends(vapi_secret_scheme)],
+    openapi_extra=documented_body(UpdateLeadStatusBody),
+)
 async def lead_status(request: Request):
     trace = None
     tool_call_id = None

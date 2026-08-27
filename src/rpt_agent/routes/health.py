@@ -7,12 +7,12 @@ from ..db import transaction
 router = APIRouter(tags=["system"])
 
 
-@router.get("/health")
+@router.get("/health", summary="Liveness check")
 def health():
     return {"status": "ok", "service": "rpt-agent-api"}
 
 
-@router.get("/ready")
+@router.get("/ready", include_in_schema=False)
 def ready():
     errors = get_settings().runtime_errors("api")
     if not errors:

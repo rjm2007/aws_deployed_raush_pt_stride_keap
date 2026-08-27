@@ -16,7 +16,7 @@ from ..services.lead_status import explicit_opt_out
 router = APIRouter(prefix="/api/v1/twilio", tags=["twilio"])
 
 
-@router.post("/inbound-sms")
+@router.post("/inbound-sms", include_in_schema=False)
 async def twilio_inbound_sms(request: Request):
     trace = WorkflowTrace("twilio_inbound_sms", "api", trace_id_var.get())
     form_data = {str(k): str(v) for k, v in (await request.form()).items()}
@@ -55,7 +55,7 @@ async def twilio_inbound_sms(request: Request):
     return JSONResponse({"ok": True})
 
 
-@router.post("/message-status")
+@router.post("/message-status", include_in_schema=False)
 async def twilio_message_status(request: Request):
     trace = WorkflowTrace("twilio_message_status", "api", trace_id_var.get())
     form_data = {str(k): str(v) for k, v in (await request.form()).items()}

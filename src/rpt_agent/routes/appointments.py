@@ -1,9 +1,11 @@
 import re
 from datetime import date
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
+from ..api_schemas import CreateAppointmentBody, documented_body
 from ..providers import ProviderError
+from ..security import vapi_secret_scheme
 from ..services.booking import BookingService
 from ..vapi_contract import direct_tool_response
 from .tool_request import authenticated_tool_request
@@ -29,7 +31,18 @@ def _booking_message(result: dict) -> str:
     return "Stride did not accept that booking. Would you like staff to follow up?"
 
 
-@router.post("/create-appointment")
+@router.post(
+    "/create-appointment",
+    summary="Book a real Stride appointment",
+    description=(
+        "**Creates real records.** Books the slot in Stride, creating the patient and case "
+        "if needed, writes the local copy, and queues a confirmation SMS. The time must be "
+        "one returned by check-availability. Re-sending the same booking is safe - it "
+        "reports the existing appointment instead of double-booking."
+    ),
+    dependencies=[Depends(vapi_secret_scheme)],
+    openapi_extra=documented_body(CreateAppointmentBody),
+)
 async def create_appointment(request: Request):
     trace = None
     tool_call_id = None

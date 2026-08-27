@@ -14,10 +14,35 @@ from .routes import (
 
 configure_logging("api")
 
+DESCRIPTION = """
+Patient outreach and live Stride booking for Rausch Physical Therapy.
+
+**Authentication.** The three tool endpoints need the Vapi shared secret. Click
+**Authorize**, paste `VAPI_WEBHOOK_SECRET`, and Try it out will send it. `Authorization:
+Bearer <secret>` works too.
+
+**Dual format.** Every endpoint accepts either the flat JSON shown here or the Vapi
+tool-call envelope, so the same URL serves both Swagger and the voice agent.
+
+**Live providers.** Stride, Vapi and Twilio are in real mode. `check-availability` is
+read-only; `create-appointment` books a real appointment and queues an SMS.
+
+Provider callbacks (Twilio and Vapi webhooks) are authenticated by request signature and
+are deliberately not listed here - they cannot be exercised from this page.
+"""
+
+TAGS = [
+    {"name": "availability", "description": "Read live Stride openings. Safe."},
+    {"name": "appointments", "description": "Create a real Stride appointment."},
+    {"name": "leads", "description": "Record what happened on a call."},
+    {"name": "system", "description": "Health checks."},
+]
+
 app = FastAPI(
     title="RPT Agent API",
-    description="Pre-production outreach, live Stride booking, and provider webhook API.",
+    description=DESCRIPTION,
     version="1.0.0-rc1",
+    openapi_tags=TAGS,
 )
 app.include_router(health_router)
 app.include_router(availability_router)

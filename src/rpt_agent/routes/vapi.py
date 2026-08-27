@@ -17,7 +17,7 @@ from ..vapi_contract import parse_tool_calls, tool_error, tool_success
 router = APIRouter(prefix="/api/v1/vapi", tags=["vapi"])
 
 
-@router.post("/tools")
+@router.post("/tools", include_in_schema=False)
 async def vapi_tools(request: Request):
     trace = WorkflowTrace("vapi_tools", "api", trace_id_var.get())
     try:
@@ -100,7 +100,7 @@ async def vapi_tools(request: Request):
         raise HTTPException(status_code=400, detail="invalid tool request") from exc
 
 
-@router.post("/webhook")
+@router.post("/webhook", include_in_schema=False)
 async def vapi_webhook(request: Request):
     trace = WorkflowTrace("vapi_webhook", "api", trace_id_var.get())
     try:
