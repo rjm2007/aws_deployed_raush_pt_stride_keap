@@ -222,13 +222,55 @@ def dashboard_snapshot(actor: Actor):
             "select (select count(*) from provider_events where processed_at is null) as provider_queue,"
             "(select count(*) from integration_outbox where status in ('pending','sending')) as handoff_queue,"
             "(select count(*) from outreach_events where status='unknown') as unknown_events,"
-            "(select count(*) from leads where needs_review) as review_queue"
+            "(select count(*) from leads where needs_review) as review_queue,"
+            # Real counters for the analytics page. These replaced hardcoded
+            # figures, so every number shown must come from a row somewhere.
+            # Delivery must come from sms_messages: an outreach_event marked
+            # 'delivered' only means the worker handed the message to Twilio,
+            # not that the patient received it.
+            "(select count(*) from sms_messages where direction='outbound') as messages_sent,"
+            "(select count(*) from sms_messages where direction='outbound' "
+            "and delivery_status='delivered') as messages_delivered,"
+            "(select count(*) from sms_messages where direction='outbound' "
+            "and delivery_status in ('failed','undelivered')) as messages_failed,"
+            "(select count(*) from outreach_events where channel='call' and status='delivered') "
+            "as calls_completed,"
+            "(select count(*) from outreach_events where channel='call' and executed_at is not null) "
+            "as calls_attempted,"
+            "(select count(*) from outreach_events where channel='call' and outcome in "
+            "('booked','not_interested','callback','transferred')) as calls_reached"
         ).fetchone()
 
     counts = {"new": 0, "cadence": 0, "attention": 0, "booked": 0, "closed": 0}
     for lead in leads:
         counts[lead["stage"]] += 1
     settings = get_settings()
+    total_leads = len(leads)
+
+    def _rate(part: int, whole: int) -> float | None:
+        # None, not zero: "no data yet" and "zero percent" are different answers.
+        return round(part / whole * 100, 1) if whole else None
+
+    # .get keeps the payload well-formed if a counter is ever missing, rather
+    # than failing the whole snapshot for the sake of one tile.
+    def _count(name: str) -> int:
+        return int(system.get(name) or 0)
+
+    metrics = {
+        "total_leads": total_leads,
+        "messages_sent": _count("messages_sent"),
+        "messages_delivered": _count("messages_delivered"),
+        "messages_failed": _count("messages_failed"),
+        "messages_pending": max(
+            _count("messages_sent") - _count("messages_delivered") - _count("messages_failed"), 0
+        ),
+        "messages_delivery_rate": _rate(_count("messages_delivered"), _count("messages_sent")),
+        "calls_completed": _count("calls_completed"),
+        "calls_completion_rate": _rate(_count("calls_completed"), _count("calls_attempted")),
+        "calls_reached_rate": _rate(_count("calls_reached"), _count("calls_attempted")),
+        "review_rate": _rate(_count("review_queue"), total_leads),
+        "booked_rate": _rate(counts["booked"], total_leads),
+    }
     return {
         "generated_at": datetime.now(UTC),
         "counts": counts,
@@ -243,6 +285,7 @@ def dashboard_snapshot(actor: Actor):
             {"name": "Keap", "mode": settings.mode("keap"), "status": "configured", "balance": None},
         ],
         "system": system,
+        "metrics": metrics,
     }
 
 

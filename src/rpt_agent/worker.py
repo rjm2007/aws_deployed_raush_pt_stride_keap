@@ -359,10 +359,21 @@ def run_safety_checks(trace: WorkflowTrace) -> dict[str, int]:
     return counts
 
 
+# The sweeper only looks for work older than two hours, so running it on every
+# poll costs a round trip to the database for nothing. Once every ten minutes
+# still settles a stalled call long before anyone notices it.
+SAFETY_CHECK_INTERVAL_SECONDS = 600
+_last_safety_check = 0.0
+
+
 def run_tick() -> dict[str, int]:
+    global _last_safety_check
     trace = WorkflowTrace("worker_tick", "worker", uuid4().hex)
     providers = ProviderClients()
-    run_safety_checks(trace)
+    now = time.monotonic()
+    if now - _last_safety_check >= SAFETY_CHECK_INTERVAL_SECONDS:
+        _last_safety_check = now
+        run_safety_checks(trace)
     reprocess_failed_vapi_events(trace)
     reprocess_failed_twilio_events(trace)
     jobs = claim_jobs(trace)
