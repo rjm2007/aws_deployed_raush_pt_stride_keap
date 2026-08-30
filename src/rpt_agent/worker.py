@@ -300,8 +300,11 @@ def run_safety_checks(trace: WorkflowTrace) -> dict[str, int]:
                 ("ambiguous provider dispatch; do not retry", row["lead_id"]),
             )
         for row in orphaned:
+            # A lead whose cadence already ended has nothing left to act on, so
+            # settling its stale event must not drag it back into the review queue.
             conn.execute(
-                "update leads set needs_review=true,review_reason=%s,review_flagged_at=now() where id=%s",
+                "update leads set needs_review=true,review_reason=%s,review_flagged_at=now() "
+                "where id=%s and cadence_state not in ('completed','terminated')",
                 ("call outcome not reported", row["lead_id"]),
             )
             if row["vapi_call_id"]:
