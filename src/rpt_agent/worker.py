@@ -154,8 +154,14 @@ with due as (
  and (oe.channel<>'call' or coalesce(l.line_type,'unknown')<>'mobile' or l.consent_captured_at is not null)
  and not exists(select 1 from suppressed_numbers s where s.phone_e164=l.phone_e164)
  and ((%(test_mode)s and l.is_test) or (
-   (now() at time zone coalesce(l.timezone,p.timezone))::time >= time '08:00'
-   and (now() at time zone coalesce(l.timezone,p.timezone))::time < time '21:00'
+   -- practice_settings.business_hours is the single source of truth for when we may
+   -- contact anyone. A day whose key is JSON null (weekends here) is closed, so
+   -- jsonb_typeof rather than IS NOT NULL is what excludes it.
+   jsonb_typeof(ps.business_hours -> to_char(now() at time zone coalesce(l.timezone,p.timezone),'ID')) = 'object'
+   and (now() at time zone coalesce(l.timezone,p.timezone))::time
+       >= ((ps.business_hours -> to_char(now() at time zone coalesce(l.timezone,p.timezone),'ID')) ->> 'open')::time
+   and (now() at time zone coalesce(l.timezone,p.timezone))::time
+       < ((ps.business_hours -> to_char(now() at time zone coalesce(l.timezone,p.timezone),'ID')) ->> 'close')::time
  ))
  and ((%(test_mode)s and l.is_test) or (
    oe.channel<>'call' or (
@@ -195,10 +201,13 @@ def claim_jobs(trace: WorkflowTrace, limit: int = 20) -> list[Job]:
         for row in rows:
             context = conn.execute(
                 "select l.full_name,l.phone_e164,ps.vapi_assistant_id,ps.vapi_phone_number_id,"
-                "ps.booking_link_url,l.date_of_birth,ps.stride_case_title,ps.stride_location_id,mt.body "
+                "ps.booking_link_url,l.date_of_birth,ps.stride_case_title,ps.stride_location_id,"
+                "coalesce(lmo.body,mt.body) as body "
                 "from leads l "
                 "join practice_settings ps on ps.practice_id=l.practice_id "
-                "left join message_templates mt on mt.cadence_step_id=%s and mt.is_active where l.id=%s limit 1",
+                "left join message_templates mt on mt.cadence_step_id=%s and mt.is_active "
+                "left join lead_message_overrides lmo on lmo.lead_id=l.id "
+                "and lmo.message_template_id=mt.id where l.id=%s limit 1",
                 (row["cadence_step_id"], row["lead_id"]),
             ).fetchone()
             jobs.append(Job(
@@ -234,6 +243,9 @@ def dispatch_job(trace: WorkflowTrace, job: Job, providers: ProviderClients) -> 
             ref = providers.create_vapi_call(child, {
                 "assistantId": job.vapi_assistant_id, "phoneNumberId": job.vapi_phone_number_id,
                 "customer": {"number": job.phone}, "assistantOverrides": {"variableValues": {
+                    # Vapi variable names are case-sensitive: the assistant prompt reads
+                    # Patient_name and call_attempt, so both spellings are sent.
+                    "Patient_name": job.name, "call_attempt": str(job.attempt_no),
                     "lead_id": job.lead_id, "outreach_event_id": str(job.event_id), "patient_name": job.name,
                     "booking_link": job.booking_link_url or "", "day_offset": job.day_offset,
                     "date_of_birth": job.date_of_birth.isoformat() if job.date_of_birth else "",

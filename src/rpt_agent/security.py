@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import time
+from dataclasses import dataclass
 
 from fastapi import HTTPException, Request
 from fastapi.security import APIKeyHeader
@@ -17,6 +18,27 @@ vapi_secret_scheme = APIKeyHeader(
     auto_error=False,
     description="Paste VAPI_WEBHOOK_SECRET to use Try it out.",
 )
+
+
+@dataclass(frozen=True)
+class DashboardActor:
+    user_id: str
+    email: str
+
+
+def require_dashboard_auth(request: Request) -> DashboardActor:
+    settings = get_settings()
+    expected = settings.dashboard_api_token
+    supplied = request.headers.get("x-dashboard-token", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="dashboard API is not configured")
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="invalid dashboard credentials")
+    user_id = request.headers.get("x-dashboard-user-id", "").strip()
+    email = request.headers.get("x-dashboard-user-email", "").strip().lower()
+    if not user_id or not email or len(user_id) > 200 or len(email) > 320:
+        raise HTTPException(status_code=401, detail="authenticated dashboard user is required")
+    return DashboardActor(user_id=user_id, email=email)
 
 
 async def require_vapi_auth(request: Request) -> None:

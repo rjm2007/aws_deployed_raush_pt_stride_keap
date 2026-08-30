@@ -32,6 +32,8 @@ async def lead_status(request: Request):
         status = parsed.arguments.get("status") or parsed.arguments.get("outcome")
         if not lead_id or not status:
             raise ValueError("lead_id and status are required.")
+        # The voice tool reports callback timing as type + delay/ISO rather than one
+        # absolute stamp; the service resolves it against the practice timezone.
         callback_value = parsed.arguments.get("callback_requested_at")
         callback_at = datetime.fromisoformat(str(callback_value)) if callback_value else None
         event_value = parsed.arguments.get("outreach_event_id")
@@ -43,8 +45,16 @@ async def lead_status(request: Request):
                 str(parsed.arguments["call_id"]) if parsed.arguments.get("call_id") else None
             ),
             event_id=int(event_value) if event_value not in (None, "") else None,
-            notes=str(parsed.arguments.get("notes") or parsed.arguments.get("callback_notes") or ""),
+            notes=str(
+                parsed.arguments.get("notes")
+                or parsed.arguments.get("summary")
+                or parsed.arguments.get("callback_notes")
+                or ""
+            ),
             callback_requested_at=callback_at,
+            callback_type=parsed.arguments.get("callback_type"),
+            delay_minutes=parsed.arguments.get("delay_minutes"),
+            callback_datetime_iso=parsed.arguments.get("callback_datetime_iso"),
         )
         trace.complete(outcome=result)
         message = (

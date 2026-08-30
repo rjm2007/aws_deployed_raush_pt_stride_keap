@@ -61,8 +61,17 @@ def process_pending_integrations(
                 link = (row["payload"] or {}).get("booking_link_url", "")
                 if not link:
                     raise ValueError("booking link notification has no URL")
+                # Wording carried over from the approved outreach copy patients
+                # already receive; the STOP line is required and is our addition.
                 body = (
-                    f"{greeting}schedule your Rausch PT evaluation here: {link}. "
+                    f"Hi {row['first_name'] or 'there'},\n\n"
+                    "We're excited to help you get started on your wellness journey with "
+                    "Rausch PT & Wellness. You can schedule your first physical therapy "
+                    f"session anytime using this link:\n\n{link}\n\n"
+                    "If you have any trouble scheduling, have questions about which service "
+                    "to choose, or don't see a time that works for you, please call us at "
+                    "949-276-5401 and our team will be happy to help.\n\n"
+                    "Kind regards,\nThe Rausch PT & Wellness Team\n\n"
                     "Reply STOP to opt out."
                 )
             else:
@@ -203,6 +212,89 @@ def process_pending_integrations(
     return counts
 
 
+def _structured_outcome(message: dict) -> dict | None:
+    """Read the assistant's post-call structured output, if it produced one.
+
+    This is the backup for a call where the tool never fired: Vapi derives the
+    same fields from the transcript, so a promised callback is still recoverable.
+    """
+    artifact = message.get("artifact") if isinstance(message.get("artifact"), dict) else {}
+    outputs = artifact.get("structuredOutputs")
+    if not isinstance(outputs, dict):
+        return None
+    for entry in outputs.values():
+        result = entry.get("result") if isinstance(entry, dict) else None
+        if isinstance(result, dict) and result.get("status"):
+            return result
+    return None
+
+
+def _call_text_artifacts(message: dict) -> tuple[str | None, str | None]:
+    artifact = message.get("artifact") if isinstance(message.get("artifact"), dict) else {}
+    analysis = message.get("analysis") if isinstance(message.get("analysis"), dict) else {}
+    transcript = artifact.get("transcript")
+    summary = analysis.get("summary")
+    return (
+        transcript[:100_000] if isinstance(transcript, str) else None,
+        summary[:10_000] if isinstance(summary, str) else None,
+    )
+
+
+def _settle_from_structured_output(
+    trace: WorkflowTrace, message: dict, *, lead_id: str, event_id: int, call_id: str
+) -> str | None:
+    """Apply the post-call structured output, or flag the call for staff.
+
+    Never overwrites a tool result: the caller only reaches this when the event
+    is still unsettled. Returns the outreach outcome, or None if nothing applied.
+    """
+    from .lead_status import report_lead_status  # local: lead_status imports nothing here
+
+    result = _structured_outcome(message)
+    if not result:
+        with transaction() as conn:
+            conn.execute(
+                "update outreach_events set status='delivered',settled_at=now(),"
+                "settled_by='webhook',outcome='manual',failure_reason=%s,updated_at=now() "
+                "where id=%s and status in ('in_flight','attempted')",
+                ("call was answered but no outcome was reported", event_id),
+            )
+            conn.execute(
+                "update leads set needs_review=true,review_reason=%s,review_flagged_at=now() "
+                "where id=%s and needs_review is not true",
+                ("call answered but no outcome reported; see transcript", lead_id),
+            )
+        trace.log("state_transition_applied", transition="fallback_review", event_id=event_id)
+        return "manual"
+    try:
+        report_lead_status(
+            trace,
+            lead_id=lead_id,
+            status=str(result.get("status") or ""),
+            call_id=call_id,
+            event_id=event_id,
+            notes=str(result.get("summary") or ""),
+            callback_type=result.get("callback_type"),
+            delay_minutes=result.get("delay_minutes"),
+            callback_datetime_iso=result.get("callback_datetime_iso"),
+        )
+    except (TypeError, ValueError) as exc:
+        with transaction() as conn:
+            conn.execute(
+                "update leads set needs_review=true,review_reason=%s,review_flagged_at=now() "
+                "where id=%s",
+                (f"structured outcome could not be applied: {exc}"[:500], lead_id),
+            )
+        trace.log("validation_failed", reason="structured_output_rejected")
+        return None
+    with transaction() as conn:
+        row = conn.execute(
+            "select outcome from outreach_events where id=%s", (event_id,)
+        ).fetchone()
+    trace.log("state_transition_applied", transition="fallback_structured", event_id=event_id)
+    return row["outcome"] if row else None
+
+
 def process_vapi_end_report(trace: WorkflowTrace, body: dict) -> str:
     """Settle one durable Vapi end report and persist its call log idempotently."""
     message = body.get("message") if isinstance(body, dict) else {}
@@ -213,6 +305,7 @@ def process_vapi_end_report(trace: WorkflowTrace, body: dict) -> str:
     event_id = context.get("outreach_event_id")
     call_id = str(call.get("id") or body.get("id") or "")
     ended = str(message.get("endedReason") or call.get("endedReason") or "")
+    transcript, summary = _call_text_artifacts(message)
     if not lead_id or not event_id or not call_id:
         raise ValueError("webhook cannot be associated with a lead, event, and call")
     mapped_outcome = outcome_from_ended_reason(ended)
@@ -228,7 +321,11 @@ def process_vapi_end_report(trace: WorkflowTrace, body: dict) -> str:
         if event["status"] == "delivered" and event["outcome"]:
             outcome = event["outcome"]
         elif event["status"] in {"in_flight", "attempted"}:
-            outcome = None
+            # The tool never reported. Fall back to the structured output so a
+            # callback the patient was promised is not silently lost.
+            outcome = _settle_from_structured_output(
+                trace, message, lead_id=lead_id, event_id=int(event_id), call_id=call_id
+            )
         else:
             raise ValueError("answered call report cannot settle this outreach event")
     else:
@@ -242,9 +339,12 @@ def process_vapi_end_report(trace: WorkflowTrace, body: dict) -> str:
     with transaction() as conn:
         conn.execute(
             "insert into call_logs(outreach_event_id,lead_id,vapi_call_id,dialed_at,ended_at,"
-            "answer_state,ended_reason,outcome_source) values(%s,%s,%s,coalesce(%s::timestamptz,now()),"
-            "%s::timestamptz,%s,%s,%s) on conflict(vapi_call_id) do update set "
-            "outcome_source=coalesce(call_logs.outcome_source,excluded.outcome_source)",
+            "answer_state,ended_reason,outcome_source,transcript_text,summary_text) "
+            "values(%s,%s,%s,coalesce(%s::timestamptz,now()),%s::timestamptz,%s,%s,%s,%s,%s) "
+            "on conflict(vapi_call_id) do update set "
+            "outcome_source=coalesce(call_logs.outcome_source,excluded.outcome_source),"
+            "transcript_text=coalesce(excluded.transcript_text,call_logs.transcript_text),"
+            "summary_text=coalesce(excluded.summary_text,call_logs.summary_text)",
             (
                 int(event_id),
                 lead_id,
@@ -256,6 +356,8 @@ def process_vapi_end_report(trace: WorkflowTrace, body: dict) -> str:
                 "tool"
                 if outcome and mapped_outcome == "manual"
                 else ("webhook" if outcome else None),
+                transcript,
+                summary,
             ),
         )
         conn.execute(

@@ -6,6 +6,7 @@ from .observability import configure_logging, trace_id_var
 from .routes import (
     appointments_router,
     availability_router,
+    dashboard_router,
     health_router,
     leads_router,
     twilio_router,
@@ -46,6 +47,7 @@ app = FastAPI(
 )
 app.include_router(health_router)
 app.include_router(availability_router)
+app.include_router(dashboard_router)
 app.include_router(appointments_router)
 app.include_router(leads_router)
 app.include_router(vapi_router)

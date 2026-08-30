@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     mock_base_url: str = "http://localhost:9000"
     api_base_url: str = "http://localhost:8000"
     public_base_url: str = ""
+    dashboard_api_token: str = ""
     vapi_base_url: str = "https://api.vapi.ai"
     vapi_api_key: str = ""
     vapi_assistant_id: str = ""
@@ -108,6 +109,8 @@ class Settings(BaseSettings):
                 errors.append("SUPABASE_DB_URL must set sslmode=require or verify-full")
             if self.public_base_url and not self.public_base_url.startswith("https://"):
                 errors.append("PUBLIC_BASE_URL must use HTTPS")
+            if service == "api" and len(self.dashboard_api_token) < 32:
+                errors.append("DASHBOARD_API_TOKEN must contain at least 32 characters")
             if "your-ngrok-domain" in self.public_base_url:
                 errors.append("PUBLIC_BASE_URL still contains the example hostname")
             if self.mode("vapi") == "real" and self.vapi_webhook_secret == "local-vapi-secret":

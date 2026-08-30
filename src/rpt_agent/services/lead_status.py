@@ -2,9 +2,107 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
 
 from ..db import transaction
 from ..observability import WorkflowTrace
+
+CALLBACK_MIN_MINUTES = 5
+CALLBACK_MAX_MINUTES = 240
+
+
+def _practice_clock(conn, lead_id: str) -> tuple[ZoneInfo, dict, list]:
+    row = conn.execute(
+        "select coalesce(l.timezone,p.timezone) as tz,ps.business_hours,ps.holidays "
+        "from leads l join practices p on p.id=l.practice_id "
+        "join practice_settings ps on ps.practice_id=l.practice_id where l.id=%s",
+        (lead_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError("lead not found")
+    return ZoneInfo(row["tz"] or "America/Los_Angeles"), row["business_hours"] or {}, row["holidays"] or []
+
+
+def resolve_callback_time(
+    tz: ZoneInfo,
+    *,
+    callback_requested_at: datetime | None,
+    callback_type: str | None,
+    delay_minutes: str | int | None,
+    callback_datetime_iso: str | None,
+    now: datetime | None = None,
+) -> datetime:
+    """Turn the voice tool's callback fields into one absolute UTC moment.
+
+    The model supplies a duration or a wall-clock string; the arithmetic and the
+    timezone stay here so a mis-calculated offset cannot reach the database.
+    """
+    now = now or datetime.now(UTC)
+    kind = (callback_type or "").strip().lower()
+    if kind == "relative" or (not kind and delay_minutes not in (None, "")):
+        try:
+            minutes = int(float(str(delay_minutes).strip()))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("delay_minutes must be a whole number of minutes") from exc
+        minutes = max(CALLBACK_MIN_MINUTES, min(minutes, CALLBACK_MAX_MINUTES))
+        return now + timedelta(minutes=minutes)
+    raw = callback_datetime_iso if kind == "absolute" else (callback_datetime_iso or None)
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(str(raw).strip())
+        except ValueError as exc:
+            raise ValueError("callback_datetime_iso must be an ISO 8601 timestamp") from exc
+        # A bare wall-clock reading is the practice's local time, not UTC.
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=tz)).astimezone(UTC)
+    if callback_requested_at is not None:
+        if callback_requested_at.tzinfo is None:
+            return callback_requested_at.replace(tzinfo=tz).astimezone(UTC)
+        return callback_requested_at.astimezone(UTC)
+    raise ValueError("callback_scheduled requires a callback time")
+
+
+def _window_for(hours: dict, holidays: list, day) -> tuple[dtime, dtime] | None:
+    closed = set()
+    overrides = {}
+    for item in holidays or []:
+        if isinstance(item, str):
+            closed.add(item)
+        elif isinstance(item, dict) and item.get("date"):
+            if item.get("close"):
+                overrides[item["date"]] = item["close"]
+            else:
+                closed.add(item["date"])
+    key = day.isoformat()
+    if key in closed:
+        return None
+    window = hours.get(str(day.isoweekday()))
+    if not isinstance(window, dict):
+        return None
+    close_raw = overrides.get(key) or window["close"]
+    return (
+        dtime.fromisoformat(window["open"][:5]),
+        dtime.fromisoformat(str(close_raw)[:5]),
+    )
+
+
+def clamp_to_business_hours(when_utc: datetime, tz: ZoneInfo, hours: dict, holidays: list) -> datetime:
+    """Move a callback to the next moment the practice is actually open to call."""
+    if not hours:
+        return when_utc
+    local = when_utc.astimezone(tz)
+    for _ in range(21):
+        window = _window_for(hours, holidays, local.date())
+        if window:
+            open_t, close_t = window
+            if local.time() < open_t:
+                return datetime.combine(local.date(), open_t, tzinfo=tz).astimezone(UTC)
+            if local.time() < close_t:
+                return when_utc
+        local = (local + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    return when_utc
 
 VALID_OUTCOMES = {
     "booked", "not_interested", "no_answer", "voicemail", "callback", "transferred", "manual",
@@ -46,6 +144,9 @@ def report_lead_status(
     event_id: int | None = None,
     notes: str | None = None,
     callback_requested_at: datetime | None = None,
+    callback_type: str | None = None,
+    delay_minutes: str | int | None = None,
+    callback_datetime_iso: str | None = None,
 ) -> str:
     """Apply the direct Vapi lead-status contract with per-call/status idempotency."""
     normalized = {
@@ -139,17 +240,37 @@ def report_lead_status(
             )
             record_status(conn, lead_id, lead["status"], "declined", "tool", note or "declined")
         elif normalized == "callback_scheduled":
-            if callback_requested_at is None or callback_requested_at.tzinfo is None:
-                raise ValueError("callback_scheduled requires a timezone-aware callback_requested_at")
-            callback_utc = callback_requested_at.astimezone(UTC)
+            tz, hours, holidays = _practice_clock(conn, lead_id)
             now = datetime.now(UTC)
+            callback_utc = clamp_to_business_hours(
+                resolve_callback_time(
+                    tz,
+                    callback_requested_at=callback_requested_at,
+                    callback_type=callback_type,
+                    delay_minutes=delay_minutes,
+                    callback_datetime_iso=callback_datetime_iso,
+                    now=now,
+                ),
+                tz,
+                hours,
+                holidays,
+            )
             if callback_utc <= now or callback_utc > now + timedelta(days=30):
                 raise ValueError("callback time must be in the next 30 days")
             conn.execute(
                 "update leads set status='callback_scheduled',cadence_state='active',"
                 "last_call_outcome='callback',callback_requested_at=%s,callback_notes=%s,"
+                "callback_reschedule_count=callback_reschedule_count+1,"
                 "status_changed_at=now() where id=%s",
                 (callback_utc, note or None, lead_id),
+            )
+            # Nothing should reach the patient before the callback they were promised,
+            # so the rest of the cadence shifts by the same delta rather than pausing:
+            # a paused lead would also stop the callback itself from dispatching.
+            conn.execute(
+                "update outreach_events set scheduled_for=scheduled_for+(%s-now()),updated_at=now() "
+                "where lead_id=%s and status='planned' and scheduled_for<%s",
+                (callback_utc, lead_id, callback_utc),
             )
             conn.execute(
                 "insert into outreach_events(lead_id,channel,scheduled_for,status) "
@@ -178,24 +299,33 @@ def report_lead_status(
                 "values(%s,'sms_booking_link','sms','queued',%s)",
                 (lead_id, json.dumps({"booking_link_url": settings["booking_link_url"]})),
             )
+            # Sending the link is the end of our outreach: we cannot tell whether the
+            # patient booked until Stride is re-enabled, so we stop chasing them.
             conn.execute(
-                "update leads set status='booking_link_sent',cadence_state='active',"
+                "update leads set status='booking_link_sent',cadence_state='completed',"
                 "last_call_outcome='manual',status_reason=%s,status_changed_at=now() where id=%s",
                 (note or "booking link requested", lead_id),
             )
             conn.execute(
-                "update outreach_events set status='planned',updated_at=now() where lead_id=%s "
-                "and status='skipped' and executed_at is null and scheduled_for>now()",
+                "update outreach_events set status='skipped',updated_at=now() "
+                "where lead_id=%s and status='planned'",
                 (lead_id,),
             )
             record_status(
                 conn, lead_id, lead["status"], "booking_link_sent", "tool", note or "booking link requested"
             )
         elif normalized == "transferred_human":
+            # A person has taken over the conversation, so automated outreach is done.
+            # Matches apply_call_outcome(), which already completes on transfer.
             conn.execute(
-                "update leads set status='transferred_human',cadence_state='paused',"
+                "update leads set status='transferred_human',cadence_state='completed',"
                 "last_call_outcome='transferred',status_reason=%s,status_changed_at=now() where id=%s",
                 (note or "transferred to staff", lead_id),
+            )
+            conn.execute(
+                "update outreach_events set status='skipped',updated_at=now() "
+                "where lead_id=%s and status='planned'",
+                (lead_id,),
             )
             record_status(
                 conn, lead_id, lead["status"], "transferred_human", "tool", note or "transferred"
