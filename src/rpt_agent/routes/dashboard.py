@@ -79,21 +79,54 @@ class LeadCreate(BaseModel):
         return value
 
 
+CLOSED_STATUSES = frozenset(
+    {
+        "declined",
+        "transferred_human",
+        "booking_link_sent",
+        "do_not_contact",
+        "closed_no_response",
+        "invalid_phone",
+    }
+)
+
+
 def _stage(row: dict) -> str:
+    """Bucket a lead for the board. 'cadence' means outreach is still running."""
     if row["status"] == "booked":
         return "booked"
     if row["needs_review"] or row["status"] == "needs_attention":
         return "attention"
+    # A finished lead is not in cadence. Without this it falls through below and
+    # a declined or transferred patient keeps showing as actively worked.
+    if row["status"] in CLOSED_STATUSES or row["cadence_state"] in {"completed", "terminated"}:
+        return "closed"
     if row["status"] == "new" or row["cadence_state"] == "pending":
         return "new"
     return "cadence"
 
 
+CLOSED_REASON = {
+    "declined": "Patient declined",
+    "transferred_human": "Transferred to staff",
+    "booking_link_sent": "Booking link sent",
+    "do_not_contact": "Do not contact",
+    "closed_no_response": "Closed, no response",
+    "invalid_phone": "Invalid phone number",
+    "booked": "Appointment booked",
+}
+
+
 def _lead(row: dict) -> dict:
+    stage = _stage(row)
     next_status = row.get("next_event_status")
     next_step = row.get("next_step")
     if next_status in {"attempted", "in_flight"}:
         next_step = f"Awaiting result: {next_step or row.get('next_channel', 'outreach')}"
+    if stage in {"closed", "booked"}:
+        # Outreach has stopped, so never advertise a next action that will not run.
+        next_step = CLOSED_REASON.get(row["status"], "Outreach complete")
+        next_status = None
     return {
         "id": str(row["id"]),
         "display_id": f"RPT-{str(row['id']).split('-')[0].upper()}",
@@ -102,7 +135,7 @@ def _lead(row: dict) -> dict:
         "email": row.get("email"),
         "source": row.get("source_system"),
         "status": row["status"],
-        "stage": _stage(row),
+        "stage": stage,
         "cadence_state": row["cadence_state"],
         "needs_review": row["needs_review"],
         "review_reason": row.get("review_reason"),
@@ -192,7 +225,7 @@ def dashboard_snapshot(actor: Actor):
             "(select count(*) from leads where needs_review) as review_queue"
         ).fetchone()
 
-    counts = {"new": 0, "cadence": 0, "attention": 0, "booked": 0}
+    counts = {"new": 0, "cadence": 0, "attention": 0, "booked": 0, "closed": 0}
     for lead in leads:
         counts[lead["stage"]] += 1
     settings = get_settings()
@@ -371,6 +404,13 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
     detail["next_step"] = next_event["description"] if next_event else None
     if next_event and next_event["status"] in {"in_flight", "attempted"}:
         detail["next_step"] = f"Awaiting result: {detail['next_step'] or detail['next_channel']}"
+    if detail["stage"] in {"closed", "booked"}:
+        # Same rule as the board: a finished lead has an outcome, not a next action.
+        detail["next_step"] = CLOSED_REASON.get(row["status"], "Outreach complete")
+        detail["next_event_id"] = None
+        detail["next_event_status"] = None
+        detail["next_channel"] = None
+        detail["next_scheduled_for"] = None
     return {
         "lead": detail,
         "events": events,
