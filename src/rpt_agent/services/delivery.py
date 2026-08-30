@@ -224,6 +224,14 @@ def process_pending_integrations(
     return counts
 
 
+def _as_number(value) -> float | None:
+    """Vapi sends these as numbers or strings depending on the event."""
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _structured_outcome(message: dict) -> dict | None:
     """Read the assistant's post-call structured output, if it produced one.
 
@@ -318,6 +326,10 @@ def process_vapi_end_report(trace: WorkflowTrace, body: dict) -> str:
     call_id = str(call.get("id") or body.get("id") or "")
     ended = str(message.get("endedReason") or call.get("endedReason") or "")
     transcript, summary = _call_text_artifacts(message)
+    started_at_raw = message.get("startedAt") or call.get("startedAt")
+    ended_at_raw = message.get("endedAt") or call.get("endedAt")
+    duration_seconds = _as_number(message.get("durationSeconds") or call.get("durationSeconds"))
+    call_cost = _as_number(message.get("cost") or call.get("cost"))
     if not lead_id or not event_id or not call_id:
         raise ValueError("webhook cannot be associated with a lead, event, and call")
     mapped_outcome = outcome_from_ended_reason(ended)
@@ -351,18 +363,26 @@ def process_vapi_end_report(trace: WorkflowTrace, body: dict) -> str:
     with transaction() as conn:
         conn.execute(
             "insert into call_logs(outreach_event_id,lead_id,vapi_call_id,dialed_at,ended_at,"
-            "answer_state,ended_reason,outcome_source,transcript_text,summary_text) "
-            "values(%s,%s,%s,coalesce(%s::timestamptz,now()),%s::timestamptz,%s,%s,%s,%s,%s) "
+            "answer_state,ended_reason,outcome_source,transcript_text,summary_text,"
+            "duration_seconds,cost) "
+            "values(%s,%s,%s,coalesce(%s::timestamptz,now()),%s::timestamptz,%s,%s,%s,%s,%s,"
+            # Derive the duration rather than trusting a field: we always have both
+            # timestamps, and greatest() keeps a clock skew from storing a negative.
+            "coalesce(%s,greatest(extract(epoch from (%s::timestamptz - %s::timestamptz)),0))::int,"
+            "%s) "
             "on conflict(vapi_call_id) do update set "
             "outcome_source=coalesce(call_logs.outcome_source,excluded.outcome_source),"
             "transcript_text=coalesce(excluded.transcript_text,call_logs.transcript_text),"
-            "summary_text=coalesce(excluded.summary_text,call_logs.summary_text)",
+            "summary_text=coalesce(excluded.summary_text,call_logs.summary_text),"
+            "duration_seconds=greatest(call_logs.duration_seconds,excluded.duration_seconds),"
+            "cost=coalesce(excluded.cost,call_logs.cost),"
+            "ended_at=coalesce(excluded.ended_at,call_logs.ended_at)",
             (
                 int(event_id),
                 lead_id,
                 call_id,
-                message.get("startedAt") or call.get("startedAt"),
-                message.get("endedAt") or call.get("endedAt"),
+                started_at_raw,
+                ended_at_raw,
                 outcome if outcome in {"voicemail", "no_answer"} else "human",
                 ended,
                 "tool"
@@ -370,6 +390,10 @@ def process_vapi_end_report(trace: WorkflowTrace, body: dict) -> str:
                 else ("webhook" if outcome else None),
                 transcript,
                 summary,
+                duration_seconds,
+                ended_at_raw,
+                started_at_raw,
+                call_cost,
             ),
         )
         conn.execute(

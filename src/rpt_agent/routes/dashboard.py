@@ -238,7 +238,14 @@ def dashboard_snapshot(actor: Actor):
             "(select count(*) from outreach_events where channel='call' and executed_at is not null) "
             "as calls_attempted,"
             "(select count(*) from outreach_events where channel='call' and outcome in "
-            "('booked','not_interested','callback','transferred')) as calls_reached"
+            "('booked','not_interested','callback','transferred')) as calls_reached,"
+            # Real provider usage. The dashboard previously showed fixed figures
+            # here, which cannot be told apart from a genuine reading.
+            "(select coalesce(sum(duration_seconds),0) from call_logs) as voice_seconds,"
+            "(select coalesce(sum(cost),0) from call_logs) as voice_cost,"
+            "(select count(*) from call_logs) as calls_logged,"
+            "(select count(*) from appointments) as stride_appointments,"
+            "(select count(*) from integration_outbox where status='sent') as keap_handoffs"
         ).fetchone()
 
     counts = {"new": 0, "cadence": 0, "attention": 0, "booked": 0, "closed": 0}
@@ -268,6 +275,12 @@ def dashboard_snapshot(actor: Actor):
         "calls_completed": _count("calls_completed"),
         "calls_completion_rate": _rate(_count("calls_completed"), _count("calls_attempted")),
         "calls_reached_rate": _rate(_count("calls_reached"), _count("calls_attempted")),
+        "voice_minutes": round(_count("voice_seconds") / 60, 1),
+        "voice_seconds": _count("voice_seconds"),
+        "voice_cost": float(system.get("voice_cost") or 0),
+        "calls_logged": _count("calls_logged"),
+        "stride_appointments": _count("stride_appointments"),
+        "keap_handoffs": _count("keap_handoffs"),
         "review_rate": _rate(_count("review_queue"), total_leads),
         "booked_rate": _rate(counts["booked"], total_leads),
     }

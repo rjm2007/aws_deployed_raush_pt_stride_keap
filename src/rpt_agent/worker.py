@@ -104,6 +104,10 @@ def _parse_time(value: str) -> dtime:
     return dtime(int(hours), int(minutes))
 
 
+# Minutes between two steps that fall on the same cadence day.
+STEP_GAP_MINUTES = 3
+
+
 def materialize_cadence(conn, lead_id: str, practice_id: int, start_on: date) -> int:
     """Materialize production cadence or a compressed cadence for synthetic test leads."""
     settings = conn.execute(
@@ -120,13 +124,20 @@ def materialize_cadence(conn, lead_id: str, practice_id: int, start_on: date) ->
     app_settings = get_settings()
     accelerated = bool(app_settings.test_mode and lead and lead["is_test"])
     anchor = datetime.now(UTC)
+    # Steps sharing a day were spaced one second apart, so the day-0 SMS went out
+    # in the same worker tick as the day-0 call: a patient who answered and asked
+    # for a callback had already been texted. Spacing later steps by whole minutes
+    # gives the call time to finish and settle first.
+    # step_order runs across the whole cadence, so the gap is counted per day:
+    # the first step of a day is unshifted, the second is STEP_GAP_MINUTES later.
+    seen_on_day: dict[int, int] = {}
     for step in steps:
-        scheduled_for = (
+        position = seen_on_day.get(step["day_offset"], 0)
+        seen_on_day[step["day_offset"]] = position + 1
+        gap = timedelta(minutes=STEP_GAP_MINUTES * position)
+        scheduled_for = gap + (
             anchor
-            + timedelta(
-                minutes=step["day_offset"] * app_settings.test_cadence_day_minutes,
-                seconds=step["step_order"],
-            )
+            + timedelta(minutes=step["day_offset"] * app_settings.test_cadence_day_minutes)
             if accelerated
             else compute_send_time(settings, lead_id, start_on, step["day_offset"])
         )
