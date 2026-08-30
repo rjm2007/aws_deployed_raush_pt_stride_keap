@@ -84,21 +84,33 @@ def process_pending_integrations(
                     "Call 949-276-5401 with questions. Reply STOP to opt out."
                 )
             sid = providers.send_sms(trace, row["phone_e164"], body)
+            # The message has left Twilio, so recording that fact comes first and
+            # alone. Usage accounting is bookkeeping: if it fails it must not roll
+            # back the row proving we already sent this, or the worker will treat
+            # a delivered message as unsent.
             with transaction() as conn:
                 conn.execute(
                     "update notification_log set status='sent',provider_ref=%s,sent_at=now(),"
                     "updated_at=now() where id=%s",
                     (sid, row["id"]),
                 )
-                if providers.settings.mode("twilio") == "real":
-                    record_test_usage(
-                        conn,
-                        "twilio",
-                        "booking_link_sms"
-                        if row["notification_type"] == "sms_booking_link"
-                        else "booking_confirmation_sms",
-                        row["lead_id"],
-                        sid,
+            if providers.settings.mode("twilio") == "real":
+                try:
+                    with transaction() as conn:
+                        record_test_usage(
+                            conn,
+                            "twilio",
+                            "booking_link_sms"
+                            if row["notification_type"] == "sms_booking_link"
+                            else "booking_confirmation_sms",
+                            row["lead_id"],
+                            sid,
+                        )
+                except Exception as usage_error:  # noqa: BLE001 - never lose a sent SMS
+                    trace.log(
+                        "usage_recording_failed",
+                        notification_id=row["id"],
+                        error_category=type(usage_error).__name__,
                     )
             counts["sms"] += 1
         except ProviderError as exc:
