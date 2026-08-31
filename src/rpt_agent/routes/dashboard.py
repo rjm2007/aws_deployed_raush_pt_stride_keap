@@ -24,6 +24,10 @@ class CadenceAction(BaseModel):
     action: Literal["pause", "resume"]
 
 
+class StageMove(BaseModel):
+    stage: Literal["new", "cadence", "attention", "booked", "closed"]
+
+
 class ReviewAction(BaseModel):
     resolution: str = Field(min_length=2, max_length=500)
 
@@ -494,6 +498,109 @@ def update_lead_cadence(lead_id: UUID, payload: CadenceAction, actor: Actor):
         conn.execute("update leads set cadence_state=%s where id=%s", (new_state, lead_id))
         _audit(conn, actor, lead["practice_id"], f"cadence.{payload.action}", "lead", str(lead_id))
     return {"status": "updated", "cadence_state": new_state}
+
+
+@router.post("/leads/{lead_id}/stage")
+def move_lead_stage(lead_id: UUID, payload: StageMove, actor: Actor):
+    """Move a lead between board columns.
+
+    Dropping onto 'new' restarts outreach: the remaining schedule is discarded and
+    a fresh cadence is built from today, so the patient is contacted from day zero
+    again. Every move is audited because a person, not the system, decided it.
+    """
+    with transaction() as conn:
+        lead = conn.execute(
+            "select id,practice_id,status,cadence_state,needs_review,call_opt_out,sms_opt_out "
+            "from leads where id=%s for update",
+            (lead_id,),
+        ).fetchone()
+        if not lead:
+            raise HTTPException(status_code=404, detail="lead not found")
+        if lead["status"] == "do_not_contact" and payload.stage in {"new", "cadence"}:
+            raise HTTPException(
+                status_code=409, detail="a do-not-contact lead cannot be returned to outreach"
+            )
+
+        restarted = 0
+        if payload.stage == "new":
+            if lead["call_opt_out"] and lead["sms_opt_out"]:
+                raise HTTPException(
+                    status_code=409, detail="this lead has opted out of every channel"
+                )
+            conn.execute(
+                "delete from outreach_events where lead_id=%s and status='planned'", (lead_id,)
+            )
+            conn.execute(
+                "update leads set status='new',cadence_state='pending',needs_review=false,"
+                "review_reason=null,review_flagged_at=null,last_call_outcome=null,"
+                "status_reason=null,callback_requested_at=null,callback_notes=null,"
+                "call_attempts=0,status_changed_at=now() where id=%s",
+                (lead_id,),
+            )
+            restarted = materialize_cadence(
+                conn, str(lead_id), lead["practice_id"], datetime.now(UTC).date()
+            )
+        elif payload.stage == "cadence":
+            conn.execute(
+                "update leads set status='in_progress',cadence_state='active',needs_review=false,"
+                "review_reason=null,review_flagged_at=null,status_changed_at=now() where id=%s",
+                (lead_id,),
+            )
+        elif payload.stage == "attention":
+            conn.execute(
+                "update leads set needs_review=true,review_reason=coalesce(review_reason,%s),"
+                "review_flagged_at=now(),cadence_state='paused',status_changed_at=now() where id=%s",
+                ("moved to review from the board", lead_id),
+            )
+        elif payload.stage == "closed":
+            conn.execute(
+                "update leads set status='declined',cadence_state='terminated',needs_review=false,"
+                "review_reason=null,status_reason=coalesce(status_reason,%s),"
+                "status_changed_at=now() where id=%s",
+                ("closed from the board", lead_id),
+            )
+            conn.execute(
+                "update outreach_events set status='skipped',updated_at=now() "
+                "where lead_id=%s and status='planned'",
+                (lead_id,),
+            )
+        else:  # booked
+            # Booked is a claim about the outside world, so it needs a real appointment.
+            appointment = conn.execute(
+                "select id from appointments where lead_id=%s and state='scheduled' limit 1",
+                (lead_id,),
+            ).fetchone()
+            if not appointment:
+                raise HTTPException(
+                    status_code=409,
+                    detail="booked requires a confirmed appointment on the lead",
+                )
+            conn.execute(
+                "update leads set status='booked',cadence_state='completed',needs_review=false,"
+                "status_changed_at=now() where id=%s",
+                (lead_id,),
+            )
+            conn.execute(
+                "update outreach_events set status='skipped',updated_at=now() "
+                "where lead_id=%s and status='planned'",
+                (lead_id,),
+            )
+
+        conn.execute(
+            "insert into lead_status_history(lead_id,from_status,to_status,source,reason) "
+            "values(%s,%s,%s,'dashboard',%s)",
+            (lead_id, lead["status"], payload.stage, f"moved to {payload.stage} from the board"),
+        )
+        _audit(
+            conn,
+            actor,
+            lead["practice_id"],
+            "lead.stage_move",
+            "lead",
+            str(lead_id),
+            {"from": lead["status"], "to": payload.stage, "events_created": restarted},
+        )
+    return {"status": "updated", "stage": payload.stage, "events_created": restarted}
 
 
 @router.patch("/leads/{lead_id}/outreach-events/{event_id}")
