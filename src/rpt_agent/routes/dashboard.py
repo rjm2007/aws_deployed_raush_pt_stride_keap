@@ -107,6 +107,10 @@ def _stage(row: dict) -> str:
         return "closed"
     if row["status"] == "new" or row["cadence_state"] == "pending":
         return "new"
+    # Every step has run and nothing is awaiting a provider result, so the
+    # cadence is spent even though the lead was never explicitly closed.
+    if row.get("cadence_total") and not row.get("next_event_id"):
+        return "closed"
     return "cadence"
 
 
@@ -447,7 +451,6 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
     detail = dict(row)
     detail["id"] = str(detail["id"])
     detail["display_id"] = f"RPT-{str(row['id']).split('-')[0].upper()}"
-    detail["stage"] = _stage(row)
     detail["phone"] = detail.get("phone_e164")
     detail["source"] = detail.get("source_system")
     detail["cadence_progress"] = sum(event["status"] != "planned" for event in events)
@@ -458,6 +461,11 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
             (event for event in events if event["status"] in {"in_flight", "attempted"}), None
         )
     detail["next_event_id"] = next_event["id"] if next_event else None
+    # Staged after the totals above: _stage needs them to tell an exhausted
+    # cadence apart from one that is still running.
+    detail["stage"] = _stage(
+        {**row, "cadence_total": detail["cadence_total"], "next_event_id": detail["next_event_id"]}
+    )
     detail["next_event_status"] = next_event["status"] if next_event else None
     detail["next_channel"] = next_event["channel"] if next_event else None
     detail["next_scheduled_for"] = next_event["scheduled_for"] if next_event else None
