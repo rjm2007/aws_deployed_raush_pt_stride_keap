@@ -418,13 +418,20 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
         if not row:
             raise HTTPException(status_code=404, detail="lead not found")
         events = conn.execute(
+            # sm.delivery_status is the only honest answer for an SMS step. An
+            # outreach_event reaching 'delivered' only means Twilio accepted the
+            # message; the carrier can still reject it (30034, unregistered sender)
+            # minutes later. Without this join the timeline shows "Completed" for a
+            # text the patient never received.
             "select oe.id,oe.cadence_step_id,oe.channel,oe.day_offset,oe.status,oe.scheduled_for,oe.created_at,"
-            "oe.executed_at,oe.outcome,cs.description from outreach_events oe left join cadence_steps cs "
-            "on cs.id=oe.cadence_step_id where oe.lead_id=%s order by oe.scheduled_for nulls last,oe.id",
+            "oe.executed_at,oe.outcome,cs.description,sm.delivery_status,sm.failure_reason "
+            "from outreach_events oe left join cadence_steps cs on cs.id=oe.cadence_step_id "
+            "left join sms_messages sm on sm.outreach_event_id=oe.id "
+            "where oe.lead_id=%s order by oe.scheduled_for nulls last,oe.id",
             (lead_id,),
         ).fetchall()
         messages = conn.execute(
-            "select id,direction,body,occurred_at,delivered_at,delivery_status from sms_messages "
+            "select id,direction,body,occurred_at,delivered_at,delivery_status,failure_reason from sms_messages "
             "where lead_id=%s order by occurred_at,id",
             (lead_id,),
         ).fetchall()
