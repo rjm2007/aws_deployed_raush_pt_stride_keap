@@ -418,7 +418,7 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
         if not row:
             raise HTTPException(status_code=404, detail="lead not found")
         events = conn.execute(
-            "select oe.id,oe.cadence_step_id,oe.channel,oe.day_offset,oe.status,oe.scheduled_for,"
+            "select oe.id,oe.cadence_step_id,oe.channel,oe.day_offset,oe.status,oe.scheduled_for,oe.created_at,"
             "oe.executed_at,oe.outcome,cs.description from outreach_events oe left join cadence_steps cs "
             "on cs.id=oe.cadence_step_id where oe.lead_id=%s order by oe.scheduled_for nulls last,oe.id",
             (lead_id,),
@@ -535,8 +535,11 @@ def move_lead_stage(lead_id: UUID, payload: StageMove, actor: Actor):
                 raise HTTPException(
                     status_code=409, detail="this lead has opted out of every channel"
                 )
+            # 'planned' and 'skipped' both mean nothing was ever sent, so neither
+            # is history worth keeping. Anything dispatched stays untouched.
             conn.execute(
-                "delete from outreach_events where lead_id=%s and status='planned'", (lead_id,)
+                "delete from outreach_events where lead_id=%s and status in ('planned','skipped')",
+                (lead_id,),
             )
             conn.execute(
                 "update leads set status='new',cadence_state='pending',needs_review=false,"

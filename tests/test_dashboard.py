@@ -270,3 +270,71 @@ def test_dashboard_migration_and_text_only_call_artifacts():
     })
     assert transcript == "Assistant: Hello\nPatient: Hi"
     assert summary == "Requested a callback."
+
+class RestartConnection:
+    """Records the SQL a stage move issues so the cleanup can be asserted."""
+
+    lead_id = uuid4()
+
+    def __init__(self):
+        self.statements: list[str] = []
+
+    def execute(self, sql, params=None):
+        del params
+        self.statements.append(" ".join(sql.split()))
+        if "from leads where id=" in sql:
+            return Result([{
+                "id": self.lead_id,
+                "practice_id": 1,
+                "status": "declined",
+                "cadence_state": "terminated",
+                "needs_review": False,
+                "call_opt_out": False,
+                "sms_opt_out": False,
+            }])
+        return Result([])
+
+
+def test_restart_clears_skipped_steps_not_only_planned(monkeypatch):
+    """A lead closed before a restart has leftovers marked 'skipped'.
+
+    Deleting only 'planned' left them behind, so the rebuilt cadence rendered on
+    top of the abandoned one and the patient's timeline showed every step twice.
+    """
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = RestartConnection()
+
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    monkeypatch.setattr(dashboard_routes, "materialize_cadence", lambda *args: 8)
+
+    response = TestClient(app).post(
+        f"/api/v1/dashboard/leads/{connection.lead_id}/stage",
+        json={"stage": "new"},
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+    )
+    assert response.status_code == 200
+
+    deletes = [sql for sql in connection.statements if sql.startswith("delete from outreach_events")]
+    assert len(deletes) == 1, connection.statements
+    assert "'planned'" in deletes[0] and "'skipped'" in deletes[0], deletes[0]
+
+
+def test_lead_detail_events_expose_creation_batch(monkeypatch):
+    """The timeline groups runs by when events were created.
+
+    Without created_at it fell back to watching the day offset step backwards,
+    which never happens once two runs overlap in time.
+    """
+    source = Path(dashboard_routes.__file__).read_text(encoding="utf-8")
+    events_query = source[source.index("events = conn.execute("):]
+    events_query = events_query[: events_query.index(").fetchall()")]
+    assert "oe.created_at" in events_query, events_query
