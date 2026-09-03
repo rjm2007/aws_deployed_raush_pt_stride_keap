@@ -19,7 +19,16 @@ on conflict(practice_id) do update set
   stride_location_timezone=excluded.stride_location_timezone,
   stride_booking_enabled=excluded.stride_booking_enabled;
 
-with p as (select id from public.practices where slug='rausch-pt'), values_to_upsert as (
+insert into public.cadence_versions(practice_id,version_number,name,status,activated_at)
+select id,3,'Standard v3','active',now() from public.practices where slug='rausch-pt'
+on conflict (practice_id,version_number) where lead_id is null do update set
+  name=excluded.name,status='active',activated_at=coalesce(public.cadence_versions.activated_at,now());
+
+with p as (
+  select p.id,cv.id as cadence_version_id from public.practices p
+  join public.cadence_versions cv on cv.practice_id=p.id and cv.lead_id is null
+  where p.slug='rausch-pt' and cv.version_number=3
+), values_to_upsert as (
   select * from (values
     (0,0,'call','day0_call','Day 0 initial scheduling call'),
     (1,0,'sms','day0_sms','Day 0 introduction and booking link'),
@@ -31,12 +40,17 @@ with p as (select id from public.practices where slug='rausch-pt'), values_to_up
     (7,13,'sms','day13_sms','Day 13 final reminder')
   ) as v(step_order,day_offset,channel,key,description)
 )
-insert into public.cadence_steps(practice_id,step_order,day_offset,channel,key,description)
-select p.id,v.step_order,v.day_offset,v.channel,v.key,v.description from p cross join values_to_upsert v
-on conflict(practice_id,key) do update set step_order=excluded.step_order,day_offset=excluded.day_offset,
+insert into public.cadence_steps(practice_id,cadence_version_id,step_order,day_offset,channel,key,description)
+select p.id,p.cadence_version_id,v.step_order,v.day_offset,v.channel,v.key,v.description
+from p cross join values_to_upsert v
+on conflict(cadence_version_id,key) do update set step_order=excluded.step_order,day_offset=excluded.day_offset,
   channel=excluded.channel,description=excluded.description,is_active=true;
 
-with p as (select id from public.practices where slug='rausch-pt'), templates as (
+with p as (
+  select p.id,cv.id as cadence_version_id from public.practices p
+  join public.cadence_versions cv on cv.practice_id=p.id and cv.lead_id is null
+  where p.slug='rausch-pt' and cv.version_number=3
+), templates as (
   select * from (values
     ('day0_sms','Hi {name}, Rausch PT & Wellness received a request to help you schedule a physical therapy evaluation. Book here: {link}. Reply STOP to opt out.'),
     ('day1_sms','Hi {name}, just a friendly reminder to schedule your physical therapy evaluation: {link} or call 949-276-5401. Reply STOP to opt out.'),
@@ -45,7 +59,9 @@ with p as (select id from public.practices where slug='rausch-pt'), templates as
     ('day13_sms','Hi {name}, this is a final reminder from Rausch PT & Wellness. Book here: {link} or call 949-276-5401. Reply STOP to opt out.')
   ) as t(key,body)
 )
-insert into public.message_templates(practice_id,cadence_step_id,key,channel,body)
-select p.id,cs.id,t.key,'sms',t.body from p join public.cadence_steps cs on cs.practice_id=p.id
+insert into public.message_templates(practice_id,cadence_version_id,cadence_step_id,key,channel,body)
+select p.id,p.cadence_version_id,cs.id,t.key,'sms',t.body from p
+join public.cadence_steps cs on cs.cadence_version_id=p.cadence_version_id
 join templates t on t.key=cs.key
-on conflict(practice_id,key) do update set cadence_step_id=excluded.cadence_step_id,body=excluded.body,is_active=true;
+on conflict(cadence_version_id,key) where cadence_version_id is not null do update set
+  cadence_step_id=excluded.cadence_step_id,body=excluded.body,is_active=true;

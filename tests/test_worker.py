@@ -57,9 +57,13 @@ class _Result:
 
 
 class _CadenceConnection:
-    def __init__(self, is_test: bool):
+    def __init__(self, is_test: bool, steps=None):
         self.is_test = is_test
         self.inserted = []
+        self.steps = steps or [
+            {"id": 1, "step_order": 1, "day_offset": 0, "channel": "call"},
+            {"id": 2, "step_order": 2, "day_offset": 1, "channel": "sms"},
+        ]
 
     def execute(self, query, params):
         if "select ps.business_hours" in query:
@@ -71,14 +75,13 @@ class _CadenceConnection:
                 "timezone": "America/Los_Angeles",
             })
         if "select is_test" in query:
-            return _Result(one={"is_test": self.is_test})
+            return _Result(one={"is_test": self.is_test, "cadence_state": "active"})
+        if "select id from cadence_versions" in query:
+            return _Result(one={"id": 3})
         if "select id,step_order" in query:
-            return _Result(many=[
-                {"id": 1, "step_order": 1, "day_offset": 0, "channel": "call"},
-                {"id": 2, "step_order": 2, "day_offset": 1, "channel": "sms"},
-            ])
+            return _Result(many=self.steps)
         if "insert into outreach_events" in query:
-            self.inserted.append(params[4])
+            self.inserted.append(params[5])
         return _Result()
 
 
@@ -96,6 +99,22 @@ def test_test_mode_compresses_only_synthetic_leads(monkeypatch):
     production = _CadenceConnection(is_test=False)
     materialize_cadence(production, "prod-lead", 1, date(2026, 8, 24))
     assert (production.inserted[1] - production.inserted[0]).total_seconds() > 5 * 60
+
+
+def test_compressed_same_day_gap_never_overtakes_later_day(monkeypatch):
+    monkeypatch.setattr(
+        "rpt_agent.worker.get_settings",
+        lambda: Settings(test_mode=True, test_cadence_day_minutes=1),
+    )
+    connection = _CadenceConnection(is_test=True, steps=[
+        {"id": 1, "step_order": 0, "day_offset": 0, "channel": "call"},
+        {"id": 2, "step_order": 1, "day_offset": 0, "channel": "sms"},
+        {"id": 3, "step_order": 2, "day_offset": 1, "channel": "sms"},
+    ])
+    materialize_cadence(connection, "test-lead", 1, date(2026, 8, 24))
+    assert connection.inserted == sorted(connection.inserted)
+    assert (connection.inserted[1] - connection.inserted[0]).total_seconds() == 180
+    assert (connection.inserted[2] - connection.inserted[1]).total_seconds() == 1
 
 
 def test_dispatch_classifies_safe_retry_and_ambiguous_exception():

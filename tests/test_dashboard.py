@@ -118,14 +118,32 @@ class DetailConnection:
             }])
         if "from outreach_events oe" in sql:
             return Result([
-                {"id": 1, "cadence_step_id": 1, "channel": "sms", "day_offset": 0,
+                {"id": 1, "cadence_step_id": 1, "cadence_version_id": 3,
+                 "channel": "sms", "day_offset": 0,
                  "status": "delivered", "scheduled_for": datetime.now(UTC),
-                 "executed_at": datetime.now(UTC), "outcome": None,
-                 "description": "Initial SMS"},
-                {"id": 2, "cadence_step_id": 2, "channel": "call", "day_offset": 3,
+                 "created_at": datetime.now(UTC), "executed_at": datetime.now(UTC),
+                 "outcome": None, "description": "Initial SMS", "cadence_version_name": "Standard v3",
+                 "delivery_status": "delivered", "failure_reason": None},
+                {"id": 2, "cadence_step_id": 2, "cadence_version_id": 3,
+                 "channel": "call", "day_offset": 3,
                  "status": "attempted", "scheduled_for": datetime.now(UTC),
-                 "executed_at": datetime.now(UTC), "outcome": None,
-                 "description": "Follow-up Call"},
+                 "created_at": datetime.now(UTC), "executed_at": datetime.now(UTC),
+                 "outcome": None, "description": "Follow-up Call", "cadence_version_name": "Standard v3",
+                 "delivery_status": None, "failure_reason": None},
+            ])
+        if "from cadence_versions" in sql:
+            return Result([{
+                "id": 3, "name": "Standard v3", "version_number": 3, "status": "active",
+                "lead_id": None, "practice_id": 1, "source_version_id": None,
+                "activated_at": datetime.now(UTC), "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
+            }])
+        if "from cadence_steps cs" in sql:
+            return Result([
+                {"id": 1, "step_order": 0, "day_offset": 0, "channel": "sms", "key": "day0_sms",
+                 "description": "Initial SMS", "is_active": True, "sms_body": "Hello"},
+                {"id": 2, "step_order": 1, "day_offset": 3, "channel": "call", "key": "day3_call",
+                 "description": "Follow-up Call", "is_active": True, "sms_body": None},
             ])
         if any(table in sql for table in (
             "from sms_messages", "from call_logs", "from appointments",
@@ -264,6 +282,18 @@ def test_dashboard_migration_and_text_only_call_artifacts():
         encoding="utf-8"
     )
     assert "dashboard_staff_attestation" in consent_sql
+    cadence_sql = Path("supabase/migrations/020_cadence_versions.sql").read_text(
+        encoding="utf-8"
+    )
+    assert "create table public.cadence_versions" in cadence_sql
+    assert "day_offset between 0 and 365" in cadence_sql
+    assert "cadence_versions_one_active_global" in cadence_sql
+    assert "cadence_version_id" in cadence_sql
+    deletion_sql = Path("supabase/migrations/022_deleted_cadence_versions.sql").read_text(
+        encoding="utf-8"
+    )
+    assert "'deleted'" in deletion_sql and "deleted_at" in deletion_sql
+    assert "Personalized plan" in deletion_sql
     transcript, summary = _call_text_artifacts({
         "artifact": {"transcript": "Assistant: Hello\nPatient: Hi"},
         "analysis": {"summary": "Requested a callback."},
@@ -338,3 +368,396 @@ def test_lead_detail_events_expose_creation_batch(monkeypatch):
     events_query = source[source.index("events = conn.execute("):]
     events_query = events_query[: events_query.index(").fetchall()")]
     assert "oe.created_at" in events_query, events_query
+
+
+class ActivateVersionConnection:
+    def __init__(self):
+        now = datetime.now(UTC)
+        self.version = {
+            "id": 4, "practice_id": 1, "lead_id": None, "version_number": 4,
+            "name": "Standard v4", "status": "draft", "source_version_id": 3,
+            "activated_at": None, "created_at": now, "updated_at": now,
+        }
+        self.statements: list[str] = []
+
+    def execute(self, sql, params=None):
+        del params
+        normal = " ".join(sql.split())
+        self.statements.append(normal)
+        if "from cadence_versions where id=" in normal and "for update" in normal:
+            return Result([dict(self.version)])
+        if normal.startswith("select l.id,l.status,l.cadence_state from leads l"):
+            return Result([{
+                "id": uuid4(), "status": "in_progress", "cadence_state": "paused",
+            }])
+        if normal.startswith("update cadence_versions set status='active'"):
+            self.version["status"] = "active"
+            self.version["activated_at"] = datetime.now(UTC)
+            return Result([])
+        if "from cadence_versions where id=" in normal:
+            return Result([dict(self.version)])
+        if "from cadence_steps cs" in normal:
+            return Result([{
+                "id": 9, "step_order": 0, "day_offset": 30, "channel": "sms",
+                "key": "day30_sms", "description": "Day 30 SMS", "is_active": True,
+                "sms_body": "Hello",
+            }])
+        return Result([])
+
+
+def test_global_activation_replans_only_planned_work_and_preserves_pause(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = ActivateVersionConnection()
+    materialized = []
+
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    monkeypatch.setattr(
+        dashboard_routes,
+        "materialize_cadence",
+        lambda *args, **kwargs: materialized.append((args, kwargs)) or 1,
+    )
+    response = TestClient(app).post(
+        "/api/v1/dashboard/cadence-versions/4/activate",
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["replanned_leads"] == 1
+    replan = next(sql for sql in connection.statements if sql.startswith("update outreach_events"))
+    assert "status='planned'" in replan
+    assert "in_flight" not in replan and "delivered" not in replan
+    lead_query = next(sql for sql in connection.statements if sql.startswith("select l.id"))
+    assert "not exists" in lead_query and "cv.status='active'" in lead_query
+    assert materialized[0][1]["cadence_version_id"] == 4
+    assert materialized[0][1]["update_lead"] is False
+    get_settings.cache_clear()
+
+
+def test_cadence_version_rejects_empty_sms_copy(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    response = TestClient(app).put(
+        "/api/v1/dashboard/cadence-versions/4",
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+        json={
+            "name": "Month cadence",
+            "steps": [{
+                "day_offset": 30, "channel": "sms", "description": "Day 30 SMS",
+                "is_active": True, "sms_body": "   ",
+            }],
+        },
+    )
+    assert response.status_code == 422
+    assert "message copy" in response.json()["detail"]
+    get_settings.cache_clear()
+
+
+class DeleteVersionConnection:
+    def __init__(self, status="draft"):
+        now = datetime.now(UTC)
+        self.version = {
+            "id": 7, "practice_id": 1, "lead_id": None, "version_number": 7,
+            "name": "Standard v7", "status": status, "source_version_id": 3,
+            "activated_at": None, "deleted_at": None, "created_at": now, "updated_at": now,
+        }
+        self.statements: list[str] = []
+
+    def execute(self, sql, params=None):
+        del params
+        normal = " ".join(sql.split())
+        self.statements.append(normal)
+        if "from cadence_versions where id=" in normal:
+            return Result([dict(self.version)])
+        if normal.startswith("update cadence_versions set status='deleted'"):
+            self.version["status"] = "deleted"
+            self.version["deleted_at"] = datetime.now(UTC)
+        return Result([])
+
+
+def test_cadence_version_delete_is_soft_and_active_is_protected(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = DeleteVersionConnection()
+
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    response = TestClient(app).delete(
+        "/api/v1/dashboard/cadence-versions/7",
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "deleted"
+    assert any("status='deleted'" in sql for sql in connection.statements)
+
+    active = DeleteVersionConnection(status="active")
+
+    @contextmanager
+    def active_transaction():
+        yield active
+
+    monkeypatch.setattr(dashboard_routes, "transaction", active_transaction)
+    response = TestClient(app).delete(
+        "/api/v1/dashboard/cadence-versions/7",
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+    )
+    assert response.status_code == 409
+    assert not any("status='deleted'" in sql for sql in active.statements)
+    get_settings.cache_clear()
+
+
+class PermanentDeleteVersionConnection:
+    def __init__(self, status="deleted"):
+        self.version = {
+            "id": 7, "practice_id": 1, "lead_id": None, "name": "Standard v7", "status": status,
+        }
+        self.statements: list[str] = []
+
+    def execute(self, sql, params=None):
+        del params
+        normal = " ".join(sql.split())
+        self.statements.append(normal)
+        if "from cadence_versions cv join practices" in normal:
+            return Result([dict(self.version)])
+        return Result([])
+
+
+def test_only_deleted_cadence_versions_can_be_permanently_deleted(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = PermanentDeleteVersionConnection()
+
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    response = TestClient(app).delete(
+        "/api/v1/dashboard/cadence-versions/7/permanent",
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "permanently_deleted"
+    assert any("update outreach_events set cadence_step_id=null" in sql for sql in connection.statements)
+    assert any("delete from cadence_versions" in sql for sql in connection.statements)
+
+    protected = PermanentDeleteVersionConnection(status="archived")
+
+    @contextmanager
+    def protected_transaction():
+        yield protected
+
+    monkeypatch.setattr(dashboard_routes, "transaction", protected_transaction)
+    response = TestClient(app).delete(
+        "/api/v1/dashboard/cadence-versions/7/permanent",
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+    )
+    assert response.status_code == 409
+    assert not any(sql.startswith("delete from cadence_versions") for sql in protected.statements)
+    get_settings.cache_clear()
+
+
+class RenameVersionConnection:
+    def __init__(self):
+        now = datetime.now(UTC)
+        self.version = {
+            "id": 7, "practice_id": 1, "lead_id": None, "version_number": 7,
+            "name": "Standard v7", "status": "deleted", "source_version_id": 3,
+            "activated_at": None, "deleted_at": now, "created_at": now, "updated_at": now,
+        }
+
+    def execute(self, sql, params=None):
+        normal = " ".join(sql.split())
+        if normal.startswith("update cadence_versions set name="):
+            self.version["name"] = params[0]
+            return Result([])
+        if "from cadence_versions where id=" in normal:
+            return Result([dict(self.version)])
+        return Result([])
+
+
+def test_deleted_cadence_can_be_renamed_and_reused(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+
+
+class TemplateCrudConnection:
+    def __init__(self, cadence_step_id=None):
+        self.template = {
+            "id": 21, "practice_id": 1, "cadence_step_id": cadence_step_id,
+            "cadence_version_id": None, "key": "Appointment reminder", "name": "Appointment reminder",
+            "body": "Hi {{first_name}}", "is_active": True, "day_offset": None, "description": None,
+        }
+        self.statements: list[str] = []
+
+    def execute(self, sql, params=None):
+        normal = " ".join(sql.split())
+        self.statements.append(normal)
+        if "from practices where slug='rausch-pt'" in normal:
+            return Result([{"id": 1}])
+        if normal.startswith("select id from message_templates where practice_id="):
+            return Result([])
+        if normal.startswith("insert into message_templates"):
+            self.template["key"] = params[1]
+            self.template["name"] = params[1]
+            self.template["body"] = params[2]
+            return Result([dict(self.template)])
+        if "from message_templates mt join practices" in normal:
+            return Result([dict(self.template)])
+        if normal.startswith("update message_templates set key="):
+            if params[0] is not None:
+                self.template["key"] = params[0]
+                self.template["name"] = params[0]
+            if params[1] is not None:
+                self.template["body"] = params[1]
+            return Result([])
+        if "from message_templates mt left join cadence_steps" in normal:
+            return Result([dict(self.template)])
+        return Result([])
+
+
+def test_saved_sms_templates_support_create_rename_and_permanent_delete(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = TemplateCrudConnection()
+
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    headers = {
+        "X-Dashboard-Token": "x" * 32,
+        "X-Dashboard-User-ID": "staff-1",
+        "X-Dashboard-User-Email": "staff@example.test",
+    }
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/dashboard/message-templates",
+        headers=headers,
+        json={"name": "Appointment reminder", "body": "Hi {{first_name}}"},
+    )
+    assert response.status_code == 201
+    assert response.json()["deletable"] is True
+
+    response = client.patch(
+        "/api/v1/dashboard/message-templates/21",
+        headers=headers,
+        json={"name": "Evaluation reminder", "body": "Please choose a time"},
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "Evaluation reminder"
+
+    response = client.delete("/api/v1/dashboard/message-templates/21", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["status"] == "permanently_deleted"
+    assert any(sql.startswith("delete from message_templates where id=") for sql in connection.statements)
+    get_settings.cache_clear()
+    connection = RenameVersionConnection()
+
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    response = TestClient(app).patch(
+        "/api/v1/dashboard/cadence-versions/7/name",
+        json={"name": "Thirty-day follow-up"},
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "Thirty-day follow-up"
+
+    source = Path(dashboard_routes.__file__).read_text(encoding="utf-8")
+    clone_query = source[source.index("if payload.source_version_id:") :]
+    clone_query = clone_query[: clone_query.index("elif payload.lead_id:")]
+    assert "status!='deleted'" not in clone_query
+    get_settings.cache_clear()
+
+
+class StandardCadenceConnection:
+    lead_id = uuid4()
+
+    def __init__(self):
+        self.statements: list[str] = []
+
+    def execute(self, sql, params=None):
+        del params
+        normal = " ".join(sql.split())
+        self.statements.append(normal)
+        if "from leads where id=" in normal:
+            return Result([{
+                "id": self.lead_id, "practice_id": 1, "status": "in_progress",
+                "cadence_state": "paused",
+            }])
+        if "lead_id is null" in normal and "status='active'" in normal:
+            return Result([{"id": 3}])
+        return Result([])
+
+
+def test_switching_to_standard_archives_local_and_replans_only_future(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = StandardCadenceConnection()
+    materialized = []
+
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    monkeypatch.setattr(
+        dashboard_routes,
+        "materialize_cadence",
+        lambda *args, **kwargs: materialized.append((args, kwargs)) or 8,
+    )
+    response = TestClient(app).post(
+        f"/api/v1/dashboard/leads/{connection.lead_id}/cadence-mode",
+        json={"mode": "standard"},
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["mode"] == "standard"
+    assert any("set status='archived'" in sql for sql in connection.statements)
+    replan = next(sql for sql in connection.statements if sql.startswith("update outreach_events"))
+    assert "status='planned'" in replan
+    assert materialized[0][1] == {"cadence_version_id": 3, "update_lead": False}
+    get_settings.cache_clear()

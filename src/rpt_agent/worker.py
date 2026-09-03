@@ -108,7 +108,14 @@ def _parse_time(value: str) -> dtime:
 STEP_GAP_MINUTES = 3
 
 
-def materialize_cadence(conn, lead_id: str, practice_id: int, start_on: date) -> int:
+def materialize_cadence(
+    conn,
+    lead_id: str,
+    practice_id: int,
+    start_on: date,
+    cadence_version_id: int | None = None,
+    update_lead: bool = True,
+) -> int:
     """Materialize production cadence or a compressed cadence for synthetic test leads."""
     settings = conn.execute(
         "select ps.business_hours,ps.holidays,p.timezone from practice_settings ps "
@@ -116,10 +123,21 @@ def materialize_cadence(conn, lead_id: str, practice_id: int, start_on: date) ->
     ).fetchone()
     if not settings:
         raise ValueError("practice settings not found")
-    lead = conn.execute("select is_test from leads where id=%s", (lead_id,)).fetchone()
+    lead = conn.execute(
+        "select is_test,cadence_state from leads where id=%s", (lead_id,)
+    ).fetchone()
+    version = conn.execute(
+        "select id from cadence_versions where practice_id=%s and status='active' "
+        "and (%s is null or id=%s) and (lead_id=%s or lead_id is null) "
+        "order by (lead_id is not null) desc limit 1",
+        (practice_id, cadence_version_id, cadence_version_id, lead_id),
+    ).fetchone()
+    if not version:
+        return 0
     steps = conn.execute(
-        "select id,step_order,day_offset,channel from cadence_steps where practice_id=%s and is_active "
-        "order by day_offset,step_order", (practice_id,),
+        "select id,step_order,day_offset,channel from cadence_steps "
+        "where cadence_version_id=%s and is_active order by day_offset,step_order",
+        (version["id"],),
     ).fetchall()
     app_settings = get_settings()
     accelerated = bool(app_settings.test_mode and lead and lead["is_test"])
@@ -131,25 +149,42 @@ def materialize_cadence(conn, lead_id: str, practice_id: int, start_on: date) ->
     # step_order runs across the whole cadence, so the gap is counted per day:
     # the first step of a day is unshifted, the second is STEP_GAP_MINUTES later.
     seen_on_day: dict[int, int] = {}
+    base_by_day: dict[int, datetime] = {}
+    previous: datetime | None = None
     for step in steps:
         position = seen_on_day.get(step["day_offset"], 0)
         seen_on_day[step["day_offset"]] = position + 1
         gap = timedelta(minutes=STEP_GAP_MINUTES * position)
-        scheduled_for = gap + (
-            anchor
-            + timedelta(minutes=step["day_offset"] * app_settings.test_cadence_day_minutes)
-            if accelerated
-            else compute_send_time(settings, lead_id, start_on, step["day_offset"])
-        )
+        if step["day_offset"] not in base_by_day:
+            base_by_day[step["day_offset"]] = (
+                anchor
+                + timedelta(minutes=step["day_offset"] * app_settings.test_cadence_day_minutes)
+                if accelerated
+                else compute_send_time(settings, lead_id, start_on, step["day_offset"])
+            )
+        scheduled_for = base_by_day[step["day_offset"]] + gap
+        # A three-minute same-day gap is longer than a one-minute compressed
+        # cadence day. Keep synthetic execution ordered even in that case.
+        if accelerated and previous and scheduled_for <= previous:
+            scheduled_for = previous + timedelta(seconds=1)
+        previous = scheduled_for
         conn.execute(
-            "insert into outreach_events(lead_id,cadence_step_id,channel,day_offset,scheduled_for,status) "
-            "values(%s,%s,%s,%s,%s,'planned')",
-            (lead_id, step["id"], step["channel"], step["day_offset"], scheduled_for),
+            "insert into outreach_events(lead_id,cadence_step_id,cadence_version_id,channel,"
+            "day_offset,scheduled_for,status) values(%s,%s,%s,%s,%s,%s,'planned')",
+            (
+                lead_id,
+                step["id"],
+                version["id"],
+                step["channel"],
+                step["day_offset"],
+                scheduled_for,
+            ),
         )
-    conn.execute(
-        "update leads set cadence_started_on=%s,cadence_state='active',status='in_progress',"
-        "status_changed_at=now() where id=%s", (start_on, lead_id),
-    )
+    if update_lead:
+        conn.execute(
+            "update leads set cadence_started_on=%s,cadence_state='active',status='in_progress',"
+            "status_changed_at=now() where id=%s", (start_on, lead_id),
+        )
     return len(steps)
 
 

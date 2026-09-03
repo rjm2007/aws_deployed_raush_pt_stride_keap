@@ -1,6 +1,6 @@
 # RPT Agent — Complete Project Context and Handoff
 
-Last updated: 2026-08-26 (Asia/Calcutta)
+Last updated: 2026-09-03 (Asia/Calcutta)
 
 This is the durable context file for future Codex, Claude, and human development sessions. Read this file
 before changing the project. Update it whenever a material decision, schema migration, integration contract,
@@ -215,9 +215,19 @@ Migrations currently present:
 14. `014_preproduction_booking_api.sql` — adds PHI-free `integration_events` auditing and records whether a
     settled call outcome came from a conversational tool or the end-report fallback.
 15. `015_stride_booking_gate.sql` — adds the fail-closed per-practice `stride_booking_enabled` switch.
+16. `016_dashboard_security_and_transcripts.sql` and `016_stride_sandbox_appointment_type.sql` — add the
+    authenticated dashboard audit/text-artifact surface and sandbox appointment-type configuration.
+17. `017_dashboard_lead_intake.sql` — adds dashboard-owned lead intake fields and idempotency.
+18. `018_dashboard_staff_attestation.sql` — records the dashboard staff contact-consent attestation.
+19. `019_booking_link_usage_type.sql` — distinguishes booking-link messages in the usage ledger.
+20. `020_cadence_versions.sql` — versions global cadence steps/templates, supports lead-scoped overrides,
+    expands cadence days through 365, and records the version used by each outreach event.
+21. `021_outreach_cadence_version_compatibility.sql` — preserves outreach-event version linkage while
+    pre-020 API/worker instances finish rolling over, and backfills concurrent legacy inserts.
+22. `022_deleted_cadence_versions.sql` — adds audited soft deletion for cadence versions, preserves deleted
+    steps/templates, and replaces developer-facing local-override names with personalized-plan names.
 
-Migrations 001–015 are applied to the currently configured hosted Supabase project and `rpt verify` confirmed
-the registry on 2026-08-26. Migration 009 fixed a real
+Migrations through 022 are applied to the currently configured hosted Supabase project. Migration 009 fixed a real
 end-to-end defect where a null `stride_location_timezone` caused `ZoneInfo(None)` during confirmation SMS
 delivery. Runtime delivery also falls back to the lead timezone and then `America/Los_Angeles`.
 
@@ -248,7 +258,9 @@ Important database guarantees and semantics:
 
 ## Cadence and synthetic test mode
 
-Production cadence scheduling remains unchanged.
+Production business-hour spreading remains unchanged. Cadence definitions are now immutable versions:
+an active lead-specific version takes precedence over the active global version, and activation replaces only
+future `planned` events while preserving in-flight and completed outreach.
 
 When both conditions are true:
 
@@ -686,6 +698,98 @@ user work when continuing development.
 
 Append entries newest first. Include date, decision/change, migrations, configuration impact, validation, and
 known follow-up. Do not include secrets or patient/tester identifiers.
+
+### 2026-09-03 — Shared dashboard shell and visual-system redesign
+
+- Reworked the frontend shell around one exact 88px alignment line shared by the navy navigation rail and
+  white application header. The standalone R mark, official Rausch wordmark, page label, filters, search,
+  connection state, and avatar now align consistently.
+- Replaced the plain three-line hamburger with an accessible side-panel collapse/expand control, retained the
+  brand anchor in the collapsed rail, centered the control beneath it, and kept the application header sticky.
+- Applied one restrained clinical-enterprise system across navigation, headings, status summaries, tables,
+  panels, forms, custom selects, cadence editors, template tools, and responsive states. Existing information
+  architecture, data, routes, and behavior were preserved; no dependency, database change, worker, or provider
+  path was added.
+- Rebuilt the lead cadence from the legacy timeline into the accepted five-column operational table: connected
+  step/day markers, channel, semantic status, scheduled/completed time, and provider outcome. Rescheduling stays
+  attached to the next planned event, while source-step creation remains in Personalized Outreach.
+- Validation: frontend ESLint, TypeScript, and Vinext production build passed. Authenticated Edge browser QA
+  covered 1920×1080 Home, expanded/collapsed navigation, the loaded lead cadence workspace, and 760×900 mobile.
+
+### 2026-09-03 — Lead workspace and template-library polish
+
+- Made lead-detail loading skeletons route-aware, so cadence, history, appointments, and conversation routes
+  render matching panel names instead of always showing the Overview page's Recent activity skeleton.
+- Rebuilt the shared location, owner, saved-plan, cadence-channel, and lead-intake dropdowns as one styled,
+  keyboard-accessible control; corrected the personalized outreach selector layout and made the top-bar logo
+  fill its frame cleanly.
+- Added authenticated SMS template create, rename/body update, and permanent-delete APIs and UI. Reusable
+  templates use existing `message_templates` rows with null cadence linkage; cadence-step templates remain
+  protected from deletion so scheduled SMS cannot lose required message copy.
+- Reusable SMS templates created in SMS Template Studio can now be imported into any SMS step in both global
+  and personalized cadence drafts. Import copies the message into the draft, leaving the saved template
+  independent and unchanged.
+- Added permanent deletion for already-soft-deleted cadence versions. It explicitly severs historical event
+  linkage, removes retained steps/templates, preserves an audit entry, and cannot target active/draft/archive
+  versions. The UI requires a second irreversible confirmation.
+- No schema migration, persistent database change, new table, dependency, worker, or provider path was needed.
+  Validation: `81 passed, 3 skipped`; Ruff, frontend lint, TypeScript, Vinext build, and authenticated 1920×1080
+  visual QA passed. A temporary saved template was also created, imported into a personalized SMS step, and
+  permanently removed through the live local dashboard.
+
+### 2026-09-03 — Cadence recovery and planner UX refinement
+
+- Kept deleted cadence versions in the existing soft-deleted `cadence_versions` rows: their normalized steps
+  and templates are already retained, so no duplicate recovery table or migration was added. Deleted versions
+  can now be selected, reviewed, renamed, and cloned into a new draft; rename and clone actions remain audited.
+- Added a patient-facing Standard outreach / Personalized outreach selector. Returning to Standard archives
+  the active personalized version and replaces only future `planned` events from the active global version;
+  completed, attempted, in-flight, failed, and other history is unchanged.
+- Replaced the all-steps-at-once cadence form with a step navigator and a focused single-step editor using
+  native fields and accessible controls. Provider implementation names are no longer exposed in plan labels.
+- Reduced and framed the Rausch top-bar logo, and added an Analytics loading skeleton using the dashboard's
+  existing skeleton components.
+- Installed and applied OpenAI's `frontend-app-builder` Codex skill for the workflow-first UI pass. No new
+  frontend dependency, database table, migration, worker, or provider execution path was added.
+- Validation: `79 passed, 3 skipped`; Ruff, frontend lint, TypeScript, and Vinext build passed.
+
+### 2026-09-03 — Cadence schema rollout and local dashboard launch
+
+- Applied migrations 020 and 021 to the configured hosted Supabase project after explicit approval. The
+  current cadence was backfilled as the single active `Standard v3`; all eight steps, linked templates, and
+  existing outreach events have cadence-version linkage.
+- Migration 021 handles concurrent writes from older running instances during rollout. Sixteen events created
+  immediately after migration 020 were backfilled, and subsequent step-linked inserts resolve their version
+  in the database as well as in the updated application code.
+- Launched only the API and frontend locally at ports 8000 and 3000. The frontend uses `.env.local` to force
+  its proxy to the local API; the provider worker and real provider execution paths were not started.
+- Verified API health, authenticated dashboard rendering, and the frontend cadence-version proxy. It returns
+  one active `Standard v3` version with eight ordered steps.
+- Live local review created four global drafts (`Standard v4` through `Standard v7`); `Standard v3` remains
+  active. A pending-state guard now prevents repeated Add Version submissions.
+- Applied migration 022 and added `DELETE /cadence-versions/{id}` as an audited soft delete. Active versions
+  are protected until another version is activated. The live dashboard moved Standard v4–v7 into the new
+  Deleted versions column while preserving their steps and audit history.
+- Replaced local-override terminology with client-facing personalized-plan language. Patient plan editing now
+  opens in a bounded full-width modal instead of rendering inside the narrow controls panel.
+- Replaced the top-bar product placeholder with the supplied Rausch logo asset and standardized location
+  markers on an accessible inline map-pin icon.
+- Post-change validation: `77 passed, 3 skipped`; Ruff, frontend lint, TypeScript, and Vinext build passed.
+
+### 2026-09-02 — Cadence versions, lead overrides, and dashboard loading fixes
+
+- Added migration 020 and the authenticated cadence-version API. Global drafts and lead-scoped local
+  overrides reuse the existing cadence step/template tables; activation archives the previous version and
+  replans only future planned events. Local overrides take precedence over global activation.
+- Added a shared full-flow editor for global and local cadence work: day, order within a day, call/SMS channel,
+  action label, enabled state, and SMS copy. Global Studio can add/view/activate versions, and the previously
+  inert Create local override control now creates and applies a lead-specific draft.
+- Added version-aware materialization/event history, extended cadence days to 365, preserved compressed-test
+  ordering when same-day gaps exceed a test day, and retained existing contact/suppression guardrails.
+- Reused the dashboard skeleton components for Today’s Work and Global Cadence Studio, and replaced the Send
+  SMS dot with an accessible envelope icon.
+- Local validation before rollout: `76 passed, 3 skipped`; Ruff, frontend lint, TypeScript, Vinext build,
+  Next build, and both repositories’ diff checks passed.
 
 ### 2026-08-26 — Real booking APIs and pre-production transition
 
