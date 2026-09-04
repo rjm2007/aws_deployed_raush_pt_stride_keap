@@ -371,11 +371,11 @@ def test_lead_detail_events_expose_creation_batch(monkeypatch):
 
 
 class ActivateVersionConnection:
-    def __init__(self):
+    def __init__(self, status="draft"):
         now = datetime.now(UTC)
         self.version = {
             "id": 4, "practice_id": 1, "lead_id": None, "version_number": 4,
-            "name": "Standard v4", "status": "draft", "source_version_id": 3,
+            "name": "Standard v4", "status": status, "source_version_id": 3,
             "activated_at": None, "created_at": now, "updated_at": now,
         }
         self.statements: list[str] = []
@@ -407,6 +407,30 @@ class ActivateVersionConnection:
 
 def test_global_activation_replans_only_planned_work_and_preserves_pause(monkeypatch):
     monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+
+
+def test_archived_global_version_can_be_reactivated(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = ActivateVersionConnection(status="archived")
+
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    monkeypatch.setattr(dashboard_routes, "materialize_cadence", lambda *args, **kwargs: 1)
+    response = TestClient(app).post(
+        "/api/v1/dashboard/cadence-versions/4/activate",
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "active"
     get_settings.cache_clear()
     connection = ActivateVersionConnection()
     materialized = []

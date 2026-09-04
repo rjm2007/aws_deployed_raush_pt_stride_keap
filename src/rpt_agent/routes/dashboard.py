@@ -1173,8 +1173,11 @@ def activate_cadence_version(version_id: int, actor: Actor):
             raise HTTPException(status_code=404, detail="cadence version not found")
         if version["status"] == "active":
             return {**_version_payload(conn, version), "replanned_leads": 0}
-        if version["status"] != "draft":
-            raise HTTPException(status_code=409, detail="only a draft cadence can be activated")
+        if version["status"] not in {"draft", "archived"}:
+            raise HTTPException(
+                status_code=409,
+                detail="only a draft or previous cadence can be activated",
+            )
         if version["lead_id"]:
             lead = conn.execute(
                 "select id,status,cadence_state from leads where id=%s and practice_id=%s for update",

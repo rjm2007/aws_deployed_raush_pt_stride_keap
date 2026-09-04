@@ -699,6 +699,15 @@ user work when continuing development.
 Append entries newest first. Include date, decision/change, migrations, configuration impact, validation, and
 known follow-up. Do not include secrets or patient/tester identifiers.
 
+### 2026-09-04 — Cadence reactivation and SMS preview fidelity
+
+- Previous global cadence versions can now be activated directly without cloning or editing them. The existing
+  activation transaction still archives the current version, replaces only future planned events, preserves
+  completed/in-flight history, and records the activation audit entry. Deleted versions remain ineligible.
+- SMS Template Studio preview bubbles now preserve line breaks and blank lines entered in the message editor.
+- No migration, configuration, dependency, worker, provider call, or database write was required. Validation:
+  archived-version API coverage, Ruff, frontend ESLint, TypeScript, and Vinext production build passed.
+
 ### 2026-09-03 — Shared dashboard shell and visual-system redesign
 
 - Reworked the frontend shell around one exact 88px alignment line shared by the navy navigation rail and
