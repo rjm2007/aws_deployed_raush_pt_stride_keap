@@ -4,6 +4,7 @@ from .provider_http import ProviderError, ProviderService
 
 class TwilioService(ProviderService):
     def send_sms(self, trace: WorkflowTrace, to: str, body: str) -> str:
+        self._assert_outbound_allowed("twilio")
         base = self.settings.provider_url("twilio")
         data = {"To": to, "From": self.settings.twilio_from_number, "Body": body}
         if self.settings.mode("twilio") == "mock":

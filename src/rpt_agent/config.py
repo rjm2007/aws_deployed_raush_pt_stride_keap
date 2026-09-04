@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     keap_handoff_url: str = "http://localhost:9000/mock/keap/events"
     keap_handoff_secret: str = "local-keap-secret"
     worker_poll_seconds: int = 30
+    # Master stop for anything that reaches a patient. Defaults on so a missing
+    # variable can never silence outreach by accident; set false to suspend all
+    # calls and SMS while leaving the dashboard readable.
+    outbound_enabled: bool = True
     test_mode: bool = False
     test_cadence_day_minutes: int = Field(default=5, ge=1, le=1440)
     mock_scenario: str = "success"

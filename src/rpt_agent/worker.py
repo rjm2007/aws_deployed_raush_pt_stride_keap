@@ -422,7 +422,11 @@ def run_tick() -> dict[str, int]:
         run_safety_checks(trace)
     reprocess_failed_vapi_events(trace)
     reprocess_failed_twilio_events(trace)
-    jobs = claim_jobs(trace)
+    # Claiming while suspended would burn each event against the provider guard
+    # and mark it failed. Leave the queue untouched so it resumes intact.
+    jobs = claim_jobs(trace) if get_settings().outbound_enabled else []
+    if not jobs and not get_settings().outbound_enabled:
+        trace.log("outbound_suspended")
     results = []
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(dispatch_job, trace, job, providers) for job in jobs]

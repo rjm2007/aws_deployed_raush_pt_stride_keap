@@ -1,6 +1,8 @@
 from datetime import date, datetime
 
-from rpt_agent.config import Settings
+import pytest
+
+from rpt_agent.config import Settings, get_settings
 from rpt_agent.observability import WorkflowTrace
 from rpt_agent.providers import ProviderError
 from rpt_agent.worker import (
@@ -131,3 +133,30 @@ def test_dispatch_classifies_safe_retry_and_ambiguous_exception():
     trace = WorkflowTrace("worker", "test")
     assert dispatch_job(trace, job, RetryableProvider()).state == "retry"
     assert dispatch_job(trace, job, UnexpectedProvider()).state == "unknown"
+
+
+def test_outbound_kill_switch_blocks_every_send_path(monkeypatch):
+    """The switch must bite inside the provider, not at the call sites.
+
+    The dashboard builds its own TwilioService for manual SMS, so a guard
+    placed on the worker alone would leave that path able to send while
+    outbound was supposed to be suspended.
+    """
+    from rpt_agent.services.provider_http import ProviderError
+    from rpt_agent.services.twilio_service import TwilioService
+    from rpt_agent.services.vapi_service import VapiService
+
+    monkeypatch.setenv("OUTBOUND_ENABLED", "false")
+    get_settings.cache_clear()
+    trace = WorkflowTrace("test", "test")
+
+    for service, call in (
+        (TwilioService(), lambda s: s.send_sms(trace, "+15550000001", "hi")),
+        (VapiService(), lambda s: s.create_call(trace, {})),
+    ):
+        with pytest.raises(ProviderError) as caught:
+            call(service)
+        assert caught.value.code == "outbound_disabled"
+
+    monkeypatch.setenv("OUTBOUND_ENABLED", "true")
+    get_settings.cache_clear()

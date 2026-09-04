@@ -6,6 +6,7 @@ from .provider_http import ProviderError, ProviderService
 
 class VapiService(ProviderService):
     def create_call(self, trace: WorkflowTrace, payload: dict[str, Any]) -> str:
+        self._assert_outbound_allowed("vapi")
         base = self.settings.provider_url("vapi")
         path = "/calls" if self.settings.mode("vapi") == "mock" else "/call"
         headers = (

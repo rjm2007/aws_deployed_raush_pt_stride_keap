@@ -44,6 +44,21 @@ class ProviderService:
         self.client = client or httpx.Client(timeout=self.settings.request_timeout_seconds)
         self.audit_enabled = audit_enabled
 
+    def _assert_outbound_allowed(self, provider: str) -> None:
+        """Refuse to contact a patient while outbound is suspended.
+
+        Placed on the shared base rather than at each call site: the dashboard
+        builds its own TwilioService, so guarding the callers would leave manual
+        SMS able to send while the worker was stopped.
+        """
+        if not self.settings.outbound_enabled:
+            raise ProviderError(
+                provider,
+                "outbound_disabled",
+                "outbound sending is suspended (OUTBOUND_ENABLED=false)",
+                ambiguous=False,
+            )
+
     @staticmethod
     def _retry_after(response: httpx.Response) -> int | None:
         value = response.headers.get("retry-after", "").strip()

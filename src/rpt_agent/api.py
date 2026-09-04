@@ -2,6 +2,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, Request
 
+from .config import get_settings
 from .observability import configure_logging, trace_id_var
 from .routes import (
     appointments_router,
@@ -39,11 +40,21 @@ TAGS = [
     {"name": "system", "description": "Health checks."},
 ]
 
+# The schema names every dashboard route and its shape. That is a map worth
+# having for local work and worth withholding in production, where the same
+# surface was reachable unauthenticated at /docs.
+_PUBLISH_SCHEMA = get_settings().app_env.lower() not in {
+    "preproduction", "preprod", "staging", "production", "prod",
+}
+
 app = FastAPI(
     title="RPT Agent API",
     description=DESCRIPTION,
     version="1.0.0-rc1",
     openapi_tags=TAGS,
+    docs_url="/docs" if _PUBLISH_SCHEMA else None,
+    redoc_url="/redoc" if _PUBLISH_SCHEMA else None,
+    openapi_url="/openapi.json" if _PUBLISH_SCHEMA else None,
 )
 app.include_router(health_router)
 app.include_router(availability_router)
