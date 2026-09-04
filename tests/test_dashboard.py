@@ -408,30 +408,6 @@ class ActivateVersionConnection:
 def test_global_activation_replans_only_planned_work_and_preserves_pause(monkeypatch):
     monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
     get_settings.cache_clear()
-
-
-def test_archived_global_version_can_be_reactivated(monkeypatch):
-    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
-    get_settings.cache_clear()
-    connection = ActivateVersionConnection(status="archived")
-
-    @contextmanager
-    def fake_transaction():
-        yield connection
-
-    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
-    monkeypatch.setattr(dashboard_routes, "materialize_cadence", lambda *args, **kwargs: 1)
-    response = TestClient(app).post(
-        "/api/v1/dashboard/cadence-versions/4/activate",
-        headers={
-            "X-Dashboard-Token": "x" * 32,
-            "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
-        },
-    )
-    assert response.status_code == 200
-    assert response.json()["status"] == "active"
-    get_settings.cache_clear()
     connection = ActivateVersionConnection()
     materialized = []
 
@@ -463,6 +439,31 @@ def test_archived_global_version_can_be_reactivated(monkeypatch):
     assert materialized[0][1]["cadence_version_id"] == 4
     assert materialized[0][1]["update_lead"] is False
     get_settings.cache_clear()
+
+
+def test_archived_global_version_can_be_reactivated(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = ActivateVersionConnection(status="archived")
+
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    monkeypatch.setattr(dashboard_routes, "materialize_cadence", lambda *args, **kwargs: 1)
+    response = TestClient(app).post(
+        "/api/v1/dashboard/cadence-versions/4/activate",
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "active"
+    get_settings.cache_clear()
+
 
 
 def test_cadence_version_rejects_empty_sms_copy(monkeypatch):
