@@ -786,3 +786,86 @@ def test_switching_to_standard_archives_local_and_replans_only_future(monkeypatc
     assert "status='planned'" in replan
     assert materialized[0][1] == {"cadence_version_id": 3, "update_lead": False}
     get_settings.cache_clear()
+
+
+class DeleteLeadConnection:
+    """Minimal stand-in for the delete path.
+
+    Result has no rowcount, and the endpoint reads it to report what it
+    removed, so this returns its own row objects instead.
+    """
+
+    class Rows:
+        def __init__(self, rows, rowcount=0):
+            self.rows, self.rowcount = rows, rowcount
+
+        def fetchall(self):
+            return self.rows
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    def __init__(self, in_flight=0):
+        self.in_flight = in_flight
+        self.statements: list[str] = []
+
+    def execute(self, sql, params=None):
+        del params
+        normal = " ".join(sql.split())
+        self.statements.append(normal)
+        if normal.startswith("select id,practice_id,full_name,phone_e164 from leads"):
+            return self.Rows([{
+                "id": uuid4(), "practice_id": 1,
+                "full_name": "Delete Me", "phone_e164": "+15550000001",
+            }])
+        if "status in ('in_flight','attempted')" in normal:
+            return self.Rows([{"total": self.in_flight}])
+        if normal.startswith("select count(*) as total from outreach_events"):
+            return self.Rows([{"total": 8}])
+        return self.Rows([], rowcount=2)
+
+
+def _delete_lead(connection, monkeypatch):
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    return TestClient(app).delete(
+        f"/api/v1/dashboard/leads/{uuid4()}",
+        headers={
+            "X-Dashboard-Token": "x" * 32,
+            "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Email": "staff@example.test",
+        },
+    )
+
+
+def test_delete_lead_removes_the_tables_that_do_not_cascade(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = DeleteLeadConnection()
+    response = _delete_lead(connection, monkeypatch)
+    assert response.status_code == 200
+
+    # appointments and dashboard_sms_requests are RESTRICT: leaving them would
+    # make the final delete fail. sms_messages and notification_log are SET
+    # NULL: leaving them would strand patient message bodies with no owner.
+    for table in ("appointments", "dashboard_sms_requests", "sms_messages", "notification_log"):
+        assert any(sql.startswith(f"delete from {table} where lead_id=") for sql in connection.statements)
+    # The usage ledger records money already spent and is deliberately kept.
+    assert not any("delete from test_usage_ledger" in sql for sql in connection.statements)
+    assert any("insert into dashboard_audit_log" in sql for sql in connection.statements)
+    assert any(sql.startswith("delete from leads where id=") for sql in connection.statements)
+    get_settings.cache_clear()
+
+
+def test_delete_lead_refuses_while_a_call_is_in_flight(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = DeleteLeadConnection(in_flight=1)
+    response = _delete_lead(connection, monkeypatch)
+    assert response.status_code == 409
+    # Nothing may be removed while a provider result is still coming back.
+    assert not any(sql.startswith("delete from") for sql in connection.statements)
+    get_settings.cache_clear()

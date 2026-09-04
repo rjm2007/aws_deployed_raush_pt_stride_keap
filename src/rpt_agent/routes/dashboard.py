@@ -737,6 +737,67 @@ def use_standard_cadence(lead_id: UUID, payload: CadenceModeChange, actor: Actor
     }
 
 
+@router.delete("/leads/{lead_id}")
+def delete_dashboard_lead(lead_id: UUID, actor: Actor):
+    """Remove a lead and everything belonging to it.
+
+    Six tables cascade from leads(id) already -- outreach events, call logs,
+    transcripts, status history, message overrides and any lead-scoped cadence.
+    Three do not, and each needs a decision rather than a cascade:
+
+      appointments, dashboard_sms_requests  RESTRICT, so they block the delete
+      sms_messages, notification_log        SET NULL, leaving patient message
+                                            bodies behind with no owner
+      test_usage_ledger                     SET NULL, and kept on purpose: it
+                                            records money already spent
+
+    So the first four are removed explicitly and the usage ledger is left to
+    null out, preserving the billing trail.
+    """
+    with transaction() as conn:
+        lead = conn.execute(
+            "select id,practice_id,full_name,phone_e164 from leads where id=%s for update",
+            (lead_id,),
+        ).fetchone()
+        if not lead:
+            raise HTTPException(status_code=404, detail="lead not found")
+
+        # A call already handed to the provider will report back by webhook.
+        # Deleting now would leave that result with nothing to attach to, so
+        # wait for it to land instead.
+        in_flight = conn.execute(
+            "select count(*) as total from outreach_events where lead_id=%s "
+            "and status in ('in_flight','attempted')",
+            (lead_id,),
+        ).fetchone()
+        if in_flight["total"]:
+            raise HTTPException(
+                status_code=409,
+                detail="a call or message is still in progress for this lead; try again shortly",
+            )
+
+        removed = {}
+        for table in ("appointments", "dashboard_sms_requests", "sms_messages", "notification_log"):
+            cursor = conn.execute(f"delete from {table} where lead_id=%s", (lead_id,))
+            removed[table] = cursor.rowcount
+        events = conn.execute(
+            "select count(*) as total from outreach_events where lead_id=%s", (lead_id,)
+        ).fetchone()["total"]
+
+        # Audit before the row goes: the log keeps ids as text, so it survives.
+        _audit(
+            conn,
+            actor,
+            lead["practice_id"],
+            "lead.deleted",
+            "lead",
+            str(lead_id),
+            {"full_name": lead["full_name"], "cascaded_events": events, **removed},
+        )
+        conn.execute("delete from leads where id=%s", (lead_id,))
+    return {"deleted": str(lead_id), "cascaded_events": events, **removed}
+
+
 @router.post("/leads/{lead_id}/stage")
 def move_lead_stage(lead_id: UUID, payload: StageMove, actor: Actor):
     """Move a lead between board columns.
