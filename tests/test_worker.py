@@ -160,3 +160,26 @@ def test_outbound_kill_switch_blocks_every_send_path(monkeypatch):
 
     monkeypatch.setenv("OUTBOUND_ENABLED", "true")
     get_settings.cache_clear()
+
+
+def test_version_lookup_types_its_optional_parameter():
+    """Guard the cast that keeps lead creation working.
+
+    The optional cadence_version_id is None for the two commonest callers --
+    creating a lead and restarting one from the board. Without ::bigint,
+    Postgres cannot type the bare NULL and raises IndeterminateDatatype, so
+    both paths return 500.
+
+    Asserted against the SQL text rather than a live query because every other
+    test here mocks the connection: a fake cursor accepts an untyped NULL
+    happily, which is exactly how this reached production.
+    """
+    import inspect
+
+    from rpt_agent import worker
+
+    source = inspect.getsource(worker.materialize_cadence)
+    version_query = source[source.index("select id from cadence_versions") :]
+    version_query = version_query[: version_query.index("order by")]
+    assert "%s::bigint is null" in version_query
+    assert "id=%s::bigint" in version_query

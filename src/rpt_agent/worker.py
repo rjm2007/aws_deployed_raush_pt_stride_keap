@@ -126,9 +126,13 @@ def materialize_cadence(
     lead = conn.execute(
         "select is_test,cadence_state from leads where id=%s", (lead_id,)
     ).fetchone()
+    # The optional version id needs an explicit cast. Passing None leaves
+    # Postgres with a bare NULL it cannot type ("could not determine data type
+    # of parameter $2"), which broke every caller that does not name a version:
+    # creating a lead, and restarting one from the board.
     version = conn.execute(
         "select id from cadence_versions where practice_id=%s and status='active' "
-        "and (%s is null or id=%s) and (lead_id=%s or lead_id is null) "
+        "and (%s::bigint is null or id=%s::bigint) and (lead_id=%s or lead_id is null) "
         "order by (lead_id is not null) desc limit 1",
         (practice_id, cadence_version_id, cadence_version_id, lead_id),
     ).fetchone()
