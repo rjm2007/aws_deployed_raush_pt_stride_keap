@@ -90,7 +90,7 @@ def test_undelivered_cadence_sms_pauses_for_review():
     assert skip[0][1][1] == "lead-1"
 
 
-def _settle_with(monkeypatch, structured):
+def _settle_with(monkeypatch, structured, turns=None):
     """Run the post-call fallback on one extractor result; return the status
     it applied, or "review" when the call went to staff instead."""
     from contextlib import contextmanager
@@ -121,7 +121,10 @@ def _settle_with(monkeypatch, structured):
 
     monkeypatch.setattr(delivery, "transaction", fake_transaction)
     monkeypatch.setattr(lead_status, "report_lead_status", fake_report)
-    message = {"artifact": {"structuredOutputs": {"x": {"result": structured}}}}
+    message = {"artifact": {
+        "structuredOutputs": {"x": {"result": structured}},
+        "messages": [{"role": r, "message": m} for r, m in (turns or [])],
+    }}
     delivery._settle_from_structured_output(
         WorkflowTrace("t", "test"), message, lead_id="lead-1", event_id=1, call_id="c"
     )
@@ -136,9 +139,40 @@ def test_hang_up_with_no_decision_keeps_outreach_going(monkeypatch):
 
 
 def test_extractor_refusal_and_opt_out_are_applied_with_their_note(monkeypatch):
-    applied = _settle_with(monkeypatch, {"status": "declined", "summary": "Said she is all set."})
+    answered = [("bot", "Am I speaking with Emma?"), ("user", "Yes."),
+                ("bot", "This is Sarah calling from Rausch. Is now a good time?"),
+                ("user", "No, I'm all set.")]
+    applied = _settle_with(monkeypatch, {"status": "declined", "summary": "Said she is all set."}, answered)
     assert applied == {"status": "declined", "notes": "Said she is all set."}
-    assert _settle_with(monkeypatch, {"status": "do_not_contact"})["status"] == "do_not_contact"
+    assert _settle_with(monkeypatch, {"status": "do_not_contact"}, answered)["status"] == "do_not_contact"
+
+
+DEVYANSH = [  # 26 Sep, 10:47 PM: "Yes", then silence until the call timed out
+    ("user", "Hello?"),
+    ("bot", "Hi. Am I speaking with Devianch Chaudhary?"),
+    ("user", "Yes."),
+    ("bot", ("Great. This is Sarah calling from Rausch Physical Therapy and Wellness. "
+             "Is this a convenient time to speak?")),
+    ("bot", "Are you still there?"),
+    ("bot", "Are you still there?"),
+]
+
+
+def test_silence_after_the_introduction_is_never_a_refusal(monkeypatch):
+    """Gemini read this call as "declined" despite the extractor's rules. The
+    patient never answered anything after Sarah said why she was calling."""
+    applied = _settle_with(
+        monkeypatch,
+        {"status": "declined", "summary": "The patient did not respond."},
+        DEVYANSH,
+    )
+    assert applied["status"] == "no_answer"
+    assert "The patient did not respond." in applied["notes"]  # evidence kept
+
+
+def test_opt_out_said_before_the_introduction_is_still_honoured(monkeypatch):
+    early = [("bot", "Hi. Am I speaking with Devyansh?"), ("user", "Stop calling me.")]
+    assert _settle_with(monkeypatch, {"status": "do_not_contact"}, early)["status"] == "do_not_contact"
 
 
 def test_failed_extraction_goes_to_staff(monkeypatch):

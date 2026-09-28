@@ -299,6 +299,42 @@ def _assistant_spoke(message: dict) -> bool:
     )
 
 
+def _call_turns(message: dict) -> list[tuple[str, str]]:
+    """The call as (speaker, words) pairs, speaker being "bot" or "user"."""
+    artifact = message.get("artifact") if isinstance(message.get("artifact"), dict) else {}
+    turns = [
+        (str(item.get("role")), str(item.get("message") or ""))
+        for item in artifact.get("messages") or []
+        if isinstance(item, dict) and item.get("role") in ("bot", "user")
+    ]
+    if turns:
+        return turns
+    transcript, _ = _call_text_artifacts(message)
+    for line in (transcript or "").splitlines():
+        speaker, _, words = line.partition(":")
+        role = {"ai": "bot", "user": "user"}.get(speaker.strip().lower())
+        if role:
+            turns.append((role, words))
+    return turns
+
+
+def _patient_replied_after(message: dict, *, introduction: bool) -> bool:
+    """Whether the patient said anything after Sarah's first line, or - with
+    introduction=True - after she said why she was calling (her first line that
+    names Rausch). "Yes" to "Am I speaking with ...?" and then silence is not an
+    answer to anything, so it cannot be a refusal."""
+    turns = _call_turns(message)
+    bot_lines = [i for i, (role, _) in enumerate(turns) if role == "bot"]
+    if not bot_lines:
+        return False
+    start = bot_lines[0]
+    if introduction:
+        start = next(
+            (i for i in bot_lines if "rausch" in turns[i][1].lower()), bot_lines[0]
+        )
+    return any(role == "user" and words.strip() for role, words in turns[start + 1 :])
+
+
 def _settle_from_structured_output(
     trace: WorkflowTrace, message: dict, *, lead_id: str, event_id: int, call_id: str
 ) -> str | None:
@@ -329,6 +365,21 @@ def _settle_from_structured_output(
     # and keep the cadence going - only the patient can end outreach.
     status = str(result.get("status") or "").strip() or "no_answer"
     summary_note = str(result.get("summary") or "")
+    # The extractor is told silence is not a refusal, but it runs on a model Vapi
+    # picks (Gemini, whatever we pin) and has still called silence "declined".
+    # Closing a lead is only allowed on the patient's own answer, which the
+    # transcript shows or does not - an AI's reading of it is not enough.
+    answered = (
+        _patient_replied_after(message, introduction=True)
+        if status == "declined"
+        else _patient_replied_after(message, introduction=False)
+        if status in {"do_not_contact", "call_opt_out"}
+        else True
+    )
+    if not answered:
+        trace.log("fallback_refusal_without_answer", event_id=event_id, extracted=status)
+        status = "no_answer"
+        summary_note = f"No answer from the patient; outreach continues. {summary_note}".strip()
     try:
         report_lead_status(
             trace,
