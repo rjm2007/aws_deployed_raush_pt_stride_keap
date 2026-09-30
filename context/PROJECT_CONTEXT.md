@@ -850,6 +850,18 @@ npm.cmd run build
 Append entries newest first. Include date, decision/change, migrations, configuration impact, validation, and
 known follow-up. Do not include secrets or patient/tester identifiers.
 
+### 2026-09-30 - Cadence history and transcript UX contract
+
+- Extended the lead-detail dashboard response with cadence scope, intended active-step count, and the existing
+  call-to-outreach event link. This is additive only; no stored values, provider behavior, schema, migration,
+  or configuration changed.
+- The frontend now labels full and interrupted runs from attempted steps, filters standard and personalized
+  history without renumbering runs, reorders plan steps with native drag-and-drop plus button fallbacks, and
+  deep-links cadence calls to transcript sessions named by outreach and call number.
+- Validation: backend `197 passed, 3 skipped` plus Ruff; frontend cadence/display tests, lint, typecheck,
+  Vinext production build, and Next/Vercel production build passed. Connected localhost desktop checks passed
+  in light and dark themes, including the final transcript-action alignment.
+
 ### 2026-09-17 — Streaming terminal assistant
 
 - Added authenticated `POST /api/v1/dashboard/assistant/stream` using Server-Sent Events while preserving the
