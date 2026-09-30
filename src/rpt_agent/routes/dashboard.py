@@ -639,7 +639,11 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
             # text the patient never received.
             "select oe.id,oe.cadence_step_id,oe.cadence_version_id,oe.channel,oe.day_offset,"
             "oe.status,oe.scheduled_for,oe.created_at,oe.executed_at,oe.outcome,cs.description,"
-            "cv.name as cadence_version_name,sm.delivery_status,sm.failure_reason "
+            "cv.name as cadence_version_name,"
+            "case when cv.lead_id is not null then 'personalized' else 'standard' end "
+            "as cadence_scope,(select count(*) from cadence_steps expected "
+            "where expected.cadence_version_id=oe.cadence_version_id and expected.is_active) "
+            "as cadence_step_count,sm.delivery_status,sm.failure_reason "
             "from outreach_events oe left join cadence_steps cs on cs.id=oe.cadence_step_id "
             "left join cadence_versions cv on cv.id=oe.cadence_version_id "
             "left join sms_messages sm on sm.outreach_event_id=oe.id "
@@ -652,7 +656,8 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
             (lead_id,),
         ).fetchall()
         calls = conn.execute(
-            "select cl.id,cl.dialed_at,cl.ended_at,cl.duration_seconds,cl.answer_state,"
+            "select cl.id,cl.outreach_event_id,cl.dialed_at,cl.ended_at,cl.duration_seconds,"
+            "cl.answer_state,"
             "cl.ended_reason,coalesce(ct.transcript_text,cl.transcript_text) as transcript_text,"
             "coalesce(ct.summary,cl.summary_text) as summary_text,ct.transcript_link "
             "from call_logs cl left join call_transcripts ct on ct.call_log_id=cl.id "

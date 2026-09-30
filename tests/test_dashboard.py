@@ -144,14 +144,24 @@ class DetailConnection:
                  "status": "delivered", "scheduled_for": datetime.now(UTC),
                  "created_at": datetime.now(UTC), "executed_at": datetime.now(UTC),
                  "outcome": None, "description": "Initial SMS", "cadence_version_name": "Standard v3",
+                 "cadence_scope": "standard", "cadence_step_count": 2,
                  "delivery_status": "delivered", "failure_reason": None},
                 {"id": 2, "cadence_step_id": 2, "cadence_version_id": 3,
                  "channel": "call", "day_offset": 3,
                  "status": "attempted", "scheduled_for": datetime.now(UTC),
                  "created_at": datetime.now(UTC), "executed_at": datetime.now(UTC),
                  "outcome": None, "description": "Follow-up Call", "cadence_version_name": "Standard v3",
+                 "cadence_scope": "standard", "cadence_step_count": 2,
                  "delivery_status": None, "failure_reason": None},
             ])
+        if "from call_logs cl" in sql:
+            return Result([{
+                "id": 7, "outreach_event_id": 2, "dialed_at": datetime.now(UTC),
+                "ended_at": datetime.now(UTC), "duration_seconds": 12,
+                "answer_state": "answered", "ended_reason": "completed",
+                "transcript_text": "Assistant: Hello", "summary_text": "Connected",
+                "transcript_link": None,
+            }])
         if "from cadence_versions" in sql:
             return Result([{
                 "id": 3, "name": "Standard v3", "version_number": 3, "status": "active",
@@ -324,6 +334,10 @@ def test_dashboard_lead_detail_uses_database_phone_and_event_progress(monkeypatc
         assert lead["cadence_total"] == 2
         assert lead["next_event_status"] == "attempted"
         assert lead["next_step"] == "Awaiting result: Follow-up Call"
+        detail = response.json()
+        assert detail["events"][0]["cadence_scope"] == "standard"
+        assert detail["events"][0]["cadence_step_count"] == 2
+        assert detail["calls"][0]["outreach_event_id"] == 2
     finally:
         get_settings.cache_clear()
 
@@ -462,6 +476,18 @@ def test_lead_detail_events_expose_creation_batch(monkeypatch):
     events_query = source[source.index("events = conn.execute("):]
     events_query = events_query[: events_query.index(").fetchall()")]
     assert "oe.created_at" in events_query, events_query
+
+
+def test_lead_detail_exposes_cadence_and_call_linkage():
+    source = Path(dashboard_routes.__file__).read_text(encoding="utf-8")
+    events_query = source[source.index("events = conn.execute("):]
+    events_query = events_query[: events_query.index(").fetchall()")]
+    calls_query = source[source.index("calls = conn.execute("):]
+    calls_query = calls_query[: calls_query.index(").fetchall()")]
+
+    assert "as cadence_scope" in events_query
+    assert "as cadence_step_count" in events_query
+    assert "cl.outreach_event_id" in calls_query
 
 
 class ActivateVersionConnection:
