@@ -1,7 +1,6 @@
 # RPT Agent — Complete Project Context and Handoff
 
-Last updated: 2026-09-17 (Asia/Calcutta)
-Last updated: 2026-09-20 (Asia/Calcutta)
+Last updated: 2026-10-02 (Asia/Calcutta)
 
 This is the durable context file for future Codex, Claude, and human development sessions. Read this file
 before changing the project. Update it whenever a material decision, schema migration, integration contract,
@@ -693,10 +692,21 @@ patient, case, appointment, call, SMS, or Keap write. The live response establis
 
 ## Local and ngrok commands
 
+Dashboard-only Windows startup (existing configured environment files):
+
+```powershell
+cd F:\rpt\rpt_frontend
+npm.cmd run start:local
+```
+
+This starts/reuses the frontend on port 3000 and FastAPI on loopback port 8000 without starting outreach or
+Sheet workers, applying migrations, changing provider modes, or enabling booking. A healthy dashboard does
+not imply live booking readiness: `/ready` still rejects unverified Stride practice configuration.
+
 Start/rebuild:
 
 ```powershell
-cd F:\rpt
+cd F:\rpt\aws_deployed_raush_pt_stride_keap
 docker compose run --rm api rpt migrate
 docker compose up --build -d
 ```
@@ -849,6 +859,48 @@ npm.cmd run build
 
 Append entries newest first. Include date, decision/change, migrations, configuration impact, validation, and
 known follow-up. Do not include secrets or patient/tester identifiers.
+
+### 2026-10-02 - Dashboard connection, consistency, and workspace audit
+
+- The local dashboard outage was a stopped FastAPI process. Added a frontend Windows dashboard-only
+  launcher so one command starts both services and verifies their URLs. No workers or provider settings
+  are enabled by the launcher.
+- The frontend proxy now returns a safe, uncached `503` on connection failures. Expired sessions return to
+  sign-in; failed reads retain previously loaded data with a recovery notice, and failed lead detail reads
+  no longer leave an endless skeleton. Removed the obsolete local-preview success fallback.
+- Tightened shared form/button heights, keyboard focus, search labels, mobile chart sizing, dark-theme stage
+  colors, light-theme status contrast, and team activity layout. Preserved the existing brand, permissions, ownership, and activity-only
+  staff filtering. No patient, schema, migration, or runtime credential changes were made.
+- Refreshed `uv.lock` to include the already-declared assistant dependencies and corrected the conflicting
+  websockets installation. Python dependency compatibility and wheel build pass. Updated frontend
+  Cloudflare tooling compatibly; `npm audit` reports zero vulnerabilities. Updated development-only pytest
+  and pytest-asyncio for the pytest temporary-directory advisory; `pip-audit` reports no known published
+  dependency vulnerabilities (the local application is not a PyPI package).
+- Recycled only two confirmed stale Next build folders from `F:\rpt` (83,456,305 bytes). Source repositories,
+  environment files, logs, migrations, Git history, and active dependencies were retained. Whole-drive
+  deletion was not inferred from an ambiguous cleanup request.
+- Known follow-ups: use the declared Node 22 runtime for deployment (this machine currently uses Node 26);
+  integration tests requiring separate test services remain skipped; one upstream Starlette deprecation
+  warning remains. Stride live-booking verification is still required before outreach production readiness.
+- Validation: backend `204 passed, 3 skipped`, Ruff, dependency compatibility, lock validation, and wheel
+  build pass; frontend 15 tests, ESLint, TypeScript, Vinext and native Next.js production builds pass.
+  All six configured accounts pass HTTP sign-in and authenticated reads; every employee gets `403` for
+  global cadence creation. Desktop/mobile/tablet and both themes checked. Controlled service outages return
+  safe uncached `503` responses, preserve loaded data, and recover automatically or via Retry connection after restart. The frontend
+  `AUDIT.md` records the scope, corrections, cleanup, and remaining operational limits.
+
+### 2026-10-02 - Configured six dashboard email logins
+
+- Configured one super admin and five employees in the ignored local frontend and backend `.env` files.
+  The backend roster is an operator-facing mirror only; password validation remains frontend-server-only.
+  The existing dashboard API token and session secret are unchanged.
+- Added optional, unique, case-insensitive email aliases to the frontend roster. Email and short employee-ID
+  login both resolve to the same stable ID, preserving ownership, signed sessions, and activity attribution.
+  Legacy shared-password variables are unused. No Supabase Auth token, database change, or migration is needed.
+- Validation: all six real configured accounts passed signed-session and HTTP login checks; all five employees
+  received `403` for an admin-only deletion request without changing any lead. Admin and employee dashboard
+  reads and browser sign-in passed, with Administration hidden for employees. Frontend auth tests, lint,
+  typecheck, both production builds, and backend permission tests (`37 passed`) plus Ruff passed.
 
 ### 2026-09-30 - Cadence history and transcript UX contract
 
@@ -1630,3 +1682,22 @@ known follow-up. Do not include secrets or patient/tester identifiers.
 - Changing a linked Sheet row's phone keeps the stored phone and Lead ID, pauses remaining outreach, and flags both the database
   and Sheet `Needs Review` fields. Only the profile-sync n8n workflow handles this Sheet edit.
 - Validation: `194 passed, 3 skipped`; Ruff, workflow JSON parsing, Compose configuration, and diff checks passed.
+
+### 2026-10-02 - Multi-user dashboard access and lead activity
+
+- Reworked unapplied migration 031 to add text employee IDs for optional lead ownership plus employee-name
+  snapshots and indexed lead attribution on the existing durable dashboard audit log. It does not create a
+  staff table or reference `auth.users`.
+- Applied migration 031 to the configured hosted database after confirming migrations through 030 were the
+  complete existing registry. Any later schema change must use a new migration.
+- Dashboard access uses a 12-hour signed HttpOnly cookie backed by the frontend's server-only
+  `DASHBOARD_USERS_JSON`. Exactly one configured user is the super admin. The frontend proxy forwards a
+  validated employee ID, display name, and role only alongside the shared server-to-server dashboard token;
+  the backend rejects malformed identity headers and repeats every role check.
+- Employees can perform lead-scoped work across the practice. Global cadence and SMS template changes, lead
+  deletion, and permanent cadence deletion require the super admin on the API.
+- Adding, removing, or changing users is deliberately limited to editing the frontend environment and
+  redeploying. Passwords remain server-only and never enter the browser bundle, database, or audit metadata.
+- Lead detail now returns a normalized, latest-first activity feed combining attributed employee changes with
+  automated outreach, appointments, and non-dashboard status transitions; message bodies and transcripts are
+  excluded from activity metadata.

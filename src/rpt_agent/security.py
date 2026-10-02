@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import re
 import time
 from dataclasses import dataclass
+from urllib.parse import unquote
 
 from fastapi import HTTPException, Request
 from fastapi.security import APIKeyHeader
@@ -26,6 +28,10 @@ MAX_N8N_INTAKE_BODY_BYTES = 64 * 1024
 class DashboardActor:
     user_id: str
     email: str
+    employee_id: str = ""
+    display_name: str = ""
+    role: str = "super_admin"
+    practice_id: int = 1
 
 
 def timestamped_hmac(secret: str, timestamp: str, body: bytes) -> str:
@@ -108,11 +114,23 @@ def require_dashboard_auth(request: Request) -> DashboardActor:
         raise HTTPException(status_code=503, detail="dashboard API is not configured")
     if not supplied or not hmac.compare_digest(supplied, expected):
         raise HTTPException(status_code=401, detail="invalid dashboard credentials")
-    user_id = request.headers.get("x-dashboard-user-id", "").strip()
-    email = request.headers.get("x-dashboard-user-email", "").strip().lower()
-    if not user_id or not email or len(user_id) > 200 or len(email) > 320:
+    user_id = request.headers.get("x-dashboard-user-id", "").strip().lower()
+    display_name = unquote(request.headers.get("x-dashboard-user-name", "")).strip()
+    role = request.headers.get("x-dashboard-user-role", "").strip()
+    if (
+        not re.fullmatch(r"[a-z0-9][a-z0-9._-]{2,31}", user_id)
+        or not display_name
+        or len(display_name) > 120
+        or role not in {"super_admin", "employee"}
+    ):
         raise HTTPException(status_code=401, detail="authenticated dashboard user is required")
-    return DashboardActor(user_id=user_id, email=email)
+    return DashboardActor(
+        user_id=user_id,
+        email=user_id,
+        employee_id=user_id,
+        display_name=display_name,
+        role=role,
+    )
 
 
 async def require_vapi_auth(request: Request) -> None:

@@ -3,12 +3,71 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 import rpt_agent.routes.dashboard as dashboard_routes
 from rpt_agent.api import app
 from rpt_agent.config import get_settings
+from rpt_agent.security import DashboardActor
 from rpt_agent.services.delivery import _call_text_artifacts
+
+
+def test_employee_cannot_delete_lead_or_create_global_cadence():
+    employee = DashboardActor("staff-1", "employee@example.test", role="employee")
+    with pytest.raises(Exception) as delete_error:
+        dashboard_routes.delete_dashboard_lead(uuid4(), employee)
+    assert delete_error.value.status_code == 403
+    with pytest.raises(Exception) as cadence_error:
+        dashboard_routes.create_cadence_version(
+            dashboard_routes.CadenceVersionCreate(), employee
+        )
+    assert cadence_error.value.status_code == 403
+
+
+def test_activity_feed_attributes_people_without_message_bodies():
+    now = datetime.now(UTC)
+    activity = dashboard_routes._build_activity(
+        [
+            {
+                "id": 1,
+                "action": "lead.updated",
+                "metadata": {"fields": ["owner"]},
+                "created_at": now,
+                "actor_name": "Alex Morgan",
+            },
+            {
+                "id": 2,
+                "action": "lead.stage_changed",
+                "metadata": {"stage": "contacted"},
+                "created_at": now,
+                "actor_name": "Sarah Johnson",
+            },
+        ],
+        [{
+            "id": 3,
+            "status": "delivered",
+            "channel": "sms",
+            "created_at": now,
+            "executed_at": now,
+            "delivery_status": "delivered",
+            "cadence_version_name": "Standard",
+            "description": "Follow-up",
+        }],
+        [],
+        [{
+            "id": 4,
+            "state": "scheduled",
+            "booked_at": now,
+            "start_utc": now,
+        }],
+    )
+    assert {entry["actor_name"] for entry in activity} == {
+        "Alex Morgan",
+        "Sarah Johnson",
+        "Automation",
+    }
+    assert "body" not in str(activity).lower()
 
 
 class Result:
@@ -195,6 +254,39 @@ def test_dashboard_requires_server_token(monkeypatch):
         get_settings.cache_clear()
 
 
+def test_employee_http_requests_cannot_reach_admin_only_writes(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+
+    def forbidden_transaction():
+        raise AssertionError("Admin-only request reached the database")
+
+    monkeypatch.setattr(dashboard_routes, "transaction", forbidden_transaction)
+    client = TestClient(app)
+    headers = {
+        "X-Dashboard-Token": "x" * 32,
+        "X-Dashboard-User-ID": "employee1",
+        "X-Dashboard-User-Name": "Test%20Team%20Member",
+        "X-Dashboard-User-Role": "employee",
+    }
+    requests = [
+        ("DELETE", f"leads/{uuid4()}", None),
+        ("POST", "cadence-versions", {}),
+        ("DELETE", "cadence-versions/1/permanent", None),
+        ("POST", "message-templates", {"name": "Synthetic", "body": "Synthetic text"}),
+        ("PATCH", "message-templates/1", {"body": "Synthetic text"}),
+        ("DELETE", "message-templates/1", None),
+    ]
+    try:
+        for method, path, body in requests:
+            response = client.request(
+                method, f"/api/v1/dashboard/{path}", headers=headers, json=body
+            )
+            assert response.status_code == 403, (method, path, response.status_code)
+    finally:
+        get_settings.cache_clear()
+
+
 def test_dashboard_snapshot_uses_authenticated_actor(monkeypatch):
     monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
     get_settings.cache_clear()
@@ -210,7 +302,8 @@ def test_dashboard_snapshot_uses_authenticated_actor(monkeypatch):
             headers={
                 "X-Dashboard-Token": "x" * 32,
                 "X-Dashboard-User-ID": "staff-1",
-                "X-Dashboard-User-Email": "staff@example.test",
+                "X-Dashboard-User-Name": "Test%20Administrator",
+                "X-Dashboard-User-Role": "super_admin",
             },
         )
         assert response.status_code == 200
@@ -247,7 +340,8 @@ def test_second_lead_on_the_same_phone_number_is_allowed_with_a_warning(monkeypa
             headers={
                 "X-Dashboard-Token": "x" * 32,
                 "X-Dashboard-User-ID": "staff-1",
-                "X-Dashboard-User-Email": "staff@example.test",
+                "X-Dashboard-User-Name": "Test%20Administrator",
+                "X-Dashboard-User-Role": "super_admin",
             },
         )
         assert response.status_code == 201, response.json()
@@ -285,7 +379,8 @@ def test_dashboard_create_lead_persists_and_materializes(monkeypatch):
     headers = {
         "X-Dashboard-Token": "x" * 32,
         "X-Dashboard-User-ID": "staff-1",
-        "X-Dashboard-User-Email": "staff@example.test",
+        "X-Dashboard-User-Name": "Test%20Administrator",
+        "X-Dashboard-User-Role": "super_admin",
     }
     try:
         denied = TestClient(app).post(
@@ -324,7 +419,8 @@ def test_dashboard_lead_detail_uses_database_phone_and_event_progress(monkeypatc
             headers={
                 "X-Dashboard-Token": "x" * 32,
                 "X-Dashboard-User-ID": "staff-1",
-                "X-Dashboard-User-Email": "staff@example.test",
+                "X-Dashboard-User-Name": "Test%20Administrator",
+                "X-Dashboard-User-Role": "super_admin",
             },
         )
         assert response.status_code == 200
@@ -367,6 +463,12 @@ def test_dashboard_migration_and_text_only_call_artifacts():
     )
     assert "'deleted'" in deletion_sql and "deleted_at" in deletion_sql
     assert "Personalized plan" in deletion_sql
+    activity_sql = Path("supabase/migrations/031_dashboard_staff_and_activity.sql").read_text(
+        encoding="utf-8"
+    )
+    assert "owner_user_id text" in activity_sql
+    assert "actor_name text" in activity_sql and "lead_id uuid" in activity_sql
+    assert "dashboard_staff" not in activity_sql and "auth.users" not in activity_sql
     transcript, summary = _call_text_artifacts({
         "artifact": {"transcript": "Assistant: Hello\nPatient: Hi"},
         "analysis": {"summary": "Requested a callback."},
@@ -421,7 +523,8 @@ def test_board_booked_stops_outreach_and_tells_the_sheet(monkeypatch):
             headers={
                 "X-Dashboard-Token": "x" * 32,
                 "X-Dashboard-User-ID": "staff-1",
-                "X-Dashboard-User-Email": "staff@example.test",
+                "X-Dashboard-User-Name": "Test%20Administrator",
+                "X-Dashboard-User-Role": "super_admin",
             },
         )
         assert response.status_code == 200, response.json()
@@ -456,7 +559,8 @@ def test_restart_clears_skipped_steps_not_only_planned(monkeypatch):
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
     assert response.status_code == 200
@@ -546,7 +650,8 @@ def test_global_activation_replans_only_planned_work_and_preserves_pause(monkeyp
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
     assert response.status_code == 200
@@ -577,7 +682,8 @@ def test_archived_global_version_can_be_reactivated(monkeypatch):
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
     assert response.status_code == 200
@@ -591,7 +697,8 @@ def test_cadence_version_rejects_empty_sms_copy(monkeypatch):
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
         json={
             "name": "Month cadence",
@@ -641,7 +748,8 @@ def test_published_global_step_status_can_be_changed_inline(monkeypatch):
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
     assert response.status_code == 200
@@ -687,7 +795,8 @@ def test_cadence_version_delete_is_soft_and_active_is_protected(monkeypatch):
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
     assert response.status_code == 200
@@ -706,7 +815,8 @@ def test_cadence_version_delete_is_soft_and_active_is_protected(monkeypatch):
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
     assert response.status_code == 409
@@ -745,7 +855,8 @@ def test_only_deleted_cadence_versions_can_be_permanently_deleted(monkeypatch):
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
     assert response.status_code == 200
@@ -765,7 +876,8 @@ def test_only_deleted_cadence_versions_can_be_permanently_deleted(monkeypatch):
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
     assert response.status_code == 409
@@ -845,7 +957,8 @@ def test_saved_sms_templates_support_create_rename_and_permanent_delete(monkeypa
     headers = {
         "X-Dashboard-Token": "x" * 32,
         "X-Dashboard-User-ID": "staff-1",
-        "X-Dashboard-User-Email": "staff@example.test",
+        "X-Dashboard-User-Name": "Test%20Administrator",
+        "X-Dashboard-User-Role": "super_admin",
     }
     client = TestClient(app)
     response = client.post(
@@ -882,7 +995,8 @@ def test_saved_sms_templates_support_create_rename_and_permanent_delete(monkeypa
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
     assert response.status_code == 200
@@ -937,7 +1051,8 @@ def test_switching_to_standard_archives_local_and_replans_only_future(monkeypatc
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
     assert response.status_code == 200
@@ -997,7 +1112,8 @@ def _delete_lead(connection, monkeypatch):
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
 
@@ -1069,7 +1185,8 @@ def _set_rules(connection, monkeypatch, body):
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
 
@@ -1130,7 +1247,8 @@ def test_activating_a_version_leaves_leads_already_in_outreach_alone(monkeypatch
         headers={
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Email": "staff@example.test",
+            "X-Dashboard-User-Name": "Test%20Administrator",
+            "X-Dashboard-User-Role": "super_admin",
         },
     )
     assert response.status_code == 200
@@ -1175,7 +1293,8 @@ def _template_request(connection, monkeypatch, method, path, body):
     return TestClient(app).request(
         method, f"/api/v1/dashboard/{path}", json=body,
         headers={"X-Dashboard-Token": "x" * 32, "X-Dashboard-User-ID": "staff-1",
-                 "X-Dashboard-User-Email": "staff@example.test"},
+                 "X-Dashboard-User-Name": "Test%20Administrator",
+                 "X-Dashboard-User-Role": "super_admin",},
     )
 
 

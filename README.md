@@ -93,6 +93,22 @@ from public.practices p
 where p.id = ps.practice_id and p.slug = 'rausch-pt';
 ```
 
+## Dashboard staff authentication
+
+Migration `031_dashboard_staff_and_activity.sql` adds text-based lead ownership plus employee name and lead
+attribution to the durable activity log. The frontend validates a signed employee session, then forwards the
+employee ID, display name, and role with the server-only `DASHBOARD_API_TOKEN`. The backend accepts identity
+headers only when that token is valid and repeats every role check.
+
+Users live only in the frontend host's server-side `DASHBOARD_USERS_JSON`; configure exactly one
+`super_admin`, set `DASHBOARD_SESSION_SECRET`, and redeploy the frontend when the roster changes. Employees
+can work every lead and personalize lead cadences. Only the super admin can change global cadence/templates
+or permanently delete leads, cadence versions, and templates.
+
+The local backend `.env` may mirror the roster for operator configuration, but the backend never reads login
+passwords. Optional roster emails enable frontend email login; the proxy still forwards stable short employee
+IDs. This login needs no Supabase Auth token; `SUPABASE_DB_URL` continues to provide the database connection.
+
 ## Production staff assistant
 
 The staff assistant is disabled by default. It has no write/provider tools and sends only explicitly selected,

@@ -128,7 +128,7 @@ def run_terminal(
     api_url: str | None = None,
     initial_leads: list[str] | None = None,
     user_id: str = "terminal-agent",
-    email: str = "terminal-agent@local.test",
+    display_name: str = "Terminal Agent",
 ) -> None:
     if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -146,7 +146,8 @@ def run_terminal(
     headers = {
         "X-Dashboard-Token": settings.dashboard_api_token,
         "X-Dashboard-User-ID": user_id,
-        "X-Dashboard-User-Email": email,
+        "X-Dashboard-User-Name": display_name,
+        "X-Dashboard-User-Role": "employee",
     }
     print("RPT lead-scoped agent. Use /help for commands.")
     timeout = min(65.0, max(20.0, settings.request_timeout_seconds + 5))
