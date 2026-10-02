@@ -104,7 +104,8 @@ def _headers():
     return {
         "X-Dashboard-Token": "x" * 32,
         "X-Dashboard-User-ID": "staff-1",
-        "X-Dashboard-User-Email": "staff@example.test",
+        "X-Dashboard-User-Name": "Test%20Administrator",
+        "X-Dashboard-User-Role": "super_admin",
     }
 
 

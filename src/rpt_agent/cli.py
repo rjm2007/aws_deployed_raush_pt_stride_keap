@@ -196,7 +196,7 @@ def main() -> None:
     agent.add_argument("--api-url")
     agent.add_argument("--lead", action="append", default=[])
     agent.add_argument("--user-id", default="terminal-agent")
-    agent.add_argument("--email", default="terminal-agent@local.test")
+    agent.add_argument("--name", default="Terminal Agent")
     args = parser.parse_args()
     commands = {
         "migrate": migrate,
@@ -212,7 +212,7 @@ def main() -> None:
             api_url=args.api_url,
             initial_leads=args.lead,
             user_id=args.user_id,
-            email=args.email,
+            display_name=args.name,
         ),
     }
     commands[args.command]()
