@@ -1603,9 +1603,9 @@ known follow-up. Do not include secrets or patient/tester identifiers.
 
 - Changed Sheet intake so a new row whose normalized phone already belongs to a practice lead returns
   `409 lead_already_exists`; it does not update, restart, or link the existing lead, regardless of name.
-- Existing linked rows still update their own name and other profile fields when their normalized phone is
-  unchanged. Changing the phone now returns `409 phone_changed_needs_review` without mutating the lead,
-  creating a replacement, or changing its cadence.
+- Existing linked rows may update non-identity profile fields when name and normalized phone are unchanged.
+  Changing either name or phone returns a specific `409 *_changed_needs_review` result, preserves both
+  stored identity fields, pauses remaining outreach, and flags the lead for staff review.
 - Focused n8n integration validation passed: `33 passed`.
 
 ### 2026-09-20 — Single cadence-worker claim guard and Sheet failure fallback
@@ -1701,3 +1701,10 @@ known follow-up. Do not include secrets or patient/tester identifiers.
 - Lead detail now returns a normalized, latest-first activity feed combining attributed employee changes with
   automated outreach, appointments, and non-dashboard status transitions; message bodies and transcripts are
   excluded from activity metadata.
+
+### 2026-10-04 - Sheet identity-change review guard
+
+- A linked Google Sheet row can no longer overwrite the dashboard lead's name or phone. A change to either
+  identity field preserves the stored values, pauses remaining outreach, and marks the lead for staff review.
+- No database migration was required. The already-deployed n8n profile workflow maps these review responses
+  to the live Sheet's `Lead Status` and `Outcome Status` columns.

@@ -609,7 +609,7 @@ def execute_lead_action(
 def sync_sheet_lead(
     *, request_id: UUID, lead_id: UUID, lead: dict[str, Any]
 ) -> ActionExecution:
-    """Update one linked Sheet lead; changed phones require staff review."""
+    """Update one linked Sheet lead; identity changes require staff review."""
     phone = format_phone(lead.get("phone"))
     if not phone:
         return ActionExecution(422, {"code": "invalid_phone", "detail": "Phone is invalid"})
@@ -622,12 +622,17 @@ def sync_sheet_lead(
         if not practice:
             return ActionExecution(503, {"detail": "Configured practice is not available"})
         current = conn.execute(
-            "select id,phone_e164 from leads where id=%s and practice_id=%s for update",
+            "select id,full_name,phone_e164 from leads "
+            "where id=%s and practice_id=%s for update",
             (lead_id, practice["id"]),
         ).fetchone()
         if not current:
             return ActionExecution(404, {"code": "lead_not_found", "detail": "Lead was not found"})
-        if current["phone_e164"] == phone:
+        incoming_name = str(lead.get("full_name") or "").strip()
+        stored_name = str(current["full_name"] or "").strip()
+        name_changed = bool(incoming_name and incoming_name != stored_name)
+        phone_changed = current["phone_e164"] != phone
+        if not name_changed and not phone_changed:
             _update_lead_profile(conn, lead_id, lead)
             return ActionExecution(
                 200,
@@ -639,16 +644,25 @@ def sync_sheet_lead(
                     "created": False,
                 },
             )
-        flag_lead_for_review(conn, str(lead_id), "Phone number changed; needs review")
+        if name_changed and phone_changed:
+            code = "name_and_phone_changed_needs_review"
+            detail = "Name and phone number changed; needs review"
+        elif name_changed:
+            code = "name_changed_needs_review"
+            detail = "Name changed; needs review"
+        else:
+            code = "phone_changed_needs_review"
+            detail = "Phone number changed; needs review"
+        flag_lead_for_review(conn, str(lead_id), detail)
         return ActionExecution(
             409,
             {
                 "request_id": str(request_id),
                 "lead_id": str(lead_id),
                 "previous_lead_id": str(lead_id),
-                "result": "phone_changed_needs_review",
-                "code": "phone_changed_needs_review",
-                "detail": "Phone number changed; needs review",
+                "result": code,
+                "code": code,
+                "detail": detail,
                 "created": False,
             },
         )

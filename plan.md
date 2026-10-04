@@ -162,7 +162,9 @@ Main responses:
 | 200 | Existing linked lead action completed or idempotent retry returned |
 | 401 | Wrong shared secret |
 | 409 `lead_already_exists` | Blank-ID row uses a phone already present in the practice |
+| 409 `name_changed_needs_review` | Linked row's name differs from its database lead |
 | 409 `phone_changed_needs_review` | Linked row's phone differs from its database lead |
+| 409 `name_and_phone_changed_needs_review` | Both linked identity fields differ |
 | 422 | Invalid request, phone, UUID, DOB, or required field |
 | 429/5xx/timeout | Temporary failure; recovery may retry |
 
@@ -190,8 +192,9 @@ Uses the same intake secret and a new `X-Request-ID`. Body:
 
 Behavior:
 
-- Same Lead ID and same normalized phone: update profile fields, including Name.
-- Same Lead ID but changed phone: change nothing and return `phone_changed_needs_review`.
+- Same Lead ID, name, and normalized phone: update non-identity profile fields.
+- Changed name or phone: preserve both stored identity fields, pause outreach, flag review, and return the
+  matching name-only, phone-only, or combined `*_changed_needs_review` code.
 - Blank Lead ID is invalid for this endpoint.
 - Profile updates never create or restart cadence.
 
@@ -259,9 +262,8 @@ states and inbound replies. These endpoints update Supabase first; they never ca
 - A new blank-ID row with an existing phone is not connected to the old lead. Its own row receives
   `Lead already exists`, and Lead ID stays blank.
 - The person's name does not affect the duplicate check.
-- Editing Name on an already linked row updates that lead's name in Supabase.
-- Editing Phone Number on a linked row does not change the database. That row receives
-  `Phone number changed - needs review`.
+- Editing Name or Phone Number on a linked row does not change either stored identity field. The row receives
+  the matching review explanation, and the backend pauses outreach for staff review.
 
 This is why intake writes cannot match by Phone Number.
 
@@ -376,7 +378,7 @@ unavailable Google/n8n services never block calls, SMS, or provider callbacks.
 | n8n sends the same request again | Same Action Request ID/body returns the stored result |
 | AWS commits but response is lost | Recovery obtains the saved Lead ID/result |
 | Duplicate Sheet phone | Backend returns `lead_already_exists`; no old row is modified |
-| Linked row phone changed | Backend keeps the original phone, pauses cadence, and flags DB + Sheet review |
+| Linked row name or phone changed | Backend preserves both identity fields, pauses cadence, and flags review |
 | Worker crash | Database leases/locks allow safe recovery |
 | Two cadence workers | Advisory lock permits only one dispatcher |
 | Vapi/Twilio sends duplicate callback | Provider IDs and database constraints make processing idempotent |
@@ -393,11 +395,13 @@ unavailable Google/n8n services never block calls, SMS, or provider callbacks.
 2. The AWS status webhook must find exactly one row by Lead ID.
 3. Keep the verified HMAC code in `Verify AWS Request`, with the production Sheet key ID and webhook secret.
 4. Replace the profile-sync signing placeholder with the intake HMAC configuration.
-5. Remove the old `Phone Created New Lead?` and `Write Replacement Lead ID` path. Changed phones now require
-   review and never create a replacement automatically.
+5. Remove the old `Phone Created New Lead?` and `Write Replacement Lead ID` path. Changed identity fields now
+   require review and never create a replacement automatically.
 6. Map backend conflicts clearly:
    - `lead_already_exists` -> `Lead already exists`
+   - `name_changed_needs_review` -> `Name changed - needs review`
    - `phone_changed_needs_review` -> `Phone number changed - needs review`
+   - `name_and_phone_changed_needs_review` -> `Name and phone number changed - needs review`
 7. Keep the Action Status blank gate before intake to prevent an infinite trigger loop.
 8. Ensure the webhook responds 200 only after the Google update succeeds.
 9. Export the final active workflows after these corrections, remove credential values, and replace the stale
