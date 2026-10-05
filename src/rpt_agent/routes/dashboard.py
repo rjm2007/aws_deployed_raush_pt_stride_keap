@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from psycopg.types.json import Jsonb
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..config import get_settings
 from ..db import transaction
@@ -40,10 +40,6 @@ class ContactRules(BaseModel):
     sms_opt_out: bool | None = None
 
 
-class CadenceModeChange(BaseModel):
-    mode: Literal["standard"]
-
-
 class StageMove(BaseModel):
     stage: Literal["new", "cadence", "attention", "booked", "closed"]
 
@@ -70,8 +66,9 @@ class CadenceVersionStepInput(BaseModel):
 
 
 class CadenceVersionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     source_version_id: int | None = Field(default=None, ge=1)
-    lead_id: UUID | None = None
     name: str | None = Field(default=None, min_length=1, max_length=120)
 
     @field_validator("name")
@@ -148,13 +145,9 @@ class LeadCreate(BaseModel):
     referred_by: str | None = Field(default=None, max_length=200)
     lead_type: str = Field(min_length=1, max_length=200)
     location: Literal["Dana Point", "Laguna Niguel", "Mission Viejo"]
-    owner: str = Field(min_length=1, max_length=200)
-    owner_user_id: str | None = Field(
-        default=None, pattern=r"^[a-z0-9][a-z0-9._-]{2,31}$"
-    )
     contact_consent: Literal[True]
 
-    @field_validator("first_name", "last_name", "lead_type", "owner")
+    @field_validator("first_name", "last_name", "lead_type")
     @classmethod
     def required_text(cls, value: str) -> str:
         value = value.strip()
@@ -300,8 +293,9 @@ def _require_super_admin(actor: DashboardActor) -> None:
 
 
 def _require_global_admin(actor: DashboardActor, lead_id) -> None:
-    if lead_id is None:
-        _require_super_admin(actor)
+    _require_super_admin(actor)
+    if lead_id is not None:
+        raise HTTPException(status_code=410, detail="lead-specific cadence editing has been removed")
 
 
 def _activity_entry(
@@ -330,15 +324,15 @@ def _build_activity(audits, events, status_history, appointments) -> list[dict]:
         "cadence.resume": "Cadence resumed",
         "cadence.standard_selected": "Standard cadence selected",
         "cadence.local_schedule_updated": "Outreach rescheduled",
-        "cadence.version_created": "Personalized cadence created",
-        "cadence.version_updated": "Personalized cadence updated",
-        "cadence.version_renamed": "Personalized cadence renamed",
-        "cadence.version_deleted": "Personalized cadence archived",
-        "cadence.version_activated": "Personalized cadence activated",
-        "cadence.local_updated": "Personalized cadence step updated",
+        "cadence.version_created": "Cadence created",
+        "cadence.version_updated": "Cadence updated",
+        "cadence.version_renamed": "Cadence renamed",
+        "cadence.version_deleted": "Cadence archived",
+        "cadence.version_activated": "Cadence activated",
+        "cadence.local_updated": "Cadence step updated",
         "contact_rules.updated": "Contact rules updated",
         "review.resolved": "Review resolved",
-        "sms_template.local_updated": "Lead message personalized",
+        "sms_template.local_updated": "Lead message updated",
         "sms_template.local_reset": "Lead message reset",
         "sms.manual_sent": "Manual SMS sent",
         "sms.manual_failed": "Manual SMS failed",
@@ -428,18 +422,27 @@ def _version_payload(conn, version: dict) -> dict:
     }
 
 
+def _cadence_step_name(day_offset: int, description: str) -> str:
+    action = re.sub(r"^day\s+\d+\b[\s:–—-]*", "", description.strip(), flags=re.IGNORECASE)
+    if not action:
+        raise HTTPException(status_code=422, detail="cadence descriptions must not be blank")
+    name = f"Day {day_offset} {action}".strip()
+    if len(name) > 300:
+        raise HTTPException(status_code=422, detail="cadence descriptions must not exceed 300 characters")
+    return name
+
+
 def _validate_cadence_steps(steps: list[CadenceVersionStepInput]) -> None:
     if not any(step.is_active for step in steps):
         raise HTTPException(status_code=422, detail="at least one cadence step must be enabled")
     for step in steps:
-        if not step.description.strip():
-            raise HTTPException(status_code=422, detail="cadence descriptions must not be blank")
+        _cadence_step_name(step.day_offset, step.description)
         if step.channel == "sms" and not (step.sms_body or "").strip():
             raise HTTPException(status_code=422, detail="every SMS step requires message copy")
 
 
 def _clone_version_steps(
-    conn, source_id: int, target_id: int, practice_id: int, lead_id: UUID | None = None
+    conn, source_id: int, target_id: int, practice_id: int
 ) -> None:
     source_steps = conn.execute(
         "select id,step_order,day_offset,channel,key,description,is_active from cadence_steps "
@@ -457,15 +460,13 @@ def _clone_version_steps(
                 step["day_offset"],
                 step["channel"],
                 step["key"],
-                step["description"],
+                _cadence_step_name(step["day_offset"], step["description"]),
                 step["is_active"],
             ),
         ).fetchone()
         template = conn.execute(
-            "select mt.key,mt.channel,coalesce(lmo.body,mt.body) as body,mt.is_active "
-            "from message_templates mt left join lead_message_overrides lmo "
-            "on lmo.message_template_id=mt.id and lmo.lead_id=%s where mt.cadence_step_id=%s",
-            (lead_id, step["id"]),
+            "select key,channel,body,is_active from message_templates where cadence_step_id=%s",
+            (step["id"],),
         ).fetchone()
         if template:
             conn.execute(
@@ -508,8 +509,7 @@ def dashboard_snapshot(actor: Actor):
             "(select oe2.cadence_version_id from outreach_events oe2 where oe2.lead_id=l.id "
             "and oe2.cadence_version_id is not null order by oe2.created_at desc,oe2.id desc limit 1),"
             "(select cv2.id from cadence_versions cv2 where cv2.practice_id=l.practice_id "
-            "and cv2.status='active' and (cv2.lead_id=l.id or cv2.lead_id is null) "
-            "order by (cv2.lead_id is not null) desc limit 1))"
+            "and cv2.status='active' and cv2.lead_id is null limit 1))"
             ") current_version on true left join lateral ("
             "select oe.id,cs.description,oe.channel,oe.scheduled_for,oe.status from outreach_events oe "
             "left join cadence_steps cs on cs.id=oe.cadence_step_id where oe.lead_id=l.id "
@@ -676,17 +676,16 @@ def create_dashboard_lead(payload: LeadCreate, actor: Actor):
                     payload.lead_type,
                     payload.referred_by.strip() if payload.referred_by else None,
                     payload.location,
-                    payload.owner,
+                    actor.display_name or actor.user_id,
                     synthetic,
                     test_run_id,
                 ),
             ).fetchone()
             lead_id = inserted["id"]
-            if payload.owner_user_id:
-                conn.execute(
-                    "update leads set owner_user_id=%s where id=%s",
-                    (payload.owner_user_id, lead_id),
-                )
+            conn.execute(
+                "update leads set owner_user_id=%s where id=%s",
+                (actor.user_id, lead_id),
+            )
             event_count = materialize_cadence(
                 conn, str(lead_id), practice["id"], datetime.now(UTC).date()
             )
@@ -707,7 +706,7 @@ def create_dashboard_lead(payload: LeadCreate, actor: Actor):
                 {
                     "lead_type": payload.lead_type,
                     "location": payload.location,
-                    "owner_user_id": str(payload.owner_user_id) if payload.owner_user_id else None,
+                    "owner_user_id": actor.user_id,
                     "cadence_events": event_count,
                 },
             )
@@ -748,9 +747,8 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
         # What the practice would give a new lead today.
         global_version = conn.execute(
             "select id,name,version_number,status,lead_id from cadence_versions "
-            "where practice_id=%s and status='active' and (lead_id=%s or lead_id is null) "
-            "order by (lead_id is not null) desc limit 1",
-            (row["practice_id"], lead_id),
+            "where practice_id=%s and status='active' and lead_id is null limit 1",
+            (row["practice_id"],),
         ).fetchone()
         # What this lead is actually running. A lead keeps the version it started
         # on, so these differ whenever a new cadence was activated mid-outreach,
@@ -770,8 +768,7 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
             "select oe.id,oe.cadence_step_id,oe.cadence_version_id,oe.channel,oe.day_offset,"
             "oe.status,oe.scheduled_for,oe.created_at,oe.executed_at,oe.outcome,cs.description,"
             "cv.name as cadence_version_name,"
-            "case when cv.lead_id is not null then 'personalized' else 'standard' end "
-            "as cadence_scope,(select count(*) from cadence_steps expected "
+            "(select count(*) from cadence_steps expected "
             "where expected.cadence_version_id=oe.cadence_version_id and expected.is_active) "
             "as cadence_step_count,sm.delivery_status,sm.failure_reason "
             "from outreach_events oe left join cadence_steps cs on cs.id=oe.cadence_step_id "
@@ -819,11 +816,6 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
             "from dashboard_audit_log where lead_id=%s "
             "or (entity_type='lead' and entity_id=%s) order by created_at desc limit 200",
             (lead_id, str(lead_id)),
-        ).fetchall()
-        overrides = conn.execute(
-            "select lmo.message_template_id,lmo.body,lmo.updated_at from lead_message_overrides lmo "
-            "where lmo.lead_id=%s",
-            (lead_id,),
         ).fetchall()
         version_payload = _version_payload(conn, current_version) if current_version else None
     detail = dict(row)
@@ -878,7 +870,6 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
         "history": status_history,
         "cadence_actions": cadence_actions,
         "activity": _build_activity(audits, events, status_history, appointments),
-        "message_overrides": overrides,
         "cadence_version": version_payload,
     }
 
@@ -997,59 +988,6 @@ def set_contact_rules(lead_id: UUID, payload: ContactRules, actor: Actor):
     }
 
 
-@router.post("/leads/{lead_id}/cadence-mode")
-def use_standard_cadence(lead_id: UUID, payload: CadenceModeChange, actor: Actor):
-    del payload
-    with transaction() as conn:
-        lead = conn.execute(
-            "select id,practice_id,status,cadence_state from leads where id=%s for update",
-            (lead_id,),
-        ).fetchone()
-        if not lead:
-            raise HTTPException(status_code=404, detail="lead not found")
-        if lead["status"] in CLOSED_STATUSES | {"booked"}:
-            raise HTTPException(status_code=409, detail="a terminal lead cannot restart outreach")
-        standard = conn.execute(
-            "select id from cadence_versions where practice_id=%s and lead_id is null "
-            "and status='active'",
-            (lead["practice_id"],),
-        ).fetchone()
-        if not standard:
-            raise HTTPException(status_code=409, detail="no active standard cadence is available")
-        conn.execute(
-            "update cadence_versions set status='archived' where lead_id=%s and status='active'",
-            (lead_id,),
-        )
-        conn.execute(
-            "update outreach_events set status='skipped',updated_at=now() "
-            "where lead_id=%s and status='planned'",
-            (lead_id,),
-        )
-        created = materialize_cadence(
-            conn,
-            str(lead_id),
-            lead["practice_id"],
-            datetime.now(UTC).date(),
-            cadence_version_id=standard["id"],
-            update_lead=lead["cadence_state"] == "pending",
-        )
-        _audit(
-            conn,
-            actor,
-            lead["practice_id"],
-            "cadence.standard_selected",
-            "lead",
-            str(lead_id),
-            {"cadence_version_id": standard["id"], "events_created": created},
-        )
-    return {
-        "status": "updated",
-        "mode": "standard",
-        "cadence_version_id": standard["id"],
-        "events_created": created,
-    }
-
-
 @router.delete("/leads/{lead_id}")
 def delete_dashboard_lead(lead_id: UUID, actor: Actor):
     """Remove a lead and everything belonging to it.
@@ -1124,94 +1062,6 @@ def delete_dashboard_lead(lead_id: UUID, actor: Actor):
         )
         conn.execute("delete from leads where id=%s", (lead_id,))
     return {"deleted": str(lead_id), "cascaded_events": events, **removed}
-
-
-class LeadUpdate(BaseModel):
-    """Everything a staff member may correct after intake. Not the phone number:
-    it identifies the patient to the Sheet, Twilio and VAPI, so a change there is
-    a different patient, handled by adding a lead and closing this one."""
-
-    first_name: str | None = Field(default=None, min_length=1, max_length=100)
-    last_name: str | None = Field(default=None, min_length=1, max_length=100)
-    email: str | None = Field(default=None, max_length=320)
-    date_of_birth: date | None = None
-    referred_by: str | None = Field(default=None, max_length=200)
-    lead_type: str | None = Field(default=None, min_length=1, max_length=200)
-    location: Literal["Dana Point", "Laguna Niguel", "Mission Viejo"] | None = None
-    owner: str | None = Field(default=None, min_length=1, max_length=200)
-    owner_user_id: str | None = Field(
-        default=None, pattern=r"^[a-z0-9][a-z0-9._-]{2,31}$"
-    )
-
-    @field_validator("first_name", "last_name", "lead_type", "owner", "referred_by")
-    @classmethod
-    def strip_text(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        if not value:
-            raise ValueError("must not be blank")
-        return value
-
-    @field_validator("email")
-    @classmethod
-    def valid_email(cls, value: str | None) -> str | None:
-        value = (value or "").strip().lower()
-        if not value:
-            return None
-        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
-            raise ValueError("email is not valid")
-        return value
-
-    @field_validator("date_of_birth", mode="before")
-    @classmethod
-    def parse_date_of_birth(cls, value):
-        return parse_flexible_date(value) if value else None
-
-    @field_validator("date_of_birth")
-    @classmethod
-    def not_future(cls, value: date | None) -> date | None:
-        if value and value > datetime.now(UTC).date():
-            raise ValueError("date_of_birth cannot be in the future")
-        return value
-
-
-@router.patch("/leads/{lead_id}")
-def update_dashboard_lead(lead_id: UUID, payload: LeadUpdate, actor: Actor):
-    fields = payload.model_dump(exclude_unset=True)
-    if not fields:
-        raise HTTPException(status_code=422, detail="no fields to update")
-    with transaction() as conn:
-        lead = conn.execute(
-            "select id,practice_id,first_name,last_name from leads where id=%s for update",
-            (lead_id,),
-        ).fetchone()
-        if not lead:
-            raise HTTPException(status_code=404, detail="lead not found")
-        if "owner_user_id" in fields and "owner" not in fields:
-            raise HTTPException(status_code=422, detail="owner name is required")
-        if "first_name" in fields or "last_name" in fields:
-            fields["full_name"] = " ".join(
-                part for part in (
-                    fields.get("first_name", lead["first_name"]),
-                    fields.get("last_name", lead["last_name"]),
-                ) if part
-            )
-        assignments = ",".join(f"{name}=%s" for name in fields)
-        conn.execute(
-            f"update leads set {assignments},updated_at=now() where id=%s",
-            (*fields.values(), lead_id),
-        )
-        _audit(
-            conn,
-            actor,
-            lead["practice_id"],
-            "lead.updated",
-            "lead",
-            str(lead_id),
-            {"fields": sorted(fields)},
-        )
-    return {"status": "updated", "fields": sorted(fields)}
 
 
 @router.post("/leads/{lead_id}/stage")
@@ -1372,65 +1222,39 @@ def resolve_review(lead_id: UUID, payload: ReviewAction, actor: Actor):
 
 
 @router.get("/cadence-versions")
-def list_cadence_versions(actor: Actor, lead_id: UUID | None = None):
+def list_cadence_versions(request: Request, actor: Actor):
     del actor
+    if "lead_id" in request.query_params:
+        raise HTTPException(status_code=410, detail="lead-specific cadence editing has been removed")
     with transaction() as conn:
         practice = conn.execute(
             "select id from practices where slug='rausch-pt'"
         ).fetchone()
         if not practice:
             raise HTTPException(status_code=503, detail="practice is not configured")
-        if lead_id:
-            lead = conn.execute(
-                "select id from leads where id=%s and practice_id=%s",
-                (lead_id, practice["id"]),
-            ).fetchone()
-            if not lead:
-                raise HTTPException(status_code=404, detail="lead not found")
-            rows = conn.execute(
-                "select id,practice_id,lead_id,version_number,name,status,source_version_id,"
-                "activated_at,deleted_at,created_at,updated_at from cadence_versions where practice_id=%s "
-                "and (lead_id is null or lead_id=%s) order by (lead_id is not null),"
-                "version_number desc,id desc",
-                (practice["id"], lead_id),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "select id,practice_id,lead_id,version_number,name,status,source_version_id,"
-                "activated_at,deleted_at,created_at,updated_at from cadence_versions where practice_id=%s "
-                "and lead_id is null order by version_number desc,id desc",
-                (practice["id"],),
-            ).fetchall()
+        rows = conn.execute(
+            "select id,practice_id,lead_id,version_number,name,status,source_version_id,"
+            "activated_at,deleted_at,created_at,updated_at from cadence_versions where practice_id=%s "
+            "and lead_id is null order by version_number desc,id desc",
+            (practice["id"],),
+        ).fetchall()
         return {"versions": [_version_payload(conn, row) for row in rows]}
 
 
 @router.post("/cadence-versions", status_code=201)
 def create_cadence_version(payload: CadenceVersionCreate, actor: Actor):
-    _require_global_admin(actor, payload.lead_id)
+    _require_super_admin(actor)
     with transaction() as conn:
         practice = conn.execute(
             "select id from practices where slug='rausch-pt' for update"
         ).fetchone()
         if not practice:
             raise HTTPException(status_code=503, detail="practice is not configured")
-        if payload.lead_id:
-            lead = conn.execute(
-                "select id from leads where id=%s and practice_id=%s for update",
-                (payload.lead_id, practice["id"]),
-            ).fetchone()
-            if not lead:
-                raise HTTPException(status_code=404, detail="lead not found")
         if payload.source_version_id:
             source = conn.execute(
                 "select id from cadence_versions where id=%s and practice_id=%s "
-                "and (lead_id is null or lead_id=%s)",
-                (payload.source_version_id, practice["id"], payload.lead_id),
-            ).fetchone()
-        elif payload.lead_id:
-            source = conn.execute(
-                "select id from cadence_versions where practice_id=%s and status='active' "
-                "and (lead_id=%s or lead_id is null) order by (lead_id is not null) desc limit 1",
-                (practice["id"], payload.lead_id),
+                "and lead_id is null",
+                (payload.source_version_id, practice["id"]),
             ).fetchone()
         else:
             source = conn.execute(
@@ -1440,48 +1264,30 @@ def create_cadence_version(payload: CadenceVersionCreate, actor: Actor):
             ).fetchone()
         if not source:
             raise HTTPException(status_code=409, detail="no source cadence is available")
-        if payload.lead_id:
-            number = conn.execute(
-                "select coalesce(max(version_number),0)+1 as value from cadence_versions "
-                "where lead_id=%s",
-                (payload.lead_id,),
-            ).fetchone()["value"]
-        else:
-            number = conn.execute(
-                "select coalesce(max(version_number),0)+1 as value from cadence_versions "
-                "where practice_id=%s and lead_id is null",
-                (practice["id"],),
-            ).fetchone()["value"]
-        name = (payload.name or (
-            f"Personalized plan v{number}" if payload.lead_id else f"Standard v{number}"
-        )).strip()
+        number = conn.execute(
+            "select coalesce(max(version_number),0)+1 as value from cadence_versions "
+            "where practice_id=%s and lead_id is null",
+            (practice["id"],),
+        ).fetchone()["value"]
+        name = (payload.name or f"Standard v{number}").strip()
         version = conn.execute(
             "insert into cadence_versions(practice_id,lead_id,version_number,name,status,"
-            "source_version_id) values(%s,%s,%s,%s,'draft',%s) returning id,practice_id,lead_id,"
+            "source_version_id) values(%s,null,%s,%s,'draft',%s) returning id,practice_id,lead_id,"
             "version_number,name,status,source_version_id,activated_at,deleted_at,created_at,updated_at",
-            (practice["id"], payload.lead_id, number, name, source["id"]),
+            (practice["id"], number, name, source["id"]),
         ).fetchone()
-        _clone_version_steps(
-            conn, source["id"], version["id"], practice["id"], payload.lead_id
-        )
+        _clone_version_steps(conn, source["id"], version["id"], practice["id"])
         _audit(
-            conn,
-            actor,
-            practice["id"],
-            "cadence.version_created",
-            "cadence_version",
-            str(version["id"]),
-            {
-                "scope": "lead" if payload.lead_id else "global",
-                "source_version_id": source["id"],
-                "lead_id": str(payload.lead_id) if payload.lead_id else None,
-            },
+            conn, actor, practice["id"], "cadence.version_created",
+            "cadence_version", str(version["id"]),
+            {"scope": "global", "source_version_id": source["id"]},
         )
         return _version_payload(conn, version)
 
 
 @router.put("/cadence-versions/{version_id}")
 def update_cadence_version(version_id: int, payload: CadenceVersionUpdate, actor: Actor):
+    _require_super_admin(actor)
     _validate_cadence_steps(payload.steps)
     with transaction() as conn:
         version = conn.execute(
@@ -1507,7 +1313,7 @@ def update_cadence_version(version_id: int, payload: CadenceVersionUpdate, actor
                     step.day_offset,
                     step.channel,
                     key,
-                    step.description.strip(),
+                    _cadence_step_name(step.day_offset, step.description),
                     step.is_active,
                 ),
             ).fetchone()
@@ -1552,6 +1358,7 @@ def update_cadence_version(version_id: int, payload: CadenceVersionUpdate, actor
 def rename_cadence_version(
     version_id: int, payload: CadenceVersionNameUpdate, actor: Actor
 ):
+    _require_super_admin(actor)
     with transaction() as conn:
         version = conn.execute(
             "select id,practice_id,lead_id,version_number,name,status,source_version_id,"
@@ -1589,6 +1396,7 @@ def rename_cadence_version(
 
 @router.delete("/cadence-versions/{version_id}")
 def delete_cadence_version(version_id: int, actor: Actor):
+    _require_super_admin(actor)
     with transaction() as conn:
         version = conn.execute(
             "select id,practice_id,lead_id,version_number,name,status,source_version_id,"
@@ -1670,6 +1478,7 @@ def permanently_delete_cadence_version(version_id: int, actor: Actor):
 
 @router.post("/cadence-versions/{version_id}/activate")
 def activate_cadence_version(version_id: int, actor: Actor):
+    _require_super_admin(actor)
     with transaction() as conn:
         version = conn.execute(
             "select id,practice_id,lead_id,version_number,name,status,source_version_id,"
@@ -1686,47 +1495,31 @@ def activate_cadence_version(version_id: int, actor: Actor):
                 status_code=409,
                 detail="only a draft or previous cadence can be activated",
             )
-        if version["lead_id"]:
-            lead = conn.execute(
-                "select id,status,cadence_state from leads where id=%s and practice_id=%s for update",
-                (version["lead_id"], version["practice_id"]),
-            ).fetchone()
-            if not lead:
-                raise HTTPException(status_code=404, detail="lead not found")
-            if lead["status"] in CLOSED_STATUSES | {"booked"}:
-                raise HTTPException(status_code=409, detail="a terminal lead cannot start a local cadence")
-            conn.execute(
-                "update cadence_versions set status='archived' where lead_id=%s and status='active'",
-                (version["lead_id"],),
-            )
-            leads = [lead]
-        else:
-            conn.execute(
-                "update cadence_versions set status='archived' where practice_id=%s and lead_id is null "
-                "and status='active'",
-                (version["practice_id"],),
-            )
-            # A lead already in outreach finishes the cadence it started on.
-            #
-            # This used to replan every active or paused lead in the practice:
-            # their remaining steps were skipped and a fresh schedule was built
-            # from day 0. A patient on day 13 with one message left would be
-            # called again from the beginning, and one click did it to the whole
-            # caseload at once.
-            #
-            # Each event already carries its cadence_version_id, so leads in
-            # flight keep running the version stamped on their schedule. The new
-            # version applies to leads created from now on, and to any lead an
-            # operator deliberately restarts from the board -- a restart
-            # materializes against whichever version is active then.
-            leads = conn.execute(
-                "select l.id,l.status,l.cadence_state from leads l where l.practice_id=%s "
-                "and l.cadence_state='pending' and l.status not in "
-                "('booked','declined','transferred_human','booking_link_sent','do_not_contact',"
-                "'closed_no_response','invalid_phone') and not exists (select 1 from cadence_versions cv "
-                "where cv.lead_id=l.id and cv.status='active') for update",
-                (version["practice_id"],),
-            ).fetchall()
+        conn.execute(
+            "update cadence_versions set status='archived' where practice_id=%s and lead_id is null "
+            "and status='active'",
+            (version["practice_id"],),
+        )
+        # A lead already in outreach finishes the cadence it started on.
+        #
+        # This used to replan every active or paused lead in the practice:
+        # their remaining steps were skipped and a fresh schedule was built
+        # from day 0. A patient on day 13 with one message left would be
+        # called again from the beginning, and one click did it to the whole
+        # caseload at once.
+        #
+        # Each event already carries its cadence_version_id, so leads in
+        # flight keep running the version stamped on their schedule. The new
+        # version applies to leads created from now on, and to any lead an
+        # operator deliberately restarts from the board -- a restart
+        # materializes against whichever version is active then.
+        leads = conn.execute(
+            "select l.id,l.status,l.cadence_state from leads l where l.practice_id=%s "
+            "and l.cadence_state='pending' and l.status not in "
+            "('booked','declined','transferred_human','booking_link_sent','do_not_contact',"
+            "'closed_no_response','invalid_phone') for update",
+            (version["practice_id"],),
+        ).fetchall()
         conn.execute(
             "update cadence_versions set status='active',activated_at=now() where id=%s",
             (version_id,),
@@ -1773,11 +1566,12 @@ def activate_cadence_version(version_id: int, actor: Actor):
 
 @router.patch("/cadence-steps/{step_id}")
 def update_cadence_step(step_id: int, payload: CadenceStepUpdate, actor: Actor):
+    _require_super_admin(actor)
     if payload.description is None and payload.is_active is None:
         raise HTTPException(status_code=422, detail="no cadence fields supplied")
     with transaction() as conn:
         step = conn.execute(
-            "select cs.id,cs.practice_id,cs.cadence_version_id,cv.lead_id,cv.status "
+            "select cs.id,cs.practice_id,cs.cadence_version_id,cs.day_offset,cv.lead_id,cv.status "
             "from cadence_steps cs "
             "join cadence_versions cv on cv.id=cs.cadence_version_id where cs.id=%s for update",
             (step_id,),
@@ -1786,7 +1580,7 @@ def update_cadence_step(step_id: int, payload: CadenceStepUpdate, actor: Actor):
             raise HTTPException(status_code=404, detail="cadence step not found")
         _require_global_admin(actor, step["lead_id"])
         if step["status"] == "deleted" or (
-            step["status"] != "draft" and (payload.description is not None or step["lead_id"] is not None)
+            step["status"] != "draft" and payload.description is not None
         ):
             raise HTTPException(
                 status_code=409,
@@ -1800,16 +1594,17 @@ def update_cadence_step(step_id: int, payload: CadenceStepUpdate, actor: Actor):
         updated = conn.execute(
             "update cadence_steps set description=coalesce(%s,description),"
             "is_active=coalesce(%s,is_active) where id=%s returning id,description,is_active",
-            (payload.description, payload.is_active, step_id),
+            (_cadence_step_name(step["day_offset"], payload.description) if payload.description else None,
+             payload.is_active, step_id),
         ).fetchone()
         if payload.is_active:
             conn.execute("update message_templates set is_active=true where cadence_step_id=%s", (step_id,))
-        metadata = {"lead_id": str(step["lead_id"])} if step["lead_id"] else {}
+        metadata = {}
         if payload.is_active is not None:
             metadata["is_active"] = payload.is_active
         _audit(
             conn, actor, step["practice_id"],
-            "cadence.local_updated" if step["lead_id"] else "cadence.global_updated",
+            "cadence.global_updated",
             "cadence_step", str(step_id), metadata,
         )
     return {"status": "updated", **dict(updated)}
@@ -1928,47 +1723,6 @@ def delete_message_template(template_id: int, actor: Actor):
             {"name": template["key"]},
         )
         return {"status": "permanently_deleted", "id": template_id}
-
-
-@router.put("/leads/{lead_id}/message-overrides/{template_id}")
-def set_message_override(
-    lead_id: UUID, template_id: int, payload: TemplateUpdate, actor: Actor
-):
-    with transaction() as conn:
-        lead = conn.execute("select practice_id from leads where id=%s", (lead_id,)).fetchone()
-        template = conn.execute(
-            "select id from message_templates where id=%s and channel='sms'", (template_id,)
-        ).fetchone()
-        if not lead or not template:
-            raise HTTPException(status_code=404, detail="lead or SMS template not found")
-        conn.execute(
-            "insert into lead_message_overrides(lead_id,message_template_id,body,updated_by) "
-            "values(%s,%s,%s,%s) on conflict(lead_id,message_template_id) do update set "
-            "body=excluded.body,updated_by=excluded.updated_by",
-            (lead_id, template_id, payload.body, actor.user_id),
-        )
-        _audit(
-            conn, actor, lead["practice_id"], "sms_template.local_updated",
-            "lead", str(lead_id), {"template_id": template_id},
-        )
-    return {"status": "updated"}
-
-
-@router.delete("/leads/{lead_id}/message-overrides/{template_id}")
-def remove_message_override(lead_id: UUID, template_id: int, actor: Actor):
-    with transaction() as conn:
-        lead = conn.execute("select practice_id from leads where id=%s", (lead_id,)).fetchone()
-        if not lead:
-            raise HTTPException(status_code=404, detail="lead not found")
-        conn.execute(
-            "delete from lead_message_overrides where lead_id=%s and message_template_id=%s",
-            (lead_id, template_id),
-        )
-        _audit(
-            conn, actor, lead["practice_id"], "sms_template.local_reset",
-            "lead", str(lead_id), {"template_id": template_id},
-        )
-    return {"status": "reset"}
 
 
 @router.post("/leads/{lead_id}/sms")

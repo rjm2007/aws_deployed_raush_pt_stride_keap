@@ -104,6 +104,8 @@ class CreateLeadConnection:
         self.audit_written = False
         self.created_is_test = False
         self.created_lead_type = None
+        self.created_owner = None
+        self.created_owner_id = None
         self.existing_phone_owner = existing_phone_owner
 
     def execute(self, sql, params=None):
@@ -123,7 +125,11 @@ class CreateLeadConnection:
         if "insert into leads" in sql:
             self.created_is_test = bool(params[-2])
             self.created_lead_type = params[12]
+            self.created_owner = params[15]
             return Result([{"id": self.lead_id}])
+        if sql.startswith("update leads set owner_user_id="):
+            self.created_owner_id = params[0]
+            return Result([])
         if "from leads l left join lateral" in sql:
             return Result([{
                 "id": self.lead_id,
@@ -141,7 +147,8 @@ class CreateLeadConnection:
                 "referred_by": "Community partner",
                 "lead_type": self.created_lead_type,
                 "location": "Dana Point",
-                "owner": "Sarah Johnson",
+                "owner": self.created_owner,
+                "owner_user_id": self.created_owner_id,
                 "is_test": self.created_is_test,
                 "next_event_id": 1,
                 "next_step": "Initial call",
@@ -272,6 +279,11 @@ def test_employee_http_requests_cannot_reach_admin_only_writes(monkeypatch):
     requests = [
         ("DELETE", f"leads/{uuid4()}", None),
         ("POST", "cadence-versions", {}),
+        ("PUT", "cadence-versions/1", {"name": "Synthetic", "steps": [{"day_offset": 0, "channel": "call", "description": "Initial call"}]}),
+        ("PATCH", "cadence-versions/1/name", {"name": "Synthetic"}),
+        ("DELETE", "cadence-versions/1", None),
+        ("POST", "cadence-versions/1/activate", None),
+        ("PATCH", "cadence-steps/1", {"is_active": False}),
         ("DELETE", "cadence-versions/1/permanent", None),
         ("POST", "message-templates", {"name": "Synthetic", "body": "Synthetic text"}),
         ("PATCH", "message-templates/1", {"body": "Synthetic text"}),
@@ -283,6 +295,38 @@ def test_employee_http_requests_cannot_reach_admin_only_writes(monkeypatch):
                 method, f"/api/v1/dashboard/{path}", headers=headers, json=body
             )
             assert response.status_code == 403, (method, path, response.status_code)
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("role", ["super_admin", "employee"])
+def test_removed_lead_editing_and_personalization_never_reach_database(monkeypatch, role):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+
+    def forbidden_transaction():
+        raise AssertionError("Removed feature reached the database")
+
+    monkeypatch.setattr(dashboard_routes, "transaction", forbidden_transaction)
+    headers = {
+        "X-Dashboard-Token": "x" * 32,
+        "X-Dashboard-User-ID": "synthetic-user",
+        "X-Dashboard-User-Name": "Synthetic%20User",
+        "X-Dashboard-User-Role": role,
+    }
+    lead_id = uuid4()
+    requests = [
+        ("PATCH", f"leads/{lead_id}", {"first_name": "Changed"}, 405),
+        ("POST", f"leads/{lead_id}/cadence-mode", {"mode": "standard"}, 404),
+        ("PUT", f"leads/{lead_id}/message-overrides/1", {"body": "Override"}, 404),
+        ("DELETE", f"leads/{lead_id}/message-overrides/1", None, 404),
+        ("GET", f"cadence-versions?lead_id={lead_id}", None, 410),
+        ("POST", "cadence-versions", {"lead_id": str(lead_id)}, 422),
+    ]
+    try:
+        for method, path, body, status in requests:
+            response = TestClient(app).request(method, f"/api/v1/dashboard/{path}", headers=headers, json=body)
+            assert response.status_code == status, (method, path, response.status_code)
     finally:
         get_settings.cache_clear()
 
@@ -350,7 +394,8 @@ def test_second_lead_on_the_same_phone_number_is_allowed_with_a_warning(monkeypa
         get_settings.cache_clear()
 
 
-def test_dashboard_create_lead_persists_and_materializes(monkeypatch):
+@pytest.mark.parametrize("user_id,role", [("admin", "super_admin"), ("employee1", "employee"), ("employee2", "employee")])
+def test_dashboard_create_lead_persists_and_materializes(monkeypatch, user_id, role):
     monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
     monkeypatch.setenv("APP_ENV", "development")
     monkeypatch.setenv("TEST_MODE", "true")
@@ -373,14 +418,15 @@ def test_dashboard_create_lead_persists_and_materializes(monkeypatch):
         "referred_by": "Community partner",
         "lead_type": "Sports Rehab",
         "location": "Dana Point",
-        "owner": "Sarah Johnson",
+        "owner": "Forged owner",
+        "owner_user_id": "someone-else",
         "contact_consent": True,
     }
     headers = {
         "X-Dashboard-Token": "x" * 32,
-        "X-Dashboard-User-ID": "staff-1",
-        "X-Dashboard-User-Name": "Test%20Administrator",
-        "X-Dashboard-User-Role": "super_admin",
+        "X-Dashboard-User-ID": user_id,
+        "X-Dashboard-User-Name": "Synthetic%20Creator",
+        "X-Dashboard-User-Role": role,
     }
     try:
         denied = TestClient(app).post(
@@ -398,6 +444,10 @@ def test_dashboard_create_lead_persists_and_materializes(monkeypatch):
         assert response.json()["lead_type"] == "Sports Rehab"
         assert response.json()["cadence_state"] == "active"
         assert response.json()["is_test"] is True
+        assert response.json()["owner"] == "Synthetic Creator"
+        assert response.json()["owner_user_id"] == user_id
+        assert connection.created_owner == "Synthetic Creator"
+        assert connection.created_owner_id == user_id
         assert connection.audit_written
     finally:
         get_settings.cache_clear()
@@ -589,7 +639,7 @@ def test_lead_detail_exposes_cadence_and_call_linkage():
     calls_query = source[source.index("calls = conn.execute("):]
     calls_query = calls_query[: calls_query.index(").fetchall()")]
 
-    assert "as cadence_scope" in events_query
+    assert "as cadence_scope" not in events_query
     assert "as cadence_step_count" in events_query
     assert "cl.outreach_event_id" in calls_query
 
@@ -629,6 +679,41 @@ class ActivateVersionConnection:
         return Result([])
 
 
+def test_cadence_draft_saves_names_using_actual_day_and_blocks_legacy_personalization(monkeypatch):
+    connection = ActivateVersionConnection()
+    saved_steps = []
+    execute = connection.execute
+
+    def capture_step(sql, params=None):
+        if sql.startswith("insert into cadence_steps"):
+            saved_steps.append(params)
+            return Result([{"id": 9}])
+        return execute(sql, params)
+
+    connection.execute = capture_step
+
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    actor = DashboardActor("admin", "admin@example.test", display_name="Synthetic Admin")
+    payload = dashboard_routes.CadenceVersionUpdate(name="Synthetic draft", steps=[
+        {"day_offset": 5, "channel": "call", "description": "Day 0 initial scheduling call"},
+        {"day_offset": 13, "channel": "sms", "description": "Follow-up", "sms_body": "Synthetic message"},
+    ])
+    dashboard_routes.update_cadence_version(4, payload, actor)
+    assert [step[6] for step in saved_steps] == ["Day 5 initial scheduling call", "Day 13 Follow-up"]
+    assert payload.steps[0].description == "Day 0 initial scheduling call"
+
+    saved_steps.clear()
+    connection.version["lead_id"] = uuid4()
+    with pytest.raises(Exception) as removed:
+        dashboard_routes.update_cadence_version(4, payload, actor)
+    assert removed.value.status_code == 410
+    assert saved_steps == []
+
+
 def test_global_activation_replans_only_planned_work_and_preserves_pause(monkeypatch):
     monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
     get_settings.cache_clear()
@@ -660,7 +745,7 @@ def test_global_activation_replans_only_planned_work_and_preserves_pause(monkeyp
     assert "status='planned'" in replan
     assert "in_flight" not in replan and "delivered" not in replan
     lead_query = next(sql for sql in connection.statements if sql.startswith("select l.id"))
-    assert "not exists" in lead_query and "cv.status='active'" in lead_query
+    assert "l.cadence_state='pending'" in lead_query
     assert materialized[0][1]["cadence_version_id"] == 4
     assert materialized[0][1]["update_lead"] is False
     get_settings.cache_clear()
@@ -1004,63 +1089,9 @@ def test_saved_sms_templates_support_create_rename_and_permanent_delete(monkeypa
 
     source = Path(dashboard_routes.__file__).read_text(encoding="utf-8")
     clone_query = source[source.index("if payload.source_version_id:") :]
-    clone_query = clone_query[: clone_query.index("elif payload.lead_id:")]
+    clone_query = clone_query[: clone_query.index("        else:")]
+    assert "lead_id is null" in clone_query
     assert "status!='deleted'" not in clone_query
-    get_settings.cache_clear()
-
-
-class StandardCadenceConnection:
-    lead_id = uuid4()
-
-    def __init__(self):
-        self.statements: list[str] = []
-
-    def execute(self, sql, params=None):
-        del params
-        normal = " ".join(sql.split())
-        self.statements.append(normal)
-        if "from leads where id=" in normal:
-            return Result([{
-                "id": self.lead_id, "practice_id": 1, "status": "in_progress",
-                "cadence_state": "paused",
-            }])
-        if "lead_id is null" in normal and "status='active'" in normal:
-            return Result([{"id": 3}])
-        return Result([])
-
-
-def test_switching_to_standard_archives_local_and_replans_only_future(monkeypatch):
-    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
-    get_settings.cache_clear()
-    connection = StandardCadenceConnection()
-    materialized = []
-
-    @contextmanager
-    def fake_transaction():
-        yield connection
-
-    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
-    monkeypatch.setattr(
-        dashboard_routes,
-        "materialize_cadence",
-        lambda *args, **kwargs: materialized.append((args, kwargs)) or 8,
-    )
-    response = TestClient(app).post(
-        f"/api/v1/dashboard/leads/{connection.lead_id}/cadence-mode",
-        json={"mode": "standard"},
-        headers={
-            "X-Dashboard-Token": "x" * 32,
-            "X-Dashboard-User-ID": "staff-1",
-            "X-Dashboard-User-Name": "Test%20Administrator",
-            "X-Dashboard-User-Role": "super_admin",
-        },
-    )
-    assert response.status_code == 200
-    assert response.json()["mode"] == "standard"
-    assert any("set status='archived'" in sql for sql in connection.statements)
-    replan = next(sql for sql in connection.statements if sql.startswith("update outreach_events"))
-    assert "status='planned'" in replan
-    assert materialized[0][1] == {"cadence_version_id": 3, "update_lead": False}
     get_settings.cache_clear()
 
 
