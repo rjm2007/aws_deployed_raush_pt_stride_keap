@@ -1731,3 +1731,12 @@ known follow-up. Do not include secrets or patient/tester identifiers.
 - Pausing skips remaining planned steps, so a paused lead has no next event. The board treated that as a
   spent cadence and showed the lead under Closed with "Outreach complete". A paused, non-terminal lead now
   stays in the In Cadence column with its Paused badge; terminal statuses still go to Closed.
+
+### 2026-10-05 - Sheet restart cooldown
+
+- Observed: the Sheet intake workflow re-sent `Restart cadence` for one test lead 11 times in ~10 minutes, each
+  with a new request ID, roughly 20-40 seconds after each AWS status writeback. Every accepted restart created
+  a fresh Day 0 call. AWS writebacks never include `action_status` for in-cadence leads, so the Action Status
+  gate is most likely being cleared on the n8n side; the workflow still needs correcting.
+- Backend guard: `restart_cadence` now returns `409 restart_too_soon` when the same lead was restarted from
+  the Sheet within the last 10 minutes (`RESTART_COOLDOWN_MINUTES`), before any schedule is changed.

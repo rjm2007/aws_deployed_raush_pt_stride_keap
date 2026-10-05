@@ -24,6 +24,7 @@ TERMINAL_START_STATUSES = {
     "invalid_phone",
     "closed_no_response",
 }
+RESTART_COOLDOWN_MINUTES = 10
 
 
 @dataclass(frozen=True)
@@ -317,6 +318,23 @@ def _restart_cadence(
             409,
             "outreach_unresolved",
             "Wait for the current call or SMS result before restarting",
+            lead_id=str(lead_id),
+        )
+    # Each restart is a fresh Day 0 call. If the Sheet workflow re-fires the same
+    # Restart command after our own status writeback, every request arrives with
+    # a new request ID, so idempotency cannot catch it and the patient is called
+    # every minute or two. A real second restart this soon is not plausible.
+    recent = conn.execute(
+        "select changed_at from lead_status_history where lead_id=%s and source='n8n_sheet' "
+        "and reason='cadence restarted from Google Sheets' "
+        "and changed_at>now()-make_interval(mins=>%s) order by changed_at desc limit 1",
+        (lead_id, RESTART_COOLDOWN_MINUTES),
+    ).fetchone()
+    if recent:
+        raise LeadActionError(
+            409,
+            "restart_too_soon",
+            f"Cadence was already restarted in the last {RESTART_COOLDOWN_MINUTES} minutes",
             lead_id=str(lead_id),
         )
     if lead_data:

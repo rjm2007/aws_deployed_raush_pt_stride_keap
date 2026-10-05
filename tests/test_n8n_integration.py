@@ -926,6 +926,34 @@ def test_restart_refuses_terminal_or_unsafe_leads(status):
     assert exc_info.value.code == "restart_not_allowed"
 
 
+def test_restart_rejects_a_repeat_sheet_restart_within_cooldown(monkeypatch):
+    """A Sheet workflow that re-fires Restart after our own writeback sends a new
+    request ID each time; without this every repeat is a fresh Day 0 call."""
+    conn = _RestartConnection("active")
+    original_execute = conn.execute
+
+    def execute(query, params=None):
+        if "from lead_status_history" in query:
+            conn.queries.append((" ".join(query.split()), params))
+            return _Rows(one={"changed_at": datetime.now(UTC)})
+        return original_execute(query, params)
+
+    conn.execute = execute
+    monkeypatch.setattr(lead_actions, "materialize_cadence", lambda *args, **kwargs: 8)
+    with pytest.raises(lead_actions.LeadActionError) as exc_info:
+        lead_actions._restart_cadence(
+            conn,
+            request_id=UUID("00000000-0000-0000-0000-000000000001"),
+            practice={"id": 1},
+            lead_id=UUID("00000000-0000-0000-0000-000000000002"),
+            phone="+15555550100",
+        )
+
+    assert exc_info.value.code == "restart_too_soon"
+    statements = [query for query, _ in conn.queries]
+    assert not any(query.startswith("delete from outreach_events") for query in statements)
+
+
 def test_sheet_webhook_uses_separate_hmac_secret(monkeypatch):
     monkeypatch.setenv("N8N_SHEET_KEY_ID", "aws-sheet-worker")
     monkeypatch.setenv("N8N_SHEET_WEBHOOK_SECRET", "outbound-secret-that-is-long-enough")
