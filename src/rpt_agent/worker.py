@@ -159,9 +159,8 @@ def materialize_cadence(
     # creating a lead, and restarting one from the board.
     version = conn.execute(
         "select id from cadence_versions where practice_id=%s and status='active' "
-        "and (%s::bigint is null or id=%s::bigint) and (lead_id=%s or lead_id is null) "
-        "order by (lead_id is not null) desc limit 1",
-        (practice_id, cadence_version_id, cadence_version_id, lead_id),
+        "and (%s::bigint is null or id=%s::bigint) and lead_id is null limit 1",
+        (practice_id, cadence_version_id, cadence_version_id),
     ).fetchone()
     if not version:
         return 0
@@ -290,12 +289,11 @@ def claim_jobs(trace: WorkflowTrace, limit: int = 20) -> list[Job]:
             context = conn.execute(
                 "select l.full_name,l.phone_e164,ps.vapi_assistant_id,ps.vapi_phone_number_id,"
                 "ps.booking_link_url,l.date_of_birth,ps.stride_case_title,ps.stride_location_id,"
-                "coalesce(lmo.body,mt.body) as body "
+                "mt.body "
                 "from leads l "
                 "join practice_settings ps on ps.practice_id=l.practice_id "
                 "left join message_templates mt on mt.cadence_step_id=%s and mt.is_active "
-                "left join lead_message_overrides lmo on lmo.lead_id=l.id "
-                "and lmo.message_template_id=mt.id where l.id=%s limit 1",
+                "where l.id=%s limit 1",
                 (row["cadence_step_id"], row["lead_id"]),
             ).fetchone()
             jobs.append(Job(

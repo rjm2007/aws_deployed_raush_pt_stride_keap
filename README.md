@@ -102,8 +102,13 @@ headers only when that token is valid and repeats every role check.
 
 Users live only in the frontend host's server-side `DASHBOARD_USERS_JSON`; configure exactly one
 `super_admin`, set `DASHBOARD_SESSION_SECRET`, and redeploy the frontend when the roster changes. Employees
-can work every lead and personalize lead cadences. Only the super admin can change global cadence/templates
+can work every lead, including pause/resume and individual event rescheduling. Only the super admin can change global cadence/templates
 or permanently delete leads, cadence versions, and templates.
+
+Dashboard lead creation always assigns ownership to the authenticated creator, ignoring client-supplied
+owner fields. Lead profile editing and personalized cadence/message endpoints have been removed. Future
+cadence starts and SMS messages use global definitions; existing run/history records remain intact.
+Global draft step names automatically match their current day while preserving the action description.
 
 The local backend `.env` may mirror the roster for operator configuration, but the backend never reads login
 passwords. Optional roster emails enable frontend email login; the proxy still forwards stable short employee

@@ -122,6 +122,8 @@ class _CadenceConnection:
         if "select is_test" in query:
             return _Result(one={"is_test": self.is_test, "cadence_state": "active"})
         if "select id from cadence_versions" in query:
+            assert "lead_id is null" in query
+            assert "lead_id=%s" not in query
             return _Result(one={"id": 3})
         if "select id,step_order" in query:
             return _Result(many=self.steps)

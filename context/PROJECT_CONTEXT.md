@@ -1,6 +1,6 @@
 # RPT Agent — Complete Project Context and Handoff
 
-Last updated: 2026-10-02 (Asia/Calcutta)
+Last updated: 2026-10-05 (Asia/Calcutta)
 
 This is the durable context file for future Codex, Claude, and human development sessions. Read this file
 before changing the project. Update it whenever a material decision, schema migration, integration contract,
@@ -325,8 +325,9 @@ activating it archives the previous global version. Renaming is metadata only an
 Global activation applies the new version only to leads whose cadence is still `pending` (unstarted). Leads
 already `active` or `paused` keep the `cadence_version_id` on their existing outreach and finish the version
 they started. A staff restart that moves a lead back to New clears the old run and starts on whichever global
-version is active at that time. A lead-specific draft still takes precedence when explicitly activated for that
-lead and replaces only that lead's future `planned` events.
+version is active at that time. New cadence starts and SMS messages use global definitions only; lead-specific
+cadence editing/activation and message overrides were removed on 2026-10-05. Historical runs remain intact.
+Draft step descriptions always use the current `Day N` prefix followed by the action description.
 
 When a future callback is accepted, the service adds one standalone callback call and shifts every remaining
 planned cadence event by one common delta so the earliest remainder is one second after the callback. This
@@ -649,20 +650,18 @@ applied, and both idempotent mock deliveries completed.
 
 ## Test and quality status
 
-Latest verified local result on 2026-09-17 at backend `8e40c4e` plus the current agent worktree, and frontend
-`fcde2c1`:
+Latest verified local result on 2026-10-05 on the current backend and frontend worktrees:
 
 ```text
-backend: 130 passed, 3 skipped; Ruff all checks passed; git diff --check passed
-frontend: TypeScript check passed; Vinext production build passed
-frontend lint: passed
-development and production Compose configuration: valid
-configured Supabase migration registry: all 23 entries through 022 present
+backend: 208 passed, 3 skipped; Ruff all checks passed; wheel build passed
+frontend: 15 tests passed; lint and TypeScript check passed
+frontend: Vinext and native Next production builds passed
+both repositories: git diff --check passed
 ```
 
 The three skipped tests are optional integration/real-provider tests requiring explicit environment values,
-including `TEST_DATABASE_URL` or provider sandbox credentials. Repeated dependency deprecation warnings come
-from Python 3.14 asyncio behavior; they are not application failures.
+including `TEST_DATABASE_URL` or provider sandbox credentials. An upstream Starlette/AnyIO deprecation
+warning remains; it is not an application failure. The workstation uses Node 26, while deployment remains Node 22.
 
 Covered tests include:
 
@@ -859,6 +858,24 @@ npm.cmd run build
 
 Append entries newest first. Include date, decision/change, migrations, configuration impact, validation, and
 known follow-up. Do not include secrets or patient/tester identifiers.
+
+### 2026-10-05 - Lead workspace simplification and global-only cadences
+
+- Removed the Overview recent-activity panel, lead-edit dialog, and lead PATCH endpoint. Dedicated Team
+  activity remains, including prior audit records. New lead ownership always comes from the authenticated
+  creator; spoofed owner fields cannot change it. The Add Lead owner selector is removed.
+- Removed personalized outreach controls, scoped cadence creation/editing/activation, and per-lead SMS
+  override endpoints/worker precedence. Normal pause/resume, contact rules, callbacks, and individual event
+  rescheduling remain. Existing history-bearing tables/columns and already-materialized schedules are retained.
+- A read-only aggregate check found zero active lead-specific versions, lead drafts, unfinished scoped steps,
+  and message overrides in the configured database. No migration, record cleanup, or provider write was needed.
+- Global draft step names normalize the current day prefix in both frontend and backend, including reorder,
+  save, and clone paths. Historical step displays derive the same name without rewriting stored history.
+- Verification: 208 backend tests passed, three optional integration tests skipped; 15 frontend tests passed;
+  lint, typecheck, wheel build, both frontend production builds, and admin/employee browser checks passed.
+  Mobile lead/form layouts fit the viewport. Employee backend tests verify global writes return 403 before
+  opening a database transaction. Browser checks were read-only or cancelled; draft changes were discarded.
+- Changes remain local. No deployment, environment, migration, booking, SMS, or call changes were made.
 
 ### 2026-10-02 - Dashboard connection, consistency, and workspace audit
 
