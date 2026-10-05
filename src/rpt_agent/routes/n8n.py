@@ -167,7 +167,7 @@ async def lead_actions(request: Request):
 
 @router.post("/lead-sync")
 async def lead_sync(request: Request):
-    """Sync Sheet-owned fields; a changed phone is flagged for staff review."""
+    """Sync Sheet-owned fields; changed identity fields require staff review."""
     request_id_raw = request.headers.get("x-request-id", "").strip()
     try:
         await require_n8n_intake_auth(request)

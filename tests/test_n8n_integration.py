@@ -243,7 +243,7 @@ def test_existing_sheet_lead_profile_updates_when_name_changes():
     assert params[6:8] == ("New Location", "New Lead Type")
 
 
-def test_sheet_sync_same_phone_updates_existing_lead(monkeypatch):
+def test_sheet_sync_same_identity_updates_existing_lead(monkeypatch):
     updates = []
 
     class Connection:
@@ -251,8 +251,12 @@ def test_sheet_sync_same_phone_updates_existing_lead(monkeypatch):
             normalized = " ".join(query.split())
             if normalized.startswith("select id from practices"):
                 return _Rows({"id": 7})
-            if normalized.startswith("select id,phone_e164 from leads"):
-                return _Rows({"id": params[0], "phone_e164": "+15555550100"})
+            if normalized.startswith("select id,full_name,phone_e164 from leads"):
+                return _Rows({
+                    "id": params[0],
+                    "full_name": "Original Name",
+                    "phone_e164": "+15555550100",
+                })
             updates.append((normalized, params))
             return _Rows(None)
 
@@ -271,14 +275,18 @@ def test_sheet_sync_same_phone_updates_existing_lead(monkeypatch):
     result = lead_actions.sync_sheet_lead(
         request_id=UUID("00000000-0000-0000-0000-000000000001"),
         lead_id=UUID("00000000-0000-0000-0000-000000000002"),
-        lead={"full_name": "Changed Name", "phone": "+15555550100"},
+        lead={
+            "full_name": "Original Name",
+            "phone": "+15555550100",
+            "email": "changed@example.test",
+        },
     )
     assert result.status_code == 200
     assert result.body["result"] == "profile_updated"
     assert updates[0][0].startswith("update leads set full_name=")
 
 
-def test_sheet_sync_changed_phone_requires_review(monkeypatch):
+def test_sheet_sync_changed_name_requires_review(monkeypatch):
     queries = []
 
     class _Rows:
@@ -297,8 +305,64 @@ def test_sheet_sync_changed_phone_requires_review(monkeypatch):
             queries.append(normalized)
             if normalized.startswith("select id from practices"):
                 return _Rows({"id": 7})
-            if normalized.startswith("select id,phone_e164 from leads"):
-                return _Rows({"id": params[0], "phone_e164": "+15555550100"})
+            if normalized.startswith("select id,full_name,phone_e164 from leads"):
+                return _Rows({
+                    "id": params[0],
+                    "full_name": "Original Name",
+                    "phone_e164": "+15555550100",
+                })
+            return _Rows(None)
+
+    @contextmanager
+    def fake_transaction():
+        yield Connection()
+
+    monkeypatch.setattr(lead_actions, "transaction", fake_transaction)
+    result = lead_actions.sync_sheet_lead(
+        request_id=UUID("00000000-0000-0000-0000-000000000001"),
+        lead_id=UUID("00000000-0000-0000-0000-000000000002"),
+        lead={"full_name": "Changed Name", "phone": "+15555550100"},
+    )
+    assert result.status_code == 409
+    assert result.body["result"] == "name_changed_needs_review"
+    assert any("update leads set needs_review=true" in query for query in queries)
+    assert not any("update leads set full_name=" in query for query in queries)
+
+
+@pytest.mark.parametrize(
+    ("incoming_name", "expected_result"),
+    [
+        ("Changed Name", "phone_changed_needs_review"),
+        ("Another Name", "name_and_phone_changed_needs_review"),
+    ],
+)
+def test_sheet_sync_changed_phone_requires_review(
+    monkeypatch, incoming_name, expected_result
+):
+    queries = []
+
+    class _Rows:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return []
+
+    class Connection:
+        def execute(self, query, params=None):
+            normalized = " ".join(query.split())
+            queries.append(normalized)
+            if normalized.startswith("select id from practices"):
+                return _Rows({"id": 7})
+            if normalized.startswith("select id,full_name,phone_e164 from leads"):
+                return _Rows({
+                    "id": params[0],
+                    "full_name": "Changed Name",
+                    "phone_e164": "+15555550100",
+                })
             return _Rows(None)
 
     @contextmanager
@@ -311,7 +375,7 @@ def test_sheet_sync_changed_phone_requires_review(monkeypatch):
         request_id=UUID("00000000-0000-0000-0000-000000000001"),
         lead_id=old_id,
         lead={
-            "full_name": "Changed Name",
+            "full_name": incoming_name,
             "phone": "+15555550101",
             "date_of_birth": date(1990, 3, 15),
             "location": "Dana Point",
@@ -319,10 +383,11 @@ def test_sheet_sync_changed_phone_requires_review(monkeypatch):
         },
     )
     assert result.status_code == 409
-    assert result.body["result"] == "phone_changed_needs_review"
+    assert result.body["result"] == expected_result
     assert result.body["lead_id"] == str(old_id)
     assert any("update leads set needs_review=true" in query for query in queries)
     assert any("update outreach_events set status='skipped'" in query for query in queries)
+    assert not any("update leads set full_name=" in query for query in queries)
 
 
 def test_n8n_route_rejects_bad_or_stale_signature(monkeypatch):
@@ -972,6 +1037,7 @@ def test_profile_sync_workflow_matches_the_database_lead_id():
     assert "Lead ID" not in trigger["options"]["columnsToWatch"]
     assert "Case" in trigger["options"]["columnsToWatch"]
     assert "Title" not in trigger["options"]["columnsToWatch"]
+    assert nodes["Has Lead ID?"]["parameters"]["options"] == {}
     build = nodes["Build and Sign Profile Sync"]["parameters"]["jsCode"]
     assert "lead_id:oldLeadId" in build
     assert "row['Lead ID']" in build
@@ -993,6 +1059,7 @@ def test_profile_sync_workflow_matches_the_database_lead_id():
     error_update = nodes["Write Sync Error by Lead ID"]["parameters"]
     assert error_update["columns"]["matchingColumns"] == ["Lead ID"]
     assert error_update["columns"]["value"]["Needs Review"] == "={{ $json.needsReview }}"
+    assert error_update["columns"]["value"]["Action Status"] == "={{ $json.errorText }}"
     prepare = nodes["Prepare Profile Sync Result"]["parameters"]["jsCode"]
     assert "phone_changed_needs_review" in prepare
     assert "Needs review: phone number changed" in prepare
