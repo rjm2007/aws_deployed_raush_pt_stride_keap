@@ -1725,3 +1725,9 @@ known follow-up. Do not include secrets or patient/tester identifiers.
   identity field preserves the stored values, pauses remaining outreach, and marks the lead for staff review.
 - No database migration was required. The already-deployed n8n profile workflow maps these review responses
   to the live Sheet's `Lead Status` and `Outcome Status` columns.
+
+### 2026-10-05 - Paused leads stay in cadence on the board
+
+- Pausing skips remaining planned steps, so a paused lead has no next event. The board treated that as a
+  spent cadence and showed the lead under Closed with "Outreach complete". A paused, non-terminal lead now
+  stays in the In Cadence column with its Paused badge; terminal statuses still go to Closed.

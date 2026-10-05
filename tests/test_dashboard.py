@@ -1377,3 +1377,16 @@ def test_restart_from_new_starts_on_the_active_version():
     restart = source[source.index("restarted = materialize_cadence("):]
     restart = restart[: restart.index(")") + 1]
     assert "cadence_version_id" not in restart
+
+
+def test_paused_lead_stays_in_cadence_not_closed():
+    row = {
+        "status": "in_progress",
+        "needs_review": False,
+        "cadence_state": "paused",
+        "cadence_total": 8,
+        "next_event_id": None,
+    }
+    assert dashboard_routes._stage(row) == "cadence"
+    assert dashboard_routes._stage({**row, "cadence_state": "active"}) == "closed"
+    assert dashboard_routes._stage({**row, "status": "invalid_phone"}) == "closed"

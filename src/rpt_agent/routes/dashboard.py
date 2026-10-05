@@ -193,6 +193,10 @@ def _stage(row: dict) -> str:
         return "closed"
     if row["status"] == "new" or row["cadence_state"] == "pending":
         return "new"
+    # Pausing skips the remaining steps until resume, so a paused lead has no
+    # next event either. That is on hold, not spent.
+    if row["cadence_state"] == "paused":
+        return "cadence"
     # Every step has run and nothing is awaiting a provider result, so the
     # cadence is spent even though the lead was never explicitly closed.
     if row.get("cadence_total") and not row.get("next_event_id"):
