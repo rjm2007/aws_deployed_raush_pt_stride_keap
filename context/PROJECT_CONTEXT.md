@@ -1763,4 +1763,9 @@ known follow-up. Do not include secrets or patient/tester identifiers.
 - Tests: `tests/test_number_block_integration.py` (needs `TEST_DATABASE_URL`) runs every path on a real schema.
 - Known, unchanged: `compute_send_time` rolls weekend days to Monday, so e.g. Day 3 and Day 5 can land on the
   same Monday minutes apart. Production `call_logs.cost` exists but no migration creates it.
+- Follow-up (same day): a dashboard unblock also rewrites the Sheet's Action cell (patch key `action`):
+  Continue -> "Start cadence", Start over -> "Restart cadence", so the row stops reading Do Not Contact. A
+  restart's Outcome Status is the plain "Cadence restarted" (the intake workflow skips that next to Restart
+  cadence; "... in dashboard" would restart the patient twice). Needs the webhook-flow "Update System Columns"
+  node to map the Action column, which the local export does not show.
 

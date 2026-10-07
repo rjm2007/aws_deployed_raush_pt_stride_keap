@@ -173,6 +173,9 @@ def test_continue_resumes_only_the_stopped_steps_with_their_spacing(db):
     _, sheet = _snapshot(db, lead)
     assert sheet["action_status"] == "Cadence resumed in dashboard"
     assert sheet["lead_status"] == "In cadence"
+    # The stale "Do Not Contact" in the Action cell is replaced. Next to a Lead
+    # ID, "Start cadence" is never re-sent by the intake workflow.
+    assert sheet["action"] == "Start cadence"
 
 
 def test_start_over_builds_a_fresh_day_zero_and_keeps_history(db):
@@ -192,7 +195,10 @@ def test_start_over_builds_a_fresh_day_zero_and_keeps_history(db):
     # the set of steps is fixed here, not their order.
     assert sorted(e["day_offset"] for e in fresh) == [0, 0, 3, 5]
     _, sheet = _snapshot(db, lead)
-    assert sheet["action_status"] == "Cadence restarted in dashboard"
+    # The Sheet's own restart wording: with Action "Restart cadence" the intake
+    # workflow skips it, so the patient is not restarted a second time.
+    assert sheet["action_status"] == "Cadence restarted"
+    assert sheet["action"] == "Restart cadence"
 
 
 def test_unblock_must_choose_continue_or_start_over(db):
@@ -249,6 +255,7 @@ def test_older_do_not_contact_rows_are_marked_unblocked_too(db):
     # The old lead keeps its own Do Not Contact status, so its Sheet row keeps
     # saying so; the intake workflow skips it until staff change the Action.
     assert sheet["action_status"] == "Do not contact applied"
+    assert "action" not in sheet
 
 
 def test_continue_with_nothing_left_changes_nothing(db):

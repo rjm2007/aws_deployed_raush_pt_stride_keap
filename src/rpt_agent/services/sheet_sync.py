@@ -145,10 +145,16 @@ def format_cadence_columns(
 # never re-sends a row whose status ends in "in dashboard" while its Action
 # still reads Do Not Contact, so an unblocked patient is not blocked again by
 # the stale cell. Listed strongest first; Lead Status is set where it changes.
+#
+# A dashboard unblock also replaces the stale "Do Not Contact" in the Action
+# cell, so the row stops reading as blocked. A restart is written as the
+# plain "Cadence restarted" the Sheet's own restart produces: next to Action
+# "Restart cadence" that is a status the intake workflow already skips, where
+# "... in dashboard" would let it restart the patient a second time.
 DASHBOARD_OUTCOMES = {
-    "cadence_restarted_after_unblock": ("Cadence restarted in dashboard", "In cadence"),
-    "cadence_resumed_after_unblock": ("Cadence resumed in dashboard", "In cadence"),
-    "number_unblocked": ("Unblocked in dashboard", None),
+    "cadence_restarted_after_unblock": ("Cadence restarted", "In cadence", "Restart cadence"),
+    "cadence_resumed_after_unblock": ("Cadence resumed in dashboard", "In cadence", "Start cadence"),
+    "number_unblocked": ("Unblocked in dashboard", None, None),
 }
 
 
@@ -254,9 +260,11 @@ def build_sheet_snapshot(
         (DASHBOARD_OUTCOMES[reason] for reason in DASHBOARD_OUTCOMES if reason in pending), None
     )
     if dashboard_outcome and lead["status"] not in {"booked", "do_not_contact"}:
-        action_status, lead_status = dashboard_outcome
+        action_status, lead_status, action = dashboard_outcome
         if lead_status:
             sheet["lead_status"] = lead_status
+        if action:
+            sheet["action"] = action
     if action_status is not None:
         sheet["action_status"] = action_status
     # Booked ends the lead however it happened (board, Sheet or call), so the
