@@ -246,6 +246,10 @@ states and inbound replies. These endpoints update Supabase first; they never ca
 1. Google Sheets Trigger sees an edited row.
 2. Continue only when Action is Start cadence, Restart cadence, Do Not Contact, or Booked and Action Status is blank. This prevents
    the workflow from reprocessing its own Sheet update forever.
+   Exception (2026-10-07): a status ending in "in dashboard" ("Unblocked in dashboard", "Cadence resumed in
+   dashboard", "Cadence restarted in dashboard") is written by AWS when an admin unblocks a number. Such a row
+   is processed unless Action still reads Do Not Contact, so the stale command cannot block the patient again
+   while a changed Action (Restart cadence, Booked) still goes through.
 3. Normalize phone and DOB. Accept a one-word Name and any non-empty Case.
 4. Generate one Action Request ID.
 5. Using the trigger `row_number`, write `Processing: <Action>`, Action Request ID, and Action Started At to

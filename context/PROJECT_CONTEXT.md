@@ -1740,3 +1740,27 @@ known follow-up. Do not include secrets or patient/tester identifiers.
   gate is most likely being cleared on the n8n side; the workflow still needs correcting.
 - Backend guard: `restart_cadence` now returns `409 restart_too_soon` when the same lead was restarted from
   the Sheet within the last 10 minutes (`RESTART_COOLDOWN_MINUTES`), before any schedule is changed.
+
+### 2026-10-07 - Blocked numbers shown and managed in the dashboard
+
+- Lead board and lead page carry `number_block` (reason, source, blocked_at) from `suppressed_numbers`; the
+  dashboard shows a red "This number is blocked" bar and a "Number blocked" tag. Read-only.
+- The lead page's Do not contact switch now reports and changes the number, not only its own lead
+  (`services/number_block.py`). Turning it on writes the same block as the Sheet command (source `dashboard`,
+  staff name in the reason) and tells the Sheet. Turning it off is `super_admin` only and requires
+  `after_unblock`: `continue` (the steps the block stopped come back, first one now, original gaps kept) or
+  `restart` (fresh Day 0, as a Sheet restart). There is deliberately no "unblock and wait": the block had
+  already cancelled the steps, so a waiting lead's Resume button had nothing to resume. Every lead on
+  the number has its opt-outs cleared, and the unblocked lead becomes the one live lead on the number
+  (`hand_over_number`), so overdue steps on a newer lead cannot fire in a burst.
+- Sheet writeback: outbox reasons `cadence_resumed_after_unblock` / `cadence_restarted_after_unblock` (the
+  unblocked lead) and `number_unblocked` (older Do Not Contact rows on the same number) set Outcome Status
+  to "... in dashboard" once (`DASHBOARD_OUTCOMES` in
+  `services/sheet_sync.py`; the sheet worker now passes outbox reasons to `build_sheet_snapshot`).
+- n8n intake "Action Needs Processing?" gained one rule for "... in dashboard" statuses (see `plan.md` §5).
+  It must be live before this backend is deployed: the old rule would treat "Unblocked in dashboard" next to a
+  stale Do Not Contact as a new command and block the patient again.
+- Tests: `tests/test_number_block_integration.py` (needs `TEST_DATABASE_URL`) runs every path on a real schema.
+- Known, unchanged: `compute_send_time` rolls weekend days to Monday, so e.g. Day 3 and Day 5 can land on the
+  same Monday minutes apart. Production `call_logs.cost` exists but no migration creates it.
+

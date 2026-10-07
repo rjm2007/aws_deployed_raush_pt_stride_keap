@@ -87,7 +87,7 @@ def _claim_sheet_work(settings: Settings) -> list[dict[str, Any]]:
             "and updated_at<now()-interval '15 minutes'"
         )
         rows = conn.execute(
-            "select id,event_id,aggregate_id,attempts from integration_outbox "
+            "select id,event_id,aggregate_id,attempts,payload from integration_outbox "
             "where destination='n8n' and status='pending' and next_attempt_at<=now() "
             "order by id limit %s for update skip locked",
             (settings.sheet_sync_batch_size,),
@@ -156,7 +156,10 @@ def run_sheet_sync_tick(client: httpx.Client | None = None) -> dict[str, int]:
             try:
                 with transaction() as conn:
                     snapshot = build_sheet_snapshot(
-                        conn, lead_id, practice_slug=settings.n8n_practice_slug
+                        conn,
+                        lead_id,
+                        practice_slug=settings.n8n_practice_slug,
+                        reasons=[str((row.get("payload") or {}).get("reason", "")) for row in lead_rows],
                     )
                 http_status = _post_snapshot(client, settings, delivery_id, snapshot)
                 _mark_delivered(lead_rows)

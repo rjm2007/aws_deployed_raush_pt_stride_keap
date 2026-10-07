@@ -164,8 +164,14 @@ class CreateLeadConnection:
 class DetailConnection:
     lead_id = uuid4()
 
+    def __init__(self, blocked=None):
+        self.blocked = blocked
+        self.blocked_lookups = []
+
     def execute(self, sql, params=None):
-        del params
+        if "from suppressed_numbers" in sql:
+            self.blocked_lookups.append(params)
+            return Result([self.blocked] if self.blocked else [])
         if "from leads where id=" in sql:
             return Result([{
                 "id": self.lead_id,
@@ -486,6 +492,82 @@ def test_dashboard_lead_detail_uses_database_phone_and_event_progress(monkeypatc
         assert detail["calls"][0]["outreach_event_id"] == 2
     finally:
         get_settings.cache_clear()
+
+
+def _get_lead_detail(monkeypatch, connection):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+
+    @contextmanager
+    def fake_transaction():
+        yield connection
+
+    monkeypatch.setattr(dashboard_routes, "transaction", fake_transaction)
+    try:
+        return TestClient(app).get(
+            f"/api/v1/dashboard/leads/{connection.lead_id}",
+            headers={
+                "X-Dashboard-Token": "x" * 32,
+                "X-Dashboard-User-ID": "employee1",
+                "X-Dashboard-User-Name": "Test%20Employee",
+                "X-Dashboard-User-Role": "employee",
+            },
+        )
+    finally:
+        get_settings.cache_clear()
+
+
+def test_lead_detail_shows_who_blocked_the_number_and_when(monkeypatch):
+    blocked_at = datetime(2026, 10, 6, 17, 37, tzinfo=UTC)
+    connection = DetailConnection(blocked={
+        "blocked_reason": "staff selected Do Not Contact",
+        "blocked_source": "n8n_sheet",
+        "blocked_at": blocked_at,
+    })
+    response = _get_lead_detail(monkeypatch, connection)
+    assert response.status_code == 200
+    block = response.json()["lead"]["number_block"]
+    assert block["source"] == "n8n_sheet"
+    assert block["reason"] == "staff selected Do Not Contact"
+    assert datetime.fromisoformat(block["blocked_at"]) == blocked_at
+    # The lookup is by the lead's own phone number, not by lead id.
+    assert connection.blocked_lookups == [("+15550000001",)]
+
+
+def test_lead_detail_on_an_unblocked_number_has_no_block(monkeypatch):
+    response = _get_lead_detail(monkeypatch, DetailConnection())
+    assert response.status_code == 200
+    assert response.json()["lead"]["number_block"] is None
+
+
+def test_board_lead_carries_the_block_only_when_the_number_is_listed():
+    base = {
+        "id": uuid4(), "full_name": "Synthetic Lead", "status": "in_progress",
+        "cadence_state": "active", "needs_review": False, "created_at": datetime.now(UTC),
+        "cadence_total": 8, "next_event_id": 1,
+    }
+    assert dashboard_routes._lead(base)["number_block"] is None
+    blocked_at = datetime.now(UTC)
+    lead = dashboard_routes._lead({
+        **base,
+        "blocked_reason": "explicit do-not-contact request",
+        "blocked_source": "webhook",
+        "blocked_at": blocked_at,
+    })
+    assert lead["number_block"] == {
+        "reason": "explicit do-not-contact request",
+        "source": "webhook",
+        "blocked_at": blocked_at,
+    }
+    # A block never moves the lead on the board by itself; that is a later change.
+    assert lead["stage"] == dashboard_routes._lead(base)["stage"]
+
+
+def test_board_and_new_lead_queries_join_the_block_list_by_phone():
+    source = Path("src/rpt_agent/routes/dashboard.py").read_text(encoding="utf-8")
+    join = "left join suppressed_numbers blocked on blocked.phone_e164=l.phone_e164"
+    # Snapshot (board) and create-lead responses both read the block list.
+    assert source.count(join) == 2
 
 
 def test_dashboard_migration_and_text_only_call_artifacts():
@@ -1180,31 +1262,39 @@ def test_delete_lead_refuses_while_a_call_is_in_flight(monkeypatch):
 
 
 class ContactRulesConnection:
-    def __init__(self, status="in_progress"):
+    def __init__(self, status="in_progress", blocked=False):
         self.lead = {
-            "id": uuid4(), "practice_id": 1, "status": status, "cadence_state": "active",
+            "id": uuid4(), "practice_id": 1, "phone_e164": "+15550000001", "status": status,
+            "status_changed_at": datetime.now(UTC), "cadence_state": "active",
             "call_opt_out": False, "sms_opt_out": False,
         }
+        self.blocked = blocked
         self.statements: list[str] = []
 
     def execute(self, sql, params=None):
         del params
         normal = " ".join(sql.split())
         self.statements.append(normal)
-        if normal.startswith("select id,practice_id,status,cadence_state,call_opt_out"):
+        if normal.startswith("select id,practice_id,phone_e164,status,status_changed_at"):
             return Result([dict(self.lead)])
+        if "from suppressed_numbers" in normal:
+            return Result([{"created_at": datetime.now(UTC)}] if self.blocked else [])
+        if normal.startswith("select status from leads"):
+            return Result([{"status": self.lead["status"]}])
         if normal.startswith("select status,cadence_state,call_opt_out"):
             return Result([{
                 "status": self.lead["status"], "cadence_state": self.lead["cadence_state"],
                 "call_opt_out": self.lead["call_opt_out"], "sms_opt_out": self.lead["sms_opt_out"],
             }])
+        if normal.startswith("update leads set call_opt_out=false,sms_opt_out=false,status='in_progress'"):
+            self.lead["status"] = "in_progress"
         if normal.startswith("update leads set status='do_not_contact'"):
             self.lead["status"] = "do_not_contact"
             self.lead["cadence_state"] = "terminated"
         return Result([])
 
 
-def _set_rules(connection, monkeypatch, body):
+def _set_rules(connection, monkeypatch, body, role="super_admin"):
     @contextmanager
     def fake_transaction():
         yield connection
@@ -1217,9 +1307,70 @@ def _set_rules(connection, monkeypatch, body):
             "X-Dashboard-Token": "x" * 32,
             "X-Dashboard-User-ID": "staff-1",
             "X-Dashboard-User-Name": "Test%20Administrator",
-            "X-Dashboard-User-Role": "super_admin",
+            "X-Dashboard-User-Role": role,
         },
     )
+
+
+def test_dashboard_do_not_contact_blocks_the_number_like_the_sheet(monkeypatch):
+    """The switch used to close only its own lead. The number stayed callable,
+    so a new referral on it was dialled, and the red blocked banner never
+    showed. It now writes the same block the Sheet command does."""
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = ContactRulesConnection()
+    response = _set_rules(connection, monkeypatch, {"do_not_contact": True}, role="employee")
+
+    assert response.status_code == 200
+    block = next(sql for sql in connection.statements if sql.startswith("insert into suppressed_numbers"))
+    assert "'dashboard'" in block
+    assert any("call_opt_out=true,sms_opt_out=true" in sql for sql in connection.statements)
+    # The Sheet hears about it, so its row reads Do not contact too.
+    assert any("insert into integration_outbox" in sql for sql in connection.statements)
+    get_settings.cache_clear()
+
+
+def test_only_an_admin_can_unblock_a_number(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = ContactRulesConnection(status="do_not_contact", blocked=True)
+    response = _set_rules(
+        connection, monkeypatch, {"do_not_contact": False, "after_unblock": "continue"}, role="employee"
+    )
+    assert response.status_code == 403
+    assert connection.statements == []
+    get_settings.cache_clear()
+
+
+def test_switch_reads_on_for_a_number_the_sheet_blocked(monkeypatch):
+    """A Sheet block leaves this lead's own status alone when it came from
+    another row, but the switch still has to undo it."""
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = ContactRulesConnection(status="in_progress", blocked=True)
+    monkeypatch.setattr("rpt_agent.services.number_block.materialize_cadence", lambda *a, **k: 4)
+    response = _set_rules(connection, monkeypatch, {"do_not_contact": False, "after_unblock": "restart"})
+
+    assert response.status_code == 200
+    assert any(sql.startswith("delete from suppressed_numbers") for sql in connection.statements)
+    # Turning it on again must not double-block: it is already on.
+    again = ContactRulesConnection(status="in_progress", blocked=True)
+    assert _set_rules(again, monkeypatch, {"do_not_contact": True}).status_code == 200
+    assert not any(sql.startswith("insert into suppressed_numbers") for sql in again.statements)
+    get_settings.cache_clear()
+
+
+def test_continue_with_nothing_left_asks_for_start_over(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = ContactRulesConnection(status="do_not_contact", blocked=True)
+    response = _set_rules(connection, monkeypatch, {"do_not_contact": False, "after_unblock": "continue"})
+
+    assert response.status_code == 409
+    assert "start over" in response.json()["detail"]
+    # Refused before anything changed: the number is still blocked.
+    assert not any(sql.startswith("delete from suppressed_numbers") for sql in connection.statements)
+    get_settings.cache_clear()
 
 
 def test_do_not_contact_stops_outreach_as_well_as_blocking_it(monkeypatch):
@@ -1242,16 +1393,16 @@ def test_do_not_contact_stops_outreach_as_well_as_blocking_it(monkeypatch):
     get_settings.cache_clear()
 
 
-def test_clearing_do_not_contact_does_not_silently_restart_outreach(monkeypatch):
+def test_unblocking_without_choosing_what_happens_next_is_refused(monkeypatch):
+    """Unblock always continues or starts over. Leaving the lead on hold showed
+    a Resume button with nothing to resume, and the patient never heard back."""
     monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
     get_settings.cache_clear()
-    connection = ContactRulesConnection(status="do_not_contact")
+    connection = ContactRulesConnection(status="do_not_contact", blocked=True)
     response = _set_rules(connection, monkeypatch, {"do_not_contact": False})
 
-    assert response.status_code == 200
-    # The block lifts, but nothing re-plans: restarting a lead is a deliberate act.
-    assert any("status='in_progress'" in sql for sql in connection.statements)
-    assert not any("insert into outreach_events" in sql for sql in connection.statements)
+    assert response.status_code == 422
+    assert connection.statements == []
     get_settings.cache_clear()
 
 

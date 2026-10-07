@@ -14,6 +14,7 @@ from ..db import transaction
 from ..observability import WorkflowTrace
 from ..parsing import parse_flexible_date
 from ..security import DashboardActor, require_dashboard_auth
+from ..services.number_block import NumberBlockError, block_number, unblock_number
 from ..services.provider_http import ProviderError
 from ..services.review import (
     REPLACED_REASON,
@@ -36,6 +37,9 @@ class CadenceAction(BaseModel):
 
 class ContactRules(BaseModel):
     do_not_contact: bool | None = None
+    # Required when turning Do not contact off: continue the stopped steps or
+    # start over from Day 0 (see services/number_block.py).
+    after_unblock: Literal["continue", "restart"] | None = None
     call_opt_out: bool | None = None
     sms_opt_out: bool | None = None
 
@@ -260,6 +264,23 @@ def _lead(row: dict) -> dict:
         "owner_user_id": str(row["owner_user_id"]) if row.get("owner_user_id") else None,
         "is_test": bool(row.get("is_test")),
         "timezone": row.get("timezone"),
+        "number_block": _number_block(row),
+    }
+
+
+def _number_block(row: dict) -> dict | None:
+    """The suppression-list entry for the lead's phone, or None.
+
+    The worker never dials or texts a suppressed number, but nothing on the
+    board said so: a lead on a blocked number sat in cadence and quietly never
+    went out. Staff need to see the block, who set it, and when.
+    """
+    if not row.get("blocked_at"):
+        return None
+    return {
+        "reason": row.get("blocked_reason"),
+        "source": row.get("blocked_source"),
+        "blocked_at": row["blocked_at"],
     }
 
 
@@ -495,6 +516,8 @@ def dashboard_snapshot(actor: Actor):
             "select l.id,l.full_name,l.phone_e164,l.email,l.source_system,l.status,l.cadence_state,"
             "l.needs_review,l.review_reason,l.created_at,l.last_contacted_at,l.date_of_birth,"
             "l.referred_by,l.lead_type,l.location,l.owner,l.owner_user_id,l.is_test,l.timezone,l.status_reason,"
+            "blocked.reason as blocked_reason,blocked.source as blocked_source,"
+            "blocked.created_at as blocked_at,"
             "current_version.name as cadence_version_name,"
             "(select count(*) from outreach_events progress where progress.lead_id=l.id "
             "and progress.cadence_version_id=current_version.id "
@@ -519,7 +542,10 @@ def dashboard_snapshot(actor: Actor):
             "left join cadence_steps cs on cs.id=oe.cadence_step_id where oe.lead_id=l.id "
             "and oe.status in ('planned','in_flight','attempted') order by "
             "case when oe.status='planned' then 0 else 1 end,oe.scheduled_for nulls last,oe.id limit 1"
-            ") next_event on true order by l.created_at desc limit 250"
+            ") next_event on true "
+            # A blocked number stops every call and text, whatever the lead's status.
+            "left join suppressed_numbers blocked on blocked.phone_e164=l.phone_e164 "
+            "order by l.created_at desc limit 250"
         ).fetchall()
         leads = [_lead(row) for row in rows]
         appointments = conn.execute(
@@ -719,6 +745,8 @@ def create_dashboard_lead(payload: LeadCreate, actor: Actor):
             "select l.id,l.full_name,l.phone_e164,l.email,l.source_system,l.status,l.cadence_state,"
             "l.needs_review,l.review_reason,l.created_at,l.last_contacted_at,l.date_of_birth,"
             "l.referred_by,l.lead_type,l.location,l.owner,l.owner_user_id,l.is_test,l.timezone,l.status_reason,"
+            "blocked.reason as blocked_reason,blocked.source as blocked_source,"
+            "blocked.created_at as blocked_at,"
             "(select count(*) from outreach_events progress where progress.lead_id=l.id "
             "and progress.status<>'planned') as cadence_progress,"
             "(select count(*) from outreach_events total where total.lead_id=l.id) as cadence_total,"
@@ -729,7 +757,10 @@ def create_dashboard_lead(payload: LeadCreate, actor: Actor):
             "left join cadence_steps cs on cs.id=oe.cadence_step_id where oe.lead_id=l.id "
             "and oe.status in ('planned','in_flight','attempted') order by "
             "case when oe.status='planned' then 0 else 1 end,oe.scheduled_for nulls last,oe.id limit 1"
-            ") next_event on true where l.id=%s",
+            ") next_event on true "
+            # A blocked number stops every call and text, whatever the lead's status.
+            "left join suppressed_numbers blocked on blocked.phone_e164=l.phone_e164 "
+            "where l.id=%s",
             (lead_id,),
         ).fetchone()
     return {**_lead(row), **({"warning": warning} if warning else {})}
@@ -748,6 +779,11 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="lead not found")
+        blocked = conn.execute(
+            "select reason as blocked_reason,source as blocked_source,created_at as blocked_at "
+            "from suppressed_numbers where phone_e164=%s",
+            (row["phone_e164"],),
+        ).fetchone() if row["phone_e164"] else None
         # What the practice would give a new lead today.
         global_version = conn.execute(
             "select id,name,version_number,status,lead_id from cadence_versions "
@@ -827,6 +863,7 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
     detail["display_id"] = f"RPT-{str(row['id']).split('-')[0].upper()}"
     detail["phone"] = detail.get("phone_e164")
     detail["source"] = detail.get("source_system")
+    detail["number_block"] = _number_block(blocked or {})
     current_events = [
         event for event in events
         if current_version and event.get("cadence_version_id") == current_version["id"]
@@ -937,13 +974,23 @@ def set_contact_rules(lead_id: UUID, payload: ContactRules, actor: Actor):
 
     Do not contact is terminal, so it also stops outreach -- leaving planned
     steps alive under a do_not_contact status would be the same lie in a
-    different place. Clearing it releases the block but does not restart the
-    cadence; staff restart a lead from the board deliberately.
+    different place. It blocks the number, exactly like the Sheet command, so
+    the board, the Sheet and the worker agree. Clearing it is admin-only and
+    names what happens next: continue the stopped steps, or start over.
     """
+    if payload.do_not_contact is False:
+        # Unblocking can put a patient who asked not to be contacted back on the
+        # phone list, so it is an administrator's decision.
+        _require_super_admin(actor)
+        if payload.after_unblock is None:
+            raise HTTPException(
+                status_code=422, detail="choose whether to continue or start over"
+            )
+    staff_name = actor.display_name or actor.employee_id or actor.user_id
     with transaction() as conn:
         lead = conn.execute(
-            "select id,practice_id,status,cadence_state,call_opt_out,sms_opt_out "
-            "from leads where id=%s for update",
+            "select id,practice_id,phone_e164,status,status_changed_at,cadence_state,"
+            "call_opt_out,sms_opt_out from leads where id=%s for update",
             (lead_id,),
         ).fetchone()
         if not lead:
@@ -957,25 +1004,22 @@ def set_contact_rules(lead_id: UUID, payload: ContactRules, actor: Actor):
                 changes[field] = value
 
         if payload.do_not_contact is not None:
-            currently = lead["status"] == "do_not_contact"
+            # The switch reports the number, not just this lead: a Sheet or
+            # call-made block shows ON here and is undone here.
+            number_blocked = bool(lead["phone_e164"] and conn.execute(
+                "select 1 from suppressed_numbers where phone_e164=%s", (lead["phone_e164"],)
+            ).fetchone())
+            currently = number_blocked or lead["status"] == "do_not_contact"
             if payload.do_not_contact and not currently:
-                conn.execute(
-                    "update leads set status='do_not_contact',cadence_state='terminated',"
-                    "status_changed_at=now() where id=%s",
-                    (lead_id,),
-                )
-                conn.execute(
-                    "update outreach_events set status='skipped',updated_at=now() "
-                    "where lead_id=%s and status='planned'",
-                    (lead_id,),
-                )
+                block_number(conn, lead, staff_name)
                 changes["do_not_contact"] = True
             elif not payload.do_not_contact and currently:
-                conn.execute(
-                    "update leads set status='in_progress',status_changed_at=now() where id=%s",
-                    (lead_id,),
-                )
+                try:
+                    result = unblock_number(conn, lead, payload.after_unblock, staff_name)
+                except NumberBlockError as error:
+                    raise HTTPException(status_code=error.status_code, detail=error.detail) from error
                 changes["do_not_contact"] = False
+                changes.update(result)
 
         if changes:
             _audit(

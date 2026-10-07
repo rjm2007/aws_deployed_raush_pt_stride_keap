@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -139,8 +140,24 @@ def format_cadence_columns(
     return " + ".join(channels) or None, call_outcome, message_outcome, None
 
 
+# Dashboard events that write their own Outcome Status. "Unblocked" alone is
+# what an older Do Not Contact row on the same number gets. The intake workflow
+# never re-sends a row whose status ends in "in dashboard" while its Action
+# still reads Do Not Contact, so an unblocked patient is not blocked again by
+# the stale cell. Listed strongest first; Lead Status is set where it changes.
+DASHBOARD_OUTCOMES = {
+    "cadence_restarted_after_unblock": ("Cadence restarted in dashboard", "In cadence"),
+    "cadence_resumed_after_unblock": ("Cadence resumed in dashboard", "In cadence"),
+    "number_unblocked": ("Unblocked in dashboard", None),
+}
+
+
 def build_sheet_snapshot(
-    conn, lead_id: str, *, practice_slug: str | None = None
+    conn,
+    lead_id: str,
+    *,
+    practice_slug: str | None = None,
+    reasons: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Build the current Sheet view from committed database truth."""
     lead = conn.execute(
@@ -232,6 +249,14 @@ def build_sheet_snapshot(
         "callback_at": callback_at,
     }
     action_status = _action_label(lead)
+    pending = set(reasons)
+    dashboard_outcome = next(
+        (DASHBOARD_OUTCOMES[reason] for reason in DASHBOARD_OUTCOMES if reason in pending), None
+    )
+    if dashboard_outcome and lead["status"] not in {"booked", "do_not_contact"}:
+        action_status, lead_status = dashboard_outcome
+        if lead_status:
+            sheet["lead_status"] = lead_status
     if action_status is not None:
         sheet["action_status"] = action_status
     # Booked ends the lead however it happened (board, Sheet or call), so the
