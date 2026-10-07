@@ -24,6 +24,7 @@ from ..services.review import (
     skip_remaining_planned,
 )
 from ..services.sheet_sync import enqueue_sheet_update
+from ..services.stride_sync_status import stride_sync_status
 from ..services.twilio_service import TwilioService
 from ..worker import format_phone, materialize_cadence
 
@@ -655,6 +656,13 @@ def dashboard_snapshot(actor: Actor):
         "system": system,
         "metrics": metrics,
     }
+
+
+@router.get("/stride-sync")
+def dashboard_stride_sync(actor: Actor):
+    """Is Stride's SFTP feed arriving and loading? Plain-language status, alerts, today's numbers."""
+    with transaction() as conn:
+        return stride_sync_status(conn, actor.practice_id)
 
 
 @router.post("/leads", status_code=201)

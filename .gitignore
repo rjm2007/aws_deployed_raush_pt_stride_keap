@@ -67,3 +67,6 @@ Desktop.ini
 refrences_git_clone/
 scratch/
 .gstack/
+
+# Local fake SFTP / Stride drops (synthetic CSVs, dev keys)
+local/

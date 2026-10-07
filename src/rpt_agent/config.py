@@ -41,6 +41,22 @@ class Settings(BaseSettings):
     sheet_sync_poll_seconds: int = Field(default=30, ge=1, le=3600)
     sheet_sync_batch_size: int = Field(default=20, ge=1, le=100)
     sheet_sync_http_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
+    # Stride CSV exports arrive over SFTP into the inbox; the stride-worker moves
+    # each file to archive (imported) or error (unusable) once it is done.
+    stride_import_enabled: bool = False
+    stride_practice_slug: str = "rausch-pt"
+    stride_inbox_dir: Path = Path("stride/incoming")
+    stride_archive_dir: Path = Path("stride/archive")
+    stride_error_dir: Path = Path("stride/error")
+    stride_import_poll_seconds: int = Field(default=60, ge=5, le=3600)
+    # Stride writes files under their final name; one untouched for this long is complete.
+    stride_file_settle_seconds: int = Field(default=60, ge=0, le=3600)
+    stride_import_max_attempts: int = Field(default=3, ge=1, le=20)
+    # Bigger files go straight to the error folder; the importer streams, so this
+    # guards disk and import time, not memory.
+    stride_max_file_mb: int = Field(default=2048, ge=1, le=102400)
+    # Skip and report bad rows, but reject the whole file above this share.
+    stride_max_bad_row_percent: float = Field(default=1.0, ge=0, le=100)
     vapi_base_url: str = "https://api.vapi.ai"
     vapi_api_key: str = ""
     vapi_assistant_id: str = ""
@@ -88,10 +104,10 @@ class Settings(BaseSettings):
     def runtime_errors(self, service: str) -> list[str]:
         errors: list[str] = []
         deployment_env = self.app_env.lower() in {"preproduction", "preprod", "staging", "production", "prod"}
-        if service in {"api", "worker", "sheet-worker", "cli"} and not self.supabase_db_url:
+        if service in {"api", "worker", "sheet-worker", "stride-worker", "cli"} and not self.supabase_db_url:
             errors.append("SUPABASE_DB_URL is required")
         elif (
-            service in {"api", "worker", "sheet-worker", "cli"}
+            service in {"api", "worker", "sheet-worker", "stride-worker", "cli"}
             and "db.example.supabase.co" in self.supabase_db_url
         ):
             errors.append("SUPABASE_DB_URL still contains the example hostname")

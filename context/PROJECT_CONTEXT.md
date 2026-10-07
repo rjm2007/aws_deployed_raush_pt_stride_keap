@@ -553,7 +553,12 @@ mark a message delivered.
   pre-production integration boundary when `KEAP_MODE=real`.
 - Mock receiver records events and simulates success, rejection, timeout, and duplicate delivery.
 - Direct Keap OAuth/CRM mutation is not implemented because no application/OAuth contract was supplied.
-- SFTP testing reads synthetic fixture CSV files; no SFTP daemon is run locally.
+- Stride CSV import (2026-10-08): Stride uploads `<entity>_<YYYYMMDDHHMMSS>.csv` exports (full load, then
+  changed rows) to the EC2 SFTP inbox `/srv/sftp/stride/incoming` (chrooted `stride` user, key-only). The
+  `stride-worker` container imports them into the `stride_*` tables (migration 032) and moves each file to
+  `/srv/stride/archive` or `/srv/stride/error` (host cron deletes those after 30 days; the inbox is never
+  cleaned). See the 2026-10-08 changelog entry. Locally, `scripts/fake_stride.py` runs a fake SFTP server
+  and a synthetic Stride feed.
 
 ## Lead outcome state machine
 
@@ -858,6 +863,71 @@ npm.cmd run build
 
 Append entries newest first. Include date, decision/change, migrations, configuration impact, validation, and
 known follow-up. Do not include secrets or patient/tester identifiers.
+
+### 2026-10-08 - Stride CSV import (Stride → our database)
+
+- Purpose: Stride cannot be polled; it sends CSV exports over SFTP (full load, then changed rows, expected
+  every ~5 minutes). Phase 1 mirrors them locally. Keap sync (phase 2) will read these tables; not built.
+- Migration `032_stride_import.sql`: `stride_import_files` (one row per file: checksum, counts, PHI-free
+  issues), `stride_patients`, `stride_cases`, `stride_appointments`, `stride_users`, `stride_locations`, and
+  `stride_other_records` (notes, patient insurances, payers, referring providers kept whole in `raw`).
+  Every table keeps the full CSV row in `raw`, Stride's Modified Date Time, a `deleted_at` tombstone and an
+  `updated_at` that moves only on real change. No foreign keys between stride tables (children may arrive
+  first). RLS enabled, no policies (backend only).
+- `services/stride_import.py` parses and applies one file: Upsert/Delete, oldest change first, an older row
+  never overwrites a newer one, identical re-sends are not changes, bad rows are skipped and reported, a
+  missing required column rejects the file. Appointment Delete rows carry no Appointment Id: matched by case +
+  local start (Stride allows one appointment per case per start), narrowed by type/clinician/location;
+  0 or 2+ matches are reported, never guessed. Appointment times are clinic-local
+  (`practice_settings.stride_location_timezone`) and stored with derived UTC.
+- `services/stride_leads.py`, recomputed each tick: links a Stride patient to a lead (exact
+  `leads.stride_patient_id`, else same normalized full name + same DOB, or name + phone when either DOB is
+  missing; several candidates = `ambiguous`, left for staff). A linked lead with a future, non-cancelled
+  appointment becomes `booked`, cadence `completed`, planned events skipped, history source `stride`, Sheet
+  update `lead_booked`. If that booking (an appointment starting after the lead was booked) is cancelled or
+  deleted with no replacement, the lead becomes `needs_attention` with `needs_review` and
+  "Stride appointment cancelled"; it is never put back into the cadence. Walk-in patients never touch `leads`.
+- `stride_import_worker.py` / `rpt-stride-worker`, new `stride-worker` container (prod + dev compose):
+  polls every `STRIDE_IMPORT_POLL_SECONDS` (60), takes files untouched for `STRIDE_FILE_SETTLE_SECONDS` (60)
+  because Stride writes final names directly, sorts oldest export first and parents before children, one
+  transaction per file, advisory lock, duplicate file (name + sha256) skipped, unusable file → error folder,
+  unexpected failure → retried up to `STRIDE_IMPORT_MAX_ATTEMPTS` (3) then error folder. Logs carry counts and
+  file names only. Gated by `STRIDE_IMPORT_ENABLED` (default false).
+- Server (done 2026-10-07): `/etc/cron.d/stride-sftp-cleanup` now deletes only `/srv/stride/archive` and
+  `/srv/stride/error` files older than 30 days (it used to delete unread inbox files after 2 days; backup in
+  `/root/`). `/srv/stride/{archive,error}` created root-only, outside Stride's chroot. Only `stride-worker`
+  mounts the SFTP folders, read-write.
+- Local testing without Docker: embedded Postgres 16 (`pgserver` pip package) with migrations 001-032;
+  `tests/test_stride_import.py` (no DB) and `tests/test_stride_import_integration.py` (`TEST_DATABASE_URL`)
+  cover every edge case; `scripts/fake_stride.py` (`server`, `feed`, `seed-leads`) ran a live SFTP feed.
+- Large files (same day): the first version read a whole file into memory (~24x its size; the 1.9 GB
+  EC2 would die near 40 MB). Now the file is streamed: one pass for sha256 + encoding, then rows go
+  into a temporary staging table with Postgres COPY and are merged with set-based SQL, all in ONE
+  transaction (a file lands completely or not at all). Measured: 1,000,000 appointments (228 MB) in
+  34 s locally at 49 MB peak memory. `statement_timeout` is lifted for the import transaction.
+- Safeguards: the attempt is recorded before work (status `pending`), so an import killed mid-way still
+  counts and a poison file reaches the error folder after `STRIDE_IMPORT_MAX_ATTEMPTS`; strict order (a
+  file being retried holds back later files); `STRIDE_MAX_FILE_MB` (2048) rejects oversized files unread;
+  more than `STRIDE_MAX_BAD_ROW_PERCENT` (1%) bad rows rejects the whole file, otherwise bad rows are
+  skipped and reported; temporary upload names (`.part`, `.tmp`, `.filepart`, dot-files) are ignored;
+  `stride-worker` has `mem_limit: 512m` so it can never take the API or call worker down with it.
+  File statuses: pending, processed, retrying, rejected.
+- Watchdog: `service_heartbeats` (migration 032) gets a stride-worker heartbeat every tick and every 50k
+  rows during a long import (files waiting, oldest wait, SFTP disk free, progress).
+  `services/stride_sync_status.py` computes status on read and `GET /api/v1/dashboard/stride-sync`
+  returns it in plain words: overall ok/attention/problem/not_started, alerts (worker stopped > 5 min,
+  file not loaded, file retrying, files waiting > 15 min, no file for 30 min during clinic hours, SFTP
+  disk < 20% / < 10%, skipped rows, ambiguous lead matches), today's numbers, last 7 days, recent files.
+  The frontend page is not built yet (mockup approved first).
+- Known trade-off: Stride's 5-minute files are tiny, so one bad row exceeds 1% and rejects the whole
+  file, good rows included (seen in the live run: a Sheet lead's patient row was lost with the file).
+  Decision pending on a minimum file size for the 1% rule.
+- Recommended, not done: a separate EBS volume for /srv/sftp and /srv/stride (a huge upload today can
+  fill the server's only disk, 3.8 GB free); Stride uploading under a temporary name then renaming.
+- Not deployed. Before go-live: Stride's SSH public key and source IPs, security group, set
+  `STRIDE_IMPORT_ENABLED=true`, run migration 032 on Supabase, deploy all containers together.
+- Open questions: storing notes/insurance (sensitive, unused) awaits a decision; clinic timezone for
+  appointment times to be confirmed with Stride; "Modified Date Time" assumed UTC (only used for ordering).
 
 ### 2026-10-05 - Lead workspace simplification and global-only cadences
 

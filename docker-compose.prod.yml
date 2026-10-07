@@ -47,6 +47,30 @@ services:
     volumes:
       - ./logs:/app/logs
 
+  # Stride CSV import. The only container that sees the SFTP folders: it reads
+  # Stride's uploads and moves each one to archive or error (so not read-only).
+  # The host cron deletes archive/error files after 30 days.
+  stride-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: stride-import-worker
+    restart: unless-stopped
+    # The importer streams files (flat memory), but if it ever misbehaves only
+    # this container is killed, never the API or the call/SMS worker.
+    mem_limit: 512m
+    env_file: .env
+    command: rpt-stride-worker
+    environment:
+      STRIDE_INBOX_DIR: /app/stride/incoming
+      STRIDE_ARCHIVE_DIR: /app/stride/archive
+      STRIDE_ERROR_DIR: /app/stride/error
+    volumes:
+      - ./logs:/app/logs
+      - /srv/sftp/stride/incoming:/app/stride/incoming
+      - /srv/stride/archive:/app/stride/archive
+      - /srv/stride/error:/app/stride/error
+
   caddy:
     image: caddy:2.11.4-alpine
     container_name: stride-caddy

@@ -32,6 +32,20 @@ services:
     volumes:
       - ./src:/app/src
       - ./logs:/app/logs
+  stride-worker:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      STRIDE_INBOX_DIR: /app/stride/incoming
+      STRIDE_ARCHIVE_DIR: /app/stride/archive
+      STRIDE_ERROR_DIR: /app/stride/error
+    command: rpt-stride-worker
+    volumes:
+      - ./src:/app/src
+      - ./logs:/app/logs
+      - ./local/stride:/app/stride
   mock-provider:
     profiles: ["mock"]
     build: .
