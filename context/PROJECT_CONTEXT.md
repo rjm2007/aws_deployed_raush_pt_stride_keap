@@ -1839,3 +1839,21 @@ known follow-up. Do not include secrets or patient/tester identifiers.
   cadence; "... in dashboard" would restart the patient twice). Needs the webhook-flow "Update System Columns"
   node to map the Action column, which the local export does not show.
 
+
+### 2026-10-08 - Voice-agent booking engine (find-slots / book-appointment)
+
+- New tools `POST /api/v1/tools/find-slots` and `POST /api/v1/tools/book-appointment` (see
+  `docs/BOOKING_ENGINE.md`). The lead's location and case type pick clinicians from the client's
+  assignment list; the three nearest open times come from a local slot cache refreshed every 5 minutes by
+  the new `booking-worker` (`rpt-booking-worker`).
+- Migration `033_booking_engine.sql`: `booking_locations`, `case_types`, `clinicians`,
+  `clinician_assignments`, `availability_slots`, `availability_sync_state`, `slot_offers`, `slot_holds`, and
+  slot/hold/case-type/location/stride-case/call columns on `appointments`.
+- Booking holds the slot (one active hold per slot), re-checks it live, then creates patient, case and
+  appointment with `is_pending=true`, saving each Stride id immediately. Unclear results become `unknown`
+  and are never retried; duplicate patients are flagged for staff. Stride's undocumented one Initial
+  Evaluation per case rule (403) gets a fresh case and one retry.
+- Inside a live call Stride is called with a 6 s timeout and no retries; tools stop before 24 s.
+- Demo setup: `rpt booking-demo-seed` (Stride demo locations 3169/3170, clinicians 5980-5982, type 1452)
+  and `BOOKING_TODAY_OVERRIDE` because demo availability only exists 2026-05-15 to 2026-07-29.
+- Tests: 24 integration tests on a real Postgres schema (`tests/test_slot_booking_integration.py`).

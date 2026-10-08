@@ -1,5 +1,6 @@
 from .appointments import router as appointments_router
 from .availability import router as availability_router
+from .booking_tools import router as booking_tools_router
 from .dashboard import router as dashboard_router
 from .health import router as health_router
 from .leads import router as leads_router
@@ -10,6 +11,7 @@ from .vapi import router as vapi_router
 __all__ = [
     "appointments_router",
     "availability_router",
+    "booking_tools_router",
     "dashboard_router",
     "health_router",
     "leads_router",

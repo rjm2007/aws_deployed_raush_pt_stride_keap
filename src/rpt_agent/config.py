@@ -1,7 +1,8 @@
+from datetime import date
 from functools import cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -57,6 +58,25 @@ class Settings(BaseSettings):
     stride_max_file_mb: int = Field(default=2048, ge=1, le=102400)
     # Skip and report bad rows, but reject the whole file above this share.
     stride_max_bad_row_percent: float = Field(default=1.0, ge=0, le=100)
+    # Voice-agent booking engine (find-slots / book-appointment tools).
+    # Stride demo slots only exist in the past, so testing pins "today" here.
+    # Never set in production.
+    booking_today_override: date | None = None
+    booking_horizon_days: int = Field(default=31, ge=1, le=31)
+    booking_min_notice_minutes: int = Field(default=120, ge=0, le=10080)
+    booking_sync_seconds: int = Field(default=300, ge=30, le=3600)
+    # A search refreshes a location's cache itself when it is older than this.
+    booking_cache_max_age_seconds: int = Field(default=900, ge=60, le=86400)
+    booking_hold_seconds: int = Field(default=300, ge=30, le=1800)
+    # Vapi waits about 30 s for a tool; one Stride request may take this long and
+    # is never retried inside a live call.
+    booking_stride_timeout_seconds: float = Field(default=6.0, ge=1.0, le=20.0)
+    booking_tool_deadline_seconds: float = Field(default=24.0, ge=5.0, le=60.0)
+    # Stride requires an address; the client does not collect one on the call.
+    booking_default_address_1: str = "Address not provided"
+    booking_default_city: str = "Laguna Niguel"
+    booking_default_state: str = "CA"
+    booking_default_zip: str = "92677"
     vapi_base_url: str = "https://api.vapi.ai"
     vapi_api_key: str = ""
     vapi_assistant_id: str = ""
@@ -88,6 +108,11 @@ class Settings(BaseSettings):
     retry_base_seconds: int = Field(default=60, ge=1, le=3600)
     retry_max_seconds: int = Field(default=3600, ge=1, le=86400)
 
+    @field_validator("booking_today_override", mode="before")
+    @classmethod
+    def _blank_override_is_unset(cls, value):
+        return None if isinstance(value, str) and not value.strip() else value
+
     def mode(self, provider: str) -> str:
         override = getattr(self, f"{provider}_mode", None)
         return override or self.provider_mode
@@ -104,10 +129,10 @@ class Settings(BaseSettings):
     def runtime_errors(self, service: str) -> list[str]:
         errors: list[str] = []
         deployment_env = self.app_env.lower() in {"preproduction", "preprod", "staging", "production", "prod"}
-        if service in {"api", "worker", "sheet-worker", "stride-worker", "cli"} and not self.supabase_db_url:
+        if service in {"api", "worker", "sheet-worker", "stride-worker", "booking-worker", "cli"} and not self.supabase_db_url:
             errors.append("SUPABASE_DB_URL is required")
         elif (
-            service in {"api", "worker", "sheet-worker", "stride-worker", "cli"}
+            service in {"api", "worker", "sheet-worker", "stride-worker", "booking-worker", "cli"}
             and "db.example.supabase.co" in self.supabase_db_url
         ):
             errors.append("SUPABASE_DB_URL still contains the example hostname")

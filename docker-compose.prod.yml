@@ -49,6 +49,21 @@ services:
 
   # Stride CSV import. The only container that sees the SFTP folders: it reads
   # Stride's uploads and moves each one to archive or error (so not read-only).
+  # Keeps the voice-agent slot cache fresh from Stride (every BOOKING_SYNC_SECONDS).
+  # Separate so a slow Stride never delays calls/SMS or the import. Idles when no
+  # clinic, case type or clinician is set up.
+  booking-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: stride-booking-worker
+    restart: unless-stopped
+    mem_limit: 256m
+    env_file: .env
+    command: rpt-booking-worker
+    volumes:
+      - ./logs:/app/logs
+
   # The host cron deletes archive/error files after 30 days.
   stride-worker:
     build:

@@ -180,11 +180,35 @@ def create_test_lead(args: argparse.Namespace) -> None:
     }, indent=2, default=str))
 
 
+def booking_sync() -> None:
+    """Refresh the voice-agent slot cache once (the booking-worker does this on a loop)."""
+    from .booking_worker import run_once
+
+    print(json.dumps(run_once(), indent=2, default=str))
+
+
+def booking_demo_seed() -> None:
+    """DEMO ONLY: load the Stride demo locations, case types and clinicians."""
+    with transaction() as conn:
+        if not conn.execute("select 1 from practices where slug='rausch-pt'").fetchone():
+            raise SystemExit("practice rausch-pt not found; run `rpt seed` first")
+        conn.execute((ROOT / "supabase" / "dev" / "booking_demo_seed.sql").read_text(encoding="utf-8"))
+        counts = conn.execute(
+            "select (select count(*) from booking_locations) as locations,"
+            "(select count(*) from case_types) as case_types,"
+            "(select count(*) from clinicians) as clinicians,"
+            "(select count(*) from clinician_assignments) as assignments"
+        ).fetchone()
+    print(json.dumps(counts, indent=2))
+
+
 def main() -> None:
     configure_logging("cli")
     parser = argparse.ArgumentParser(prog="rpt")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("migrate", "verify", "seed", "demo", "fixtures", "tick"):
+    for command in (
+        "migrate", "verify", "seed", "demo", "fixtures", "tick", "booking-sync", "booking-demo-seed",
+    ):
         subparsers.add_parser(command)
     test_lead = subparsers.add_parser("test-lead", help="create a consented synthetic lead")
     test_lead.add_argument("--phone", required=True)
@@ -208,6 +232,8 @@ def main() -> None:
         )),
         "tick": lambda: print(json.dumps(run_tick(), indent=2)),
         "test-lead": lambda: create_test_lead(args),
+        "booking-sync": booking_sync,
+        "booking-demo-seed": booking_demo_seed,
         "agent": lambda: run_terminal(
             api_url=args.api_url,
             initial_leads=args.lead,

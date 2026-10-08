@@ -108,6 +108,9 @@ class StrideService(ProviderService):
                 detail = "overlapping appointment"
             elif "already exists" in normalized_detail or "duplicate" in normalized_detail:
                 detail = "already exists"
+            elif "initial evaluation" in normalized_detail:
+                # Undocumented 403: Stride allows one Initial Evaluation per case.
+                detail = "case already has an initial evaluation"
             else:
                 detail = f"Stride rejected {resource} with HTTP {response.status_code}"
             classified = self._response_error("stride", response, idempotent=False)
