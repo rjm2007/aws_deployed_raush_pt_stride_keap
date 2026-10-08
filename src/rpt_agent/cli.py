@@ -194,10 +194,12 @@ def booking_demo_seed() -> None:
             raise SystemExit("practice rausch-pt not found; run `rpt seed` first")
         conn.execute((ROOT / "supabase" / "dev" / "booking_demo_seed.sql").read_text(encoding="utf-8"))
         counts = conn.execute(
-            "select (select count(*) from booking_locations) as locations,"
-            "(select count(*) from case_types) as case_types,"
-            "(select count(*) from clinicians) as clinicians,"
-            "(select count(*) from clinician_assignments) as assignments"
+            "with p as (select id from practices where slug='rausch-pt') select "
+            "(select count(*) from booking_locations bl, p where bl.practice_id=p.id) as locations,"
+            "(select count(*) from case_types ct, p where ct.practice_id=p.id) as case_types,"
+            "(select count(*) from clinicians c, p where c.practice_id=p.id) as clinicians,"
+            "(select count(*) from clinician_assignments ca join clinicians c on c.id=ca.clinician_id,"
+            " p where c.practice_id=p.id and ca.is_active) as assignments"
         ).fetchone()
     print(json.dumps(counts, indent=2))
 
