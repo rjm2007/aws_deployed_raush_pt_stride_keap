@@ -30,8 +30,11 @@ def extract_vapi_context(body: dict[str, Any]) -> dict[str, Any]:
         return {}
     message = body.get("message") if isinstance(body.get("message"), dict) else {}
     call = message.get("call") if isinstance(message.get("call"), dict) else {}
+    # Vapi's Chat API (text testing) sends the same overrides on `chat` instead of `call`.
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
     candidates = [
         ((call.get("assistantOverrides") or {}).get("variableValues") or {}),
+        ((chat.get("assistantOverrides") or {}).get("variableValues") or {}),
         call.get("variableValues") or {},
         message.get("variableValues") or {},
         body.get("variableValues") or {},
@@ -121,7 +124,9 @@ def parse_tool_request(body: dict[str, Any]) -> ToolRequest:
     message = body.get("message") if isinstance(body, dict) else None
     message = message if isinstance(message, dict) else {}
     call = message.get("call") if isinstance(message.get("call"), dict) else {}
-    call_id = call.get("id") or body.get("call_id")
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    # A chat turn gets a new id every message; its session (if any) is the stable key.
+    call_id = call.get("id") or chat.get("sessionId") or body.get("call_id")
     if calls:
         return ToolRequest(calls[0].tool_call_id, str(call_id) if call_id else None, calls[0].arguments)
     arguments = dict(body) if isinstance(body, dict) else {}

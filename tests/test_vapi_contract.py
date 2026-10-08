@@ -87,3 +87,19 @@ def test_vapi_busy_and_unanswered_are_normal_no_answer_outcomes():
     assert outcome_from_ended_reason("customer-did-not-answer") == "no_answer"
     assert outcome_from_ended_reason("voicemail") == "voicemail"
     assert outcome_from_ended_reason("assistant-ended-call") == "manual"
+
+
+def test_chat_api_tool_calls_carry_the_lead_from_chat_overrides():
+    from rpt_agent.vapi_contract import parse_tool_request
+
+    body = {"message": {
+        "type": "tool-calls",
+        "chat": {"id": "chat-1", "assistantOverrides": {"variableValues": {
+            "lead_id": "lead-9", "outreach_event_id": "4"}}},
+        "toolCallList": [{"id": "tc-1", "function": {
+            "name": "find_slots", "arguments": {"when": "earliest", "lead_id": "spoofed"}}}],
+    }}
+    parsed = parse_tool_request(body)
+    assert parsed.arguments["lead_id"] == "lead-9"
+    assert parsed.arguments["outreach_event_id"] == "4"
+    assert parsed.call_id is None  # a chat turn id is not a stable call key
