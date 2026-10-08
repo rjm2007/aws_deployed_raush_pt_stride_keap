@@ -330,6 +330,11 @@ BOOK_HINT = (
 )
 
 
+def _today_note(context: BookingContext) -> str:
+    """The booking calendar's today, which the agent must use for dates the caller says."""
+    return f"Calendar today: {context.now_local.strftime('%A, %B %d, %Y').replace(' 0', ' ')}."
+
+
 def find_slots(
     trace: WorkflowTrace,
     *,
@@ -386,7 +391,7 @@ def _offer(
     if slots:
         _remember_offers(conn, call_key, context, slots)
         trace.log("slots_offered", count=len(slots), when=when)
-        return f"OPENINGS for {where}{who}: {_offer_text(slots)}. {BOOK_HINT}"
+        return f"OPENINGS for {where}{who}: {_offer_text(slots)}. {BOOK_HINT} {_today_note(context)}"
     # Nothing in the wished-for range: offer the next times after it.
     horizon_end = context.now_local.date() + timedelta(days=settings.booking_horizon_days - 1)
     later = search_slots(conn, context, start=end + timedelta(days=1), end=horizon_end,
@@ -398,7 +403,7 @@ def _offer(
         trace.log("slots_offered", count=len(later), when=when, fallback=True)
         return (
             f"NOTHING_IN_RANGE: no {where}{who} openings for that time. "
-            f"Next openings: {_offer_text(later)}. {BOOK_HINT}"
+            f"Next openings: {_offer_text(later)}. {BOOK_HINT} {_today_note(context)}"
         )
     if clinician_name and len(ids) < len(context.clinicians):
         return (
