@@ -1,0 +1,136 @@
+{
+  "assistant_id": "7e4d63e1-a5e5-480a-890f-4002a31821e7",
+  "assistant_name": "Outreach Booking Agent - Test",
+  "copied_from": "540ddb07-711e-4060-8753-f82d848b9a25",
+  "structured_output_id": "7170e50c-48d5-4416-b723-3a59fabb5371",
+  "prompt_file": "config/vapi_booking_assistant_prompt.md",
+  "note": "Server auth (X-Vapi-Secret header + credentialId) is copied from the update_lead_status tool and is not stored here.",
+  "tools": [
+    {
+      "id": "f622d276-97aa-4125-b655-abd1d18ecefc",
+      "type": "function",
+      "async": false,
+      "function": {
+        "name": "find_slots",
+        "description": "Find the nearest open appointment times for this patient's initial evaluation. Call it after the patient has confirmed the clinic, therapist preference, last-name spelling and date of birth, and again whenever they ask for another day, week, time of day, therapist or clinic. Only offer times this tool returns. The reply starts with a code such as OPENINGS, NOTHING_IN_RANGE or NO_SUCH_THERAPIST.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "when": {
+              "type": "string",
+              "enum": [
+                "earliest",
+                "today",
+                "tomorrow",
+                "this_week",
+                "next_week",
+                "in_two_weeks",
+                "specific_date"
+              ],
+              "description": "When the patient wants to come in. earliest when they have no preference. specific_date for one named day."
+            },
+            "specific_date": {
+              "type": "string",
+              "description": "Only with when=specific_date: the day as YYYY-MM-DD, worked out from the 'Calendar today' line in this tool's last reply."
+            },
+            "time_of_day": {
+              "type": "string",
+              "enum": [
+                "morning",
+                "afternoon",
+                "evening"
+              ],
+              "description": "Only if the patient asked for a part of the day."
+            },
+            "clinician_name": {
+              "type": "string",
+              "description": "Only if the patient asked for a particular therapist: the name they said, for example 'Thao' or 'Dr. Rome'."
+            },
+            "location": {
+              "type": "string",
+              "description": "Only if the patient wants a different clinic than the one on file: Laguna Niguel, Dana Point or Mission Viejo."
+            }
+          },
+          "required": [
+            "when"
+          ]
+        }
+      },
+      "messages": [
+        {
+          "type": "request-start",
+          "content": "Let me check what we have open.",
+          "blocking": false
+        }
+      ],
+      "server": {
+        "url": "https://stride.aibolt.ai/api/v1/tools/find-slots",
+        "timeoutSeconds": 20
+      }
+    },
+    {
+      "id": "0c8f0b68-fc8f-4459-bf83-1ef95df7a68e",
+      "type": "function",
+      "async": false,
+      "function": {
+        "name": "book_appointment",
+        "description": "Book the time the patient just chose from the open-times tool. Call it once, right after they pick a time. The reply starts with a code: BOOKED means it is done; TAKEN or NOT_AVAILABLE lists other openings; PATIENT_EXISTS, UNCONFIRMED or FOLLOW_UP mean the team will follow up. Never call it again after BOOKED, UNCONFIRMED or FOLLOW_UP.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "date": {
+              "type": "string",
+              "description": "The chosen day as YYYY-MM-DD, from the parentheses in the open-times reply."
+            },
+            "time": {
+              "type": "string",
+              "description": "The chosen time as the open-times reply wrote it, for example '9:00 AM'."
+            },
+            "first_name": {
+              "type": "string",
+              "description": "The patient's first name."
+            },
+            "last_name": {
+              "type": "string",
+              "description": "The patient's last name exactly as they spelled it."
+            },
+            "date_of_birth": {
+              "type": "string",
+              "description": "The patient's date of birth as YYYY-MM-DD."
+            },
+            "clinician_name": {
+              "type": "string",
+              "description": "The full name of the therapist for the chosen time, as the open-times reply wrote it."
+            },
+            "location": {
+              "type": "string",
+              "description": "Only if the patient changed clinic: Laguna Niguel, Dana Point or Mission Viejo."
+            },
+            "email": {
+              "type": "string",
+              "description": "Leave empty unless the patient gave it."
+            }
+          },
+          "required": [
+            "date",
+            "time",
+            "first_name",
+            "last_name",
+            "date_of_birth"
+          ]
+        }
+      },
+      "messages": [
+        {
+          "type": "request-start",
+          "content": "Perfect, let me book that for you now.",
+          "blocking": false
+        }
+      ],
+      "server": {
+        "url": "https://stride.aibolt.ai/api/v1/tools/book-appointment",
+        "timeoutSeconds": 30
+      }
+    }
+  ]
+}
