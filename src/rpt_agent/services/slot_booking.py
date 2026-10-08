@@ -70,6 +70,8 @@ class BookingContext:
     clinicians: list[dict[str, Any]]
     now_local: datetime
     settings: Settings = field(repr=False)
+    sync_state: dict[str, Any] | None = None
+    booking_enabled: bool = False
 
     @property
     def timezone(self) -> str:
@@ -80,63 +82,81 @@ class BookingContext:
 # Context: lead -> location -> case type -> clinicians
 # ---------------------------------------------------------------------------
 
-def _active_location_names(conn, practice_id: int) -> list[str]:
-    return [
-        row["name"] for row in conn.execute(
-            "select name from booking_locations where practice_id=%s and is_active order by name",
-            (practice_id,),
-        ).fetchall()
-    ]
+# One round trip loads everything a tool needs: the database is ~170 ms away
+# from the API, so separate queries add up to seconds on a live call.
+CONTEXT_SQL = """
+with lead as (
+  select id,practice_id,status,location,lead_type,email,phone_e164,stride_patient_id,
+         stride_case_id,is_test
+  from leads where id=%(lead_id)s
+), loc as (
+  select bl.id,bl.name,bl.stride_location_id,bl.timezone from booking_locations bl, lead
+  where bl.practice_id=lead.practice_id and bl.is_active
+    and lower(bl.name)=lower(coalesce(nullif(%(location)s,''),lead.location,''))
+), kind as (
+  select ct.id,ct.name,ct.stride_appointment_type_id,ct.duration_minutes from case_types ct, lead
+  where ct.practice_id=lead.practice_id and ct.is_active
+    and (lower(ct.name)=lower(coalesce(lead.lead_type,'')) or ct.is_default)
+  order by (lower(ct.name)=lower(coalesce(lead.lead_type,''))) desc limit 1
+)
+select row_to_json(lead) as lead,
+       (select row_to_json(loc) from loc) as location,
+       (select row_to_json(kind) from kind) as case_type,
+       (select coalesce(json_agg(json_build_object('id',c.id,'stride_user_id',c.stride_user_id,
+                'display_name',c.display_name) order by c.display_name),'[]'::json)
+          from clinician_assignments ca join clinicians c on c.id=ca.clinician_id and c.is_active
+         where ca.is_active and ca.booking_location_id=(select id from loc)
+           and ca.case_type_id=(select id from kind)) as clinicians,
+       (select json_build_object('last_success_at',s.last_success_at,'window_start',s.window_start)
+          from availability_sync_state s
+         where s.booking_location_id=(select id from loc)
+           and s.duration_minutes=(select duration_minutes from kind)) as sync_state,
+       (select string_agg(bl.name, ', ' order by bl.name) from booking_locations bl
+         where bl.practice_id=lead.practice_id and bl.is_active) as location_names,
+       coalesce((select stride_booking_enabled from practice_settings ps
+                  where ps.practice_id=lead.practice_id), false) as booking_enabled
+from lead
+"""
 
 
 def load_context(
     conn, lead_id: str, *, location_name: str | None = None, settings: Settings | None = None,
 ) -> BookingContext:
     settings = settings or get_settings()
-    lead = conn.execute(
-        "select id,practice_id,status,location,lead_type,first_name,last_name,email,phone_e164,"
-        "date_of_birth,stride_patient_id,stride_case_id,is_test from leads where id=%s",
-        (lead_id,),
+    row = conn.execute(
+        CONTEXT_SQL, {"lead_id": lead_id, "location": (location_name or "").strip()}
     ).fetchone()
-    if not lead:
+    if not row:
         raise BookingToolError("I could not find this patient's record.")
+    lead, names = row["lead"], row["location_names"] or ""
     wanted = (location_name or lead["location"] or "").strip()
     if not wanted:
-        names = ", ".join(_active_location_names(conn, lead["practice_id"]))
         raise ValueError(f"NEED_LOCATION: ask which clinic the caller prefers: {names}.")
-    location = conn.execute(
-        "select id,name,stride_location_id,timezone from booking_locations "
-        "where practice_id=%s and is_active and lower(name)=lower(%s)",
-        (lead["practice_id"], wanted),
-    ).fetchone()
+    location = row["location"]
     if not location:
-        names = ", ".join(_active_location_names(conn, lead["practice_id"]))
         raise ValueError(
             f"UNKNOWN_LOCATION: we have no clinic called {wanted}. Our clinics are {names}."
         )
-    case_type = conn.execute(
-        "select id,name,stride_appointment_type_id,duration_minutes from case_types "
-        "where practice_id=%s and is_active and (lower(name)=lower(%s) or is_default) "
-        "order by (lower(name)=lower(%s)) desc limit 1",
-        (lead["practice_id"], lead["lead_type"] or "", lead["lead_type"] or ""),
-    ).fetchone()
+    case_type = row["case_type"]
     if not case_type:
         raise BookingToolError("No case type is configured for booking.")
-    clinicians = conn.execute(
-        "select c.id,c.stride_user_id,c.display_name from clinician_assignments ca "
-        "join clinicians c on c.id=ca.clinician_id and c.is_active "
-        "where ca.is_active and ca.booking_location_id=%s and ca.case_type_id=%s "
-        "order by c.display_name",
-        (location["id"], case_type["id"]),
-    ).fetchall()
-    if not clinicians:
+    if not row["clinicians"]:
         raise ValueError(
             f"NO_CLINICIANS: no therapist is set up for {case_type['name']} at {location['name']}. "
             "Offer to text the booking link or transfer to the team."
         )
+    sync_state = row["sync_state"]
+    if sync_state:
+        sync_state = {
+            "last_success_at": datetime.fromisoformat(sync_state["last_success_at"])
+            if sync_state["last_success_at"] else None,
+            "window_start": date.fromisoformat(sync_state["window_start"])
+            if sync_state["window_start"] else None,
+        }
     return BookingContext(
-        lead=lead, location=location, case_type=case_type, clinicians=clinicians,
+        lead=lead, location=location, case_type=case_type, clinicians=row["clinicians"],
         now_local=booking_now(settings, location["timezone"]), settings=settings,
+        sync_state=sync_state, booking_enabled=row["booking_enabled"],
     )
 
 
@@ -216,36 +236,34 @@ def _fast_providers(settings: Settings) -> ProviderClients:
     }))
 
 
-def ensure_fresh_cache(
+def cache_is_fresh(context: BookingContext) -> bool:
+    state = context.sync_state
+    return bool(
+        state
+        and state["last_success_at"] is not None
+        and datetime.now(UTC) - state["last_success_at"]
+        < timedelta(seconds=context.settings.booking_cache_max_age_seconds)
+        and state["window_start"] == context.now_local.date()
+    )
+
+
+def refresh_cache(
     trace: WorkflowTrace, context: BookingContext, providers: ProviderClients,
 ) -> None:
     """Refresh this location's cache inline when the background sync is late."""
-    settings = context.settings
     with transaction() as conn:
-        state = conn.execute(
-            "select last_success_at,window_start from availability_sync_state "
-            "where booking_location_id=%s and duration_minutes=%s",
-            (context.location["id"], context.case_type["duration_minutes"]),
-        ).fetchone()
         targets = [
             target for target in sync_targets(conn, context.location["id"])
             if target["duration_minutes"] == context.case_type["duration_minutes"]
         ]
-    fresh = (
-        state is not None
-        and state["last_success_at"] is not None
-        and datetime.now(UTC) - state["last_success_at"]
-        < timedelta(seconds=settings.booking_cache_max_age_seconds)
-        and state["window_start"] == context.now_local.date()
-    )
-    if fresh or not targets:
+    if not targets:
         return
     try:
-        sync_target(trace, targets[0], providers=providers, settings=settings)
+        sync_target(trace, targets[0], providers=providers, settings=context.settings)
     except ProviderError:
         # Offer from the older cache; the booking re-checks live anyway.
         trace.log("availability_inline_sync_failed", booking_location_id=context.location["id"])
-        if state is None or state["last_success_at"] is None:
+        if not context.sync_state or context.sync_state["last_success_at"] is None:
             raise
 
 
@@ -293,10 +311,11 @@ def search_slots(
 
 
 def _remember_offers(conn, call_key: str, context: BookingContext, slots: list[dict]) -> None:
-    for slot in slots:
+    if slots:
         conn.execute(
-            "insert into slot_offers(call_id,lead_id,slot_id,case_type_id) values(%s,%s,%s,%s)",
-            (call_key, context.lead["id"], slot["id"], context.case_type["id"]),
+            "insert into slot_offers(call_id,lead_id,slot_id,case_type_id) "
+            "select %s,%s,unnest(%s::bigint[]),%s",
+            (call_key, context.lead["id"], [slot["id"] for slot in slots], context.case_type["id"]),
         )
 
 
@@ -328,45 +347,59 @@ def find_slots(
     providers = providers or _fast_providers(settings)
     if time_of_day and time_of_day not in TIME_OF_DAY:
         raise ValueError("BAD_TIME_OF_DAY: time_of_day must be morning, afternoon or evening.")
+    call_key = call_id or f"direct:{lead_id}"
+    # Normal case (fresh cache): load, search and remember offers in one transaction.
     with transaction() as conn:
         context = load_context(conn, lead_id, location_name=location_name, settings=settings)
-    start, end = date_window(when, context.now_local, settings.booking_horizon_days, specific_date)
-    pool = context.clinicians
-    if clinician_name:
-        pool = match_clinicians(context.clinicians, clinician_name)
-        if not pool:
-            names = ", ".join(c["display_name"] for c in context.clinicians)
-            return (
-                f"NO_SUCH_THERAPIST: no therapist named {clinician_name} sees "
-                f"{context.case_type['name']} patients at {context.location['name']}. "
-                f"Therapists there: {names}. Ask if one of them is fine, or offer the earliest "
-                "time with any therapist."
-            )
-    ensure_fresh_cache(trace, context, providers)
+        start, end = date_window(when, context.now_local, settings.booking_horizon_days,
+                                 specific_date)
+        pool = context.clinicians
+        if clinician_name:
+            pool = match_clinicians(context.clinicians, clinician_name)
+            if not pool:
+                names = ", ".join(c["display_name"] for c in context.clinicians)
+                return (
+                    f"NO_SUCH_THERAPIST: no therapist named {clinician_name} sees "
+                    f"{context.case_type['name']} patients at {context.location['name']}. "
+                    f"Therapists there: {names}. Ask if one of them is fine, or offer the earliest "
+                    "time with any therapist."
+                )
+        if cache_is_fresh(context):
+            return _offer(trace, conn, context, call_key, start, end, pool, time_of_day,
+                          clinician_name, when)
+    refresh_cache(trace, context, providers)
+    with transaction() as conn:
+        return _offer(trace, conn, context, call_key, start, end, pool, time_of_day,
+                      clinician_name, when)
+
+
+def _offer(
+    trace: WorkflowTrace, conn, context: BookingContext, call_key: str, start: date, end: date,
+    pool: list[dict[str, Any]], time_of_day: str | None, clinician_name: str | None, when: str,
+) -> str:
+    settings = context.settings
     ids = [clinician["id"] for clinician in pool]
     where = f"{context.case_type['name']} at {context.location['name']}"
     who = f" with {pool[0]['display_name']}" if clinician_name and len(pool) == 1 else ""
-    call_key = call_id or f"direct:{lead_id}"
-    with transaction() as conn:
-        slots = search_slots(conn, context, start=start, end=end, clinician_ids=ids,
-                             time_of_day=time_of_day)
-        if slots:
-            _remember_offers(conn, call_key, context, slots)
-            trace.log("slots_offered", count=len(slots), when=when)
-            return f"OPENINGS for {where}{who}: {_offer_text(slots)}. {BOOK_HINT}"
-        # Nothing in the wished-for range: offer the next times after it.
-        horizon_end = context.now_local.date() + timedelta(days=settings.booking_horizon_days - 1)
-        later = search_slots(conn, context, start=end + timedelta(days=1), end=horizon_end,
-                             clinician_ids=ids, time_of_day=time_of_day)
-        if not later and time_of_day:
-            later = search_slots(conn, context, start=start, end=horizon_end, clinician_ids=ids)
-        if later:
-            _remember_offers(conn, call_key, context, later)
-            trace.log("slots_offered", count=len(later), when=when, fallback=True)
-            return (
-                f"NOTHING_IN_RANGE: no {where}{who} openings for that time. "
-                f"Next openings: {_offer_text(later)}. {BOOK_HINT}"
-            )
+    slots = search_slots(conn, context, start=start, end=end, clinician_ids=ids,
+                         time_of_day=time_of_day)
+    if slots:
+        _remember_offers(conn, call_key, context, slots)
+        trace.log("slots_offered", count=len(slots), when=when)
+        return f"OPENINGS for {where}{who}: {_offer_text(slots)}. {BOOK_HINT}"
+    # Nothing in the wished-for range: offer the next times after it.
+    horizon_end = context.now_local.date() + timedelta(days=settings.booking_horizon_days - 1)
+    later = search_slots(conn, context, start=end + timedelta(days=1), end=horizon_end,
+                         clinician_ids=ids, time_of_day=time_of_day)
+    if not later and time_of_day:
+        later = search_slots(conn, context, start=start, end=horizon_end, clinician_ids=ids)
+    if later:
+        _remember_offers(conn, call_key, context, later)
+        trace.log("slots_offered", count=len(later), when=when, fallback=True)
+        return (
+            f"NOTHING_IN_RANGE: no {where}{who} openings for that time. "
+            f"Next openings: {_offer_text(later)}. {BOOK_HINT}"
+        )
     if clinician_name and len(ids) < len(context.clinicians):
         return (
             f"NO_OPENINGS_FOR_THERAPIST: {pool[0]['display_name']} has no openings in the next "
@@ -540,11 +573,7 @@ def book_slot(
         context = load_context(conn, lead_id, location_name=arguments.get("location"),
                                settings=settings)
         patient = validate_patient(arguments, context.now_local.date())
-        enabled = conn.execute(
-            "select stride_booking_enabled from practice_settings where practice_id=%s",
-            (context.lead["practice_id"],),
-        ).fetchone()
-        if not enabled or not enabled["stride_booking_enabled"]:
+        if not context.booking_enabled:
             raise BookingToolError("Booking is switched off for this practice.")
         existing = _existing_booking(conn, lead_id)
         if existing:
