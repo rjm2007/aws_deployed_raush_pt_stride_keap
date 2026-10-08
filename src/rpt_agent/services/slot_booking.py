@@ -819,8 +819,10 @@ def book_slot(
         )
 
     # 4. Record the booking. Stride is the source of truth from here on.
+    raw_event = str(arguments.get("outreach_event_id") or "").strip()
     _finish_booking(trace, context, slot, appointment_id, hold_id, stride_appointment_id,
-                    patient_id, case_id, patient)
+                    patient_id, case_id, patient,
+                    event_id=int(raw_event) if raw_event.isdigit() else None)
     duration = context.case_type["duration_minutes"]
     return (
         f"BOOKED: {_spoken_date(slot['local_date'])} at {_spoken_time(slot['local_time'])} with "
@@ -833,6 +835,7 @@ def book_slot(
 def _finish_booking(
     trace: WorkflowTrace, context: BookingContext, slot: dict[str, Any], appointment_id: int,
     hold_id: int, stride_appointment_id: int, patient_id: int, case_id: int, patient: Patient,
+    *, event_id: int | None = None,
 ) -> None:
     lead = context.lead
     lead_id = str(lead["id"])
@@ -849,6 +852,15 @@ def _finish_booking(
             conn.execute("update leads set stride_patient_id=%s,stride_case_id=%s where id=%s",
                          (patient_id, case_id, lead_id))
             mark_booked(conn, lead_id, "voice_booking")
+            if event_id is not None:
+                # Settle this call as booked now, so a later end-of-call summary
+                # that reads it differently cannot undo the booking.
+                conn.execute(
+                    "update outreach_events set status='delivered',settled_at=now(),"
+                    "settled_by='tool',outcome='booked' where id=%s and lead_id=%s "
+                    "and channel='call' and status not in ('delivered','failed','skipped')",
+                    (event_id, lead_id),
+                )
             conn.execute(
                 "insert into notification_log(lead_id,appointment_id,notification_type,channel,"
                 "status,payload) values(%s,%s,'sms_appointment_booked','sms','queued',%s) "
@@ -860,14 +872,14 @@ def _finish_booking(
                                  source_key=f"appointment:{appointment_id}")
             # Test leads are synthetic; they must never reach the client's CRM.
             if not lead["is_test"]:
-                event_id = str(uuid4())
+                handoff_id = str(uuid4())
                 conn.execute(
                     "insert into integration_outbox(event_id,event_type,aggregate_id,payload,"
                     "status,destination) values(%s,'appointment.booked.v1',%s,%s,'pending','keap') "
                     "on conflict(event_id) do nothing",
-                    (event_id, str(appointment_id), Jsonb({
+                    (handoff_id, str(appointment_id), Jsonb({
                         "event_type": "appointment.booked.v1",
-                        "event_id": event_id,
+                        "event_id": handoff_id,
                         "lead_id": lead_id,
                         "first_name": patient.first_name,
                         "last_name": patient.last_name,

@@ -66,6 +66,10 @@ class Job:
     date_of_birth: date | None = None
     case_title: str = ""
     location_id: int | None = None
+    # The clinic and case as the lead names them ('Laguna Niguel', 'knee'), for
+    # the booking agent to confirm with the patient.
+    clinic: str = ""
+    case_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -289,7 +293,7 @@ def claim_jobs(trace: WorkflowTrace, limit: int = 20) -> list[Job]:
             context = conn.execute(
                 "select l.full_name,l.phone_e164,ps.vapi_assistant_id,ps.vapi_phone_number_id,"
                 "ps.booking_link_url,l.date_of_birth,ps.stride_case_title,ps.stride_location_id,"
-                "mt.body "
+                "l.location,l.lead_type,mt.body "
                 "from leads l "
                 "join practice_settings ps on ps.practice_id=l.practice_id "
                 "left join message_templates mt on mt.cadence_step_id=%s and mt.is_active "
@@ -305,6 +309,8 @@ def claim_jobs(trace: WorkflowTrace, limit: int = 20) -> list[Job]:
                 context["date_of_birth"],
                 context["stride_case_title"],
                 context["stride_location_id"],
+                context["location"] or "",
+                context["lead_type"] or "",
             ))
     trace.log("database_operation_completed", operation="claim_due_events", job_count=len(jobs))
     return jobs
@@ -337,6 +343,7 @@ def dispatch_job(trace: WorkflowTrace, job: Job, providers: ProviderClients) -> 
                     "date_of_birth": job.date_of_birth.isoformat() if job.date_of_birth else "",
                     "case_title": job.case_title,
                     "location": str(job.location_id or ""),
+                    "clinic_location": job.clinic, "case_name": job.case_name,
                 }},
             })
         else:

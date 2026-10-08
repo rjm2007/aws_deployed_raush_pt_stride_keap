@@ -268,3 +268,19 @@ def test_cadence_completion_does_not_depend_on_the_calendar():
     assert "exists(select 1 from outreach_events oe where oe.lead_id=l.id)" in statement
     assert "and oe.status in ('planned','in_flight','attempted')" in statement
     assert "l.cadence_state='active'" in statement
+
+
+def test_call_sends_clinic_and_case_for_the_booking_agent():
+    job = Job(7, "lead-7", "call", "+15555550123", "Test Patient", None, None, 0,
+              "assistant", "phone", clinic="Laguna Niguel", case_name="knee")
+    sent = {}
+
+    class Provider:
+        def create_vapi_call(self, trace, payload):
+            sent.update(payload)
+            return "vapi-call-7"
+
+    assert dispatch_job(WorkflowTrace("worker", "test"), job, Provider()).state == "accepted"
+    values = sent["assistantOverrides"]["variableValues"]
+    assert values["clinic_location"] == "Laguna Niguel" and values["case_name"] == "knee"
+    assert values["lead_id"] == "lead-7" and values["outreach_event_id"] == "7"

@@ -522,3 +522,15 @@ def test_blank_today_override_means_unset(monkeypatch):
     assert Settings(_env_file=None).booking_today_override is None
     monkeypatch.setenv("BOOKING_TODAY_OVERRIDE", "2026-06-15")
     assert Settings(_env_file=None).booking_today_override == TODAY
+
+
+def test_booking_settles_the_call_so_a_later_summary_cannot_undo_it(env):
+    lead = booked_setup(env)
+    event = env.db.execute(
+        "insert into outreach_events(lead_id,attempt_no,channel,status,scheduled_for) "
+        "values(%s,1,'call','in_flight',now()) returning id", (lead,),
+    ).fetchone()["id"]
+    assert env.book(lead, date=DAY1, time="9:00 AM",
+                    outreach_event_id=str(event)).startswith("BOOKED")
+    row = env.one("select status,outcome,settled_by from outreach_events where id=%s", event)
+    assert row == {"status": "delivered", "outcome": "booked", "settled_by": "tool"}
