@@ -103,3 +103,15 @@ def test_chat_api_tool_calls_carry_the_lead_from_chat_overrides():
     assert parsed.arguments["lead_id"] == "lead-9"
     assert parsed.arguments["outreach_event_id"] == "4"
     assert parsed.call_id is None  # a chat turn id is not a stable call key
+
+
+def test_lead_found_in_any_vapi_variable_block_but_never_in_model_arguments():
+    from rpt_agent.vapi_contract import extract_vapi_context, variable_source
+
+    body = {"message": {"assistant": {"variableValues": {"lead_id": "lead-a"}},
+                        "toolCallList": [{"id": "t", "function": {"arguments": {
+                            "variableValues": {"lead_id": "spoofed"}}}}]}}
+    assert extract_vapi_context(body)["lead_id"] == "lead-a"
+    assert variable_source(body) == "message.assistant.variableValues"
+    only_model = {"message": {"toolCallList": [{"id": "t", "variableValues": {"lead_id": "x"}}]}}
+    assert "lead_id" not in extract_vapi_context(only_model)

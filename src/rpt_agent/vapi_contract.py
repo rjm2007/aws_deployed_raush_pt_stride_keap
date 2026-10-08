@@ -40,6 +40,10 @@ def extract_vapi_context(body: dict[str, Any]) -> dict[str, Any]:
         body.get("variableValues") or {},
         body.get("variables") or {},
     ]
+    # Vapi has moved these between payload shapes (call, chat, assistant). Any
+    # other variableValues block Vapi sent counts too, but never one inside the
+    # tool-call lists, which hold what the model typed.
+    candidates.extend(values for _, values in _variable_blocks(message))
     trusted: dict[str, Any] = {}
     for values in candidates:
         if isinstance(values, dict):
@@ -47,6 +51,31 @@ def extract_vapi_context(body: dict[str, Any]) -> dict[str, Any]:
                 if values.get(key) not in (None, ""):
                     trusted.setdefault(key, values[key])
     return trusted
+
+
+MODEL_CONTROLLED = {"toolCallList", "toolCalls", "toolWithToolCallList", "messages", "artifact"}
+
+
+def _variable_blocks(node: Any, path: str = "message", depth: int = 0):
+    """Yield (path, dict) for every variableValues block Vapi itself sent."""
+    if depth > 5 or not isinstance(node, dict):
+        return
+    for key, value in node.items():
+        if key in MODEL_CONTROLLED:
+            continue
+        if key == "variableValues" and isinstance(value, dict):
+            yield f"{path}.{key}", value
+        elif isinstance(value, dict):
+            yield from _variable_blocks(value, f"{path}.{key}", depth + 1)
+
+
+def variable_source(body: dict[str, Any]) -> str | None:
+    """Where the lead id came from, for logs (a path, never a value)."""
+    message = body.get("message") if isinstance(body, dict) else None
+    for path, values in _variable_blocks(message if isinstance(message, dict) else {}):
+        if values.get("lead_id"):
+            return path
+    return None
 
 
 def _coerce_arguments(value: Any) -> dict[str, Any]:

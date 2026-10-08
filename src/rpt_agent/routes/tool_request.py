@@ -3,7 +3,7 @@ from fastapi import HTTPException, Request
 from ..db import record_integration_event
 from ..observability import WorkflowTrace, trace_id_var
 from ..security import require_vapi_auth
-from ..vapi_contract import ToolRequest, parse_tool_request
+from ..vapi_contract import ToolRequest, parse_tool_request, variable_source
 
 
 async def authenticated_tool_request(
@@ -28,5 +28,6 @@ async def authenticated_tool_request(
         "authenticated",
         http_status=200,
     )
-    trace.log("request_parsed", tool_call_id=parsed.tool_call_id or "flat")
+    trace.log("request_parsed", tool_call_id=parsed.tool_call_id or "flat",
+              lead_source=variable_source(body) or "none")
     return trace, parsed
