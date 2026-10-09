@@ -429,9 +429,22 @@ class Patient:
     email: str | None = None
 
 
+def clean_spelled_name(value: str) -> str:
+    """Rejoin a name the voice model split while copying spelled letters ('Chaub h ary').
+
+    Only when a stray single letter is present: real multi-word names ('De La Cruz')
+    have no one-letter parts and are left alone.
+    """
+    parts = value.split()
+    if len(parts) > 1 and any(len(part) == 1 for part in parts):
+        joined = "".join(parts)
+        return joined[:1].upper() + joined[1:].lower()
+    return value
+
+
 def validate_patient(arguments: dict[str, Any], today: date) -> Patient:
-    first = str(arguments.get("first_name") or "").strip()
-    last = str(arguments.get("last_name") or "").strip()
+    first = clean_spelled_name(str(arguments.get("first_name") or "").strip())
+    last = clean_spelled_name(str(arguments.get("last_name") or "").strip())
     if not first or not last:
         raise ValueError("MISSING_NAME: confirm the caller's first and last name, then try again.")
     if len(first) > 100 or len(last) > 100:

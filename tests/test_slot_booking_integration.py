@@ -534,3 +534,10 @@ def test_booking_settles_the_call_so_a_later_summary_cannot_undo_it(env):
                     outreach_event_id=str(event)).startswith("BOOKED")
     row = env.one("select status,outcome,settled_by from outreach_events where id=%s", event)
     assert row == {"status": "delivered", "outcome": "booked", "settled_by": "tool"}
+
+
+def test_spelled_names_split_by_the_voice_model_are_rejoined():
+    assert slot_booking.clean_spelled_name("Chaub h ary") == "Chaubhary"
+    assert slot_booking.clean_spelled_name("C H A U B H A R Y") == "Chaubhary"
+    assert slot_booking.clean_spelled_name("De La Cruz") == "De La Cruz"
+    assert slot_booking.clean_spelled_name("Gallina") == "Gallina"
