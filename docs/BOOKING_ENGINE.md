@@ -88,19 +88,14 @@ docker compose -f docker-compose.prod.yml logs -f booking-worker
 - Remove `BOOKING_TODAY_OVERRIDE`.
 - Add the voice agent tools and prompt (not done; waiting for go-ahead).
 
-## Test the voice agent locally (one command)
-
-`scripts/booking_agent_test.py` runs everything on a Mac against its own database, so live is never
-touched (it refuses to run if `.env` points at a non-local database). Texts are simulated locally.
+## Test the voice agent (one command)
 
 ```bash
-uv run --frozen --with pgserver python scripts/booking_agent_test.py setup        # once (or --fresh)
-uv run --frozen --with pgserver python scripts/booking_agent_test.py up           # start + tunnel
-uv run --frozen --with pgserver python scripts/booking_agent_test.py call --phone +91XXXXXXXXXX \
-    --name "Dev Chaudhary" --clinic "Laguna Niguel"   # real call now, prints transcript + result
-uv run --frozen --with pgserver python scripts/booking_agent_test.py chat --name "Dev Test"  # type as the patient
-uv run --frozen --with pgserver python scripts/booking_agent_test.py status | down
+uv run --frozen python scripts/test_booking_call.py --phone +91XXXXXXXXXX --name "Dev Chaudhary"
+#   options: --clinic "Dana Point" | "Mission Viejo"   --case "Physical Therapy"   --keep
 ```
 
-`up` restarts anything that stopped and, when the free Cloudflare tunnel address changes, points only the
-new booking assistant (and its own tools) at it; the old assistant is never modified.
+Creates one test lead (is_test, cadence paused, texts off), has Vapi call the number now with the new
+booking assistant (`config/vapi_booking_tools.json`), prints the transcript, tool calls and booking result,
+then deletes the test lead (unless `--keep`). Uses the database and Vapi from `.env`; the old outreach
+assistant and real leads are never touched.
