@@ -87,3 +87,20 @@ docker compose -f docker-compose.prod.yml logs -f booking-worker
 - Replace the demo seed with the client's real clinic / case type / clinician list.
 - Remove `BOOKING_TODAY_OVERRIDE`.
 - Add the voice agent tools and prompt (not done; waiting for go-ahead).
+
+## Test the voice agent locally (one command)
+
+`scripts/booking_agent_test.py` runs everything on a Mac against its own database, so live is never
+touched (it refuses to run if `.env` points at a non-local database). Texts are simulated locally.
+
+```bash
+uv run --frozen --with pgserver python scripts/booking_agent_test.py setup        # once (or --fresh)
+uv run --frozen --with pgserver python scripts/booking_agent_test.py up           # start + tunnel
+uv run --frozen --with pgserver python scripts/booking_agent_test.py call --phone +91XXXXXXXXXX \
+    --name "Dev Chaudhary" --clinic "Laguna Niguel"   # real call now, prints transcript + result
+uv run --frozen --with pgserver python scripts/booking_agent_test.py chat --name "Dev Test"  # type as the patient
+uv run --frozen --with pgserver python scripts/booking_agent_test.py status | down
+```
+
+`up` restarts anything that stopped and, when the free Cloudflare tunnel address changes, points only the
+new booking assistant (and its own tools) at it; the old assistant is never modified.

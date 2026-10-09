@@ -4,7 +4,7 @@
   "copied_from": "540ddb07-711e-4060-8753-f82d848b9a25",
   "structured_output_id": "7170e50c-48d5-4416-b723-3a59fabb5371",
   "prompt_file": "config/vapi_booking_assistant_prompt.md",
-  "note": "Server auth (X-Vapi-Secret header + credentialId) is copied from the update_lead_status tool and is not stored here.",
+  "note": "Server auth (X-Vapi-Secret header + credentialId) is copied from the update_lead_status tool and is not stored here. lead_status_tool_copy_id is the new assistant's own copy of that tool, so pointing it at a local tunnel never affects the old assistant.",
   "tools": [
     {
       "id": "f622d276-97aa-4125-b655-abd1d18ecefc",
@@ -132,5 +132,6 @@
         "timeoutSeconds": 30
       }
     }
-  ]
+  ],
+  "lead_status_tool_copy_id": "86c809f8-1bca-4fba-aea8-b27a74c86fc2"
 }
