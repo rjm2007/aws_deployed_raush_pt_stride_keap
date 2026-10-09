@@ -17,6 +17,7 @@
           "type": "object",
           "properties": {
             "when": {
+              "description": "When the patient wants to come in. earliest when they have no preference. specific_date for one named day.",
               "type": "string",
               "enum": [
                 "earliest",
@@ -26,29 +27,32 @@
                 "next_week",
                 "in_two_weeks",
                 "specific_date"
-              ],
-              "description": "When the patient wants to come in. earliest when they have no preference. specific_date for one named day."
+              ]
             },
-            "specific_date": {
-              "type": "string",
-              "description": "Only with when=specific_date: the day as YYYY-MM-DD, worked out from the 'Calendar today' line in this tool's last reply."
+            "location": {
+              "description": "Only if the patient wants a different clinic than the one on file: Laguna Niguel, Dana Point or Mission Viejo.",
+              "type": "string"
+            },
+            "case_type": {
+              "description": "Only if the caller wants a different service than the one on file: the exact service name from the list of services we offer.",
+              "type": "string"
             },
             "time_of_day": {
+              "description": "Only if the patient asked for a part of the day.",
               "type": "string",
               "enum": [
                 "morning",
                 "afternoon",
                 "evening"
-              ],
-              "description": "Only if the patient asked for a part of the day."
+              ]
+            },
+            "specific_date": {
+              "description": "Only with when=specific_date: the day as YYYY-MM-DD, worked out from the 'Calendar today' line in this tool's last reply.",
+              "type": "string"
             },
             "clinician_name": {
-              "type": "string",
-              "description": "Only if the patient asked for a particular therapist: the name they said, for example 'Thao' or 'Dr. Rome'."
-            },
-            "location": {
-              "type": "string",
-              "description": "Only if the patient wants a different clinic than the one on file: Laguna Niguel, Dana Point or Mission Viejo."
+              "description": "Only if the patient asked for a particular therapist: the name they said, for example 'Thao' or 'Dr. Rome'.",
+              "type": "string"
             }
           },
           "required": [
@@ -59,7 +63,7 @@
       "messages": [
         {
           "type": "request-start",
-          "content": "Let me check what we have open.",
+          "content": "One moment, please, while I check our availability.",
           "blocking": false
         }
       ],
@@ -79,36 +83,40 @@
           "type": "object",
           "properties": {
             "date": {
-              "type": "string",
-              "description": "The chosen day as YYYY-MM-DD, from the parentheses in the open-times reply."
+              "description": "The chosen day as YYYY-MM-DD, from the parentheses in the open-times reply.",
+              "type": "string"
             },
             "time": {
-              "type": "string",
-              "description": "The chosen time as the open-times reply wrote it, for example '9:00 AM'."
-            },
-            "first_name": {
-              "type": "string",
-              "description": "The patient's first name."
-            },
-            "last_name": {
-              "type": "string",
-              "description": "The patient's last name exactly as they spelled it."
-            },
-            "date_of_birth": {
-              "type": "string",
-              "description": "The patient's date of birth as YYYY-MM-DD."
-            },
-            "clinician_name": {
-              "type": "string",
-              "description": "The full name of the therapist for the chosen time, as the open-times reply wrote it."
-            },
-            "location": {
-              "type": "string",
-              "description": "Only if the patient changed clinic: Laguna Niguel, Dana Point or Mission Viejo."
+              "description": "The chosen time as the open-times reply wrote it, for example '9:00 AM'.",
+              "type": "string"
             },
             "email": {
-              "type": "string",
-              "description": "Leave empty unless the patient gave it."
+              "description": "Leave empty unless the patient gave it.",
+              "type": "string"
+            },
+            "location": {
+              "description": "Only if the patient changed clinic: Laguna Niguel, Dana Point or Mission Viejo.",
+              "type": "string"
+            },
+            "case_type": {
+              "description": "Only if the caller wants a different service than the one on file: the exact service name from the list of services we offer.",
+              "type": "string"
+            },
+            "last_name": {
+              "description": "The patient's last name exactly as they spelled it.",
+              "type": "string"
+            },
+            "first_name": {
+              "description": "The patient's first name.",
+              "type": "string"
+            },
+            "date_of_birth": {
+              "description": "The patient's date of birth as YYYY-MM-DD.",
+              "type": "string"
+            },
+            "clinician_name": {
+              "description": "The full name of the therapist for the chosen time, as the open-times reply wrote it.",
+              "type": "string"
             }
           },
           "required": [
@@ -123,13 +131,47 @@
       "messages": [
         {
           "type": "request-start",
-          "content": "Perfect, let me book that for you now.",
+          "content": "Thank you. One moment, please, while I confirm your appointment.",
           "blocking": false
         }
       ],
       "server": {
         "url": "https://stride.aibolt.ai/api/v1/tools/book-appointment",
         "timeoutSeconds": 30
+      }
+    },
+    {
+      "id": "bbd1aed1-7443-4b2b-80b3-704e51c9e301",
+      "type": "function",
+      "async": false,
+      "function": {
+        "name": "list_providers",
+        "description": "List the therapists the patient can see for their service at their clinic, with any credentials and short note on file. Call it when the patient asks who the therapists are, asks about a therapist, or asks for options. Answer only from what it returns.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "description": "Only if the patient changed clinic: Laguna Niguel, Dana Point or Mission Viejo.",
+              "type": "string"
+            },
+            "case_type": {
+              "description": "Only if the caller wants a different service than the one on file: the exact service name from the list of services we offer.",
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      "messages": [
+        {
+          "type": "request-start",
+          "content": "One moment, please.",
+          "blocking": false
+        }
+      ],
+      "server": {
+        "url": "https://stride.aibolt.ai/api/v1/tools/list-providers",
+        "timeoutSeconds": 15
       }
     }
   ],
