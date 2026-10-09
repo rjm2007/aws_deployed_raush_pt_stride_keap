@@ -32,15 +32,17 @@ on conflict(practice_id, lower(name)) do update
       is_active = true, updated_at = now();
 
 with practice as (select id from public.practices where slug = 'rausch-pt')
-insert into public.clinicians(practice_id, stride_user_id, display_name)
-select practice.id, v.stride_user_id, v.display_name
+-- Credentials and bios are invented demo text, replaced by the client's real list.
+insert into public.clinicians(practice_id, stride_user_id, display_name, credentials, bio)
+select practice.id, v.stride_user_id, v.display_name, v.credentials, v.bio
 from practice, (values
-  (5980, 'Joe Smith'),
-  (5981, 'Thao Nguyen'),
-  (5982, 'Alan Rome')
-) as v(stride_user_id, display_name)
+  (5980, 'Joe Smith', 'PT, DPT', 'Focuses on back and neck pain.'),
+  (5981, 'Thao Nguyen', 'PT, DPT', 'Focuses on sports injuries and knee rehab.'),
+  (5982, 'Alan Rome', 'PT, DPT', 'Focuses on pelvic health and post-surgery recovery.')
+) as v(stride_user_id, display_name, credentials, bio)
 on conflict(practice_id, stride_user_id) do update
-  set display_name = excluded.display_name, is_active = true, updated_at = now();
+  set display_name = excluded.display_name, credentials = excluded.credentials,
+      bio = excluded.bio, is_active = true, updated_at = now();
 
 insert into public.clinician_assignments(clinician_id, booking_location_id, case_type_id)
 select c.id, bl.id, ct.id

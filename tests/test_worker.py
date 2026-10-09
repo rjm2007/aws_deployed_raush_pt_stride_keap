@@ -272,7 +272,8 @@ def test_cadence_completion_does_not_depend_on_the_calendar():
 
 def test_call_sends_clinic_and_case_for_the_booking_agent():
     job = Job(7, "lead-7", "call", "+15555550123", "Test Patient", None, None, 0,
-              "assistant", "phone", clinic="Laguna Niguel", case_name="knee")
+              "assistant", "phone", clinic="Laguna Niguel", case_name="knee",
+              case_type="Physical Therapy", case_types_offered="Physical Therapy, Pelvic Health")
     sent = {}
 
     class Provider:
@@ -284,3 +285,5 @@ def test_call_sends_clinic_and_case_for_the_booking_agent():
     values = sent["assistantOverrides"]["variableValues"]
     assert values["clinic_location"] == "Laguna Niguel" and values["case_name"] == "knee"
     assert values["lead_id"] == "lead-7" and values["outreach_event_id"] == "7"
+    assert values["case_type"] == "Physical Therapy"
+    assert values["case_types_offered"] == "Physical Therapy, Pelvic Health"

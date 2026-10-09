@@ -70,6 +70,8 @@ class Job:
     # the booking agent to confirm with the patient.
     clinic: str = ""
     case_name: str = ""
+    case_type: str = ""
+    case_types_offered: str = ""
 
 
 @dataclass(frozen=True)
@@ -280,6 +282,8 @@ from due where oe.id=due.id
 
 
 def claim_jobs(trace: WorkflowTrace, limit: int = 20) -> list[Job]:
+    from .services.slot_booking import call_case_variables  # local: avoids an import cycle
+
     trace.log("database_operation_started", operation="claim_due_events")
     with transaction() as conn:
         # Migration 025 permits only workers that identify with this claim protocol.
@@ -311,6 +315,7 @@ def claim_jobs(trace: WorkflowTrace, limit: int = 20) -> list[Job]:
                 context["stride_location_id"],
                 context["location"] or "",
                 context["lead_type"] or "",
+                **(call_case_variables(conn, str(row["lead_id"])) if row["channel"] == "call" else {}),
             ))
     trace.log("database_operation_completed", operation="claim_due_events", job_count=len(jobs))
     return jobs
@@ -344,6 +349,7 @@ def dispatch_job(trace: WorkflowTrace, job: Job, providers: ProviderClients) -> 
                     "case_title": job.case_title,
                     "location": str(job.location_id or ""),
                     "clinic_location": job.clinic, "case_name": job.case_name,
+                    "case_type": job.case_type, "case_types_offered": job.case_types_offered,
                 }},
             })
         else:

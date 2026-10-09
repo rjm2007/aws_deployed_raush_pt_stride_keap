@@ -94,16 +94,26 @@ with lead as (
   where bl.practice_id=lead.practice_id and bl.is_active
     and lower(bl.name)=lower(coalesce(nullif(%(location)s,''),lead.location,''))
 ), kind as (
+  -- The service said on the call wins (exact name, else a unique partial match such
+  -- as 'pelvic'); otherwise the lead's case, else the practice default.
   select ct.id,ct.name,ct.stride_appointment_type_id,ct.duration_minutes from case_types ct, lead
   where ct.practice_id=lead.practice_id and ct.is_active
-    and (lower(ct.name)=lower(coalesce(lead.lead_type,'')) or ct.is_default)
-  order by (lower(ct.name)=lower(coalesce(lead.lead_type,''))) desc limit 1
+    and case when %(case_type)s<>'' then
+          lower(ct.name)=lower(%(case_type)s)
+          or (strpos(lower(ct.name),lower(%(case_type)s))>0
+              and (select count(*) from case_types other
+                    where other.practice_id=lead.practice_id and other.is_active
+                      and strpos(lower(other.name),lower(%(case_type)s))>0)=1)
+        else lower(ct.name)=lower(coalesce(lead.lead_type,'')) or ct.is_default end
+  order by (lower(ct.name)=lower(coalesce(nullif(%(case_type)s,''),lead.lead_type,''))) desc
+  limit 1
 )
 select row_to_json(lead) as lead,
        (select row_to_json(loc) from loc) as location,
        (select row_to_json(kind) from kind) as case_type,
        (select coalesce(json_agg(json_build_object('id',c.id,'stride_user_id',c.stride_user_id,
-                'display_name',c.display_name) order by c.display_name),'[]'::json)
+                'display_name',c.display_name,'credentials',c.credentials,'bio',c.bio)
+                order by c.display_name),'[]'::json)
           from clinician_assignments ca join clinicians c on c.id=ca.clinician_id and c.is_active
          where ca.is_active and ca.booking_location_id=(select id from loc)
            and ca.case_type_id=(select id from kind)) as clinicians,
@@ -113,6 +123,8 @@ select row_to_json(lead) as lead,
            and s.duration_minutes=(select duration_minutes from kind)) as sync_state,
        (select string_agg(bl.name, ', ' order by bl.name) from booking_locations bl
          where bl.practice_id=lead.practice_id and bl.is_active) as location_names,
+       (select string_agg(ct.name, ', ' order by ct.name) from case_types ct
+         where ct.practice_id=lead.practice_id and ct.is_active) as case_type_names,
        coalesce((select stride_booking_enabled from practice_settings ps
                   where ps.practice_id=lead.practice_id), false) as booking_enabled
 from lead
@@ -120,11 +132,14 @@ from lead
 
 
 def load_context(
-    conn, lead_id: str, *, location_name: str | None = None, settings: Settings | None = None,
+    conn, lead_id: str, *, location_name: str | None = None, case_type_name: str | None = None,
+    settings: Settings | None = None,
 ) -> BookingContext:
     settings = settings or get_settings()
+    wanted_case = (case_type_name or "").strip()
     row = conn.execute(
-        CONTEXT_SQL, {"lead_id": lead_id, "location": (location_name or "").strip()}
+        CONTEXT_SQL,
+        {"lead_id": lead_id, "location": (location_name or "").strip(), "case_type": wanted_case},
     ).fetchone()
     if not row:
         raise BookingToolError("I could not find this patient's record.")
@@ -138,6 +153,11 @@ def load_context(
             f"UNKNOWN_LOCATION: we have no clinic called {wanted}. Our clinics are {names}."
         )
     case_type = row["case_type"]
+    if not case_type and wanted_case:
+        raise ValueError(
+            f"UNKNOWN_SERVICE: we don't book {wanted_case}. Our services are "
+            f"{row['case_type_names'] or 'none'}. Ask which one they need."
+        )
     if not case_type:
         raise BookingToolError("No case type is configured for booking.")
     if not row["clinicians"]:
@@ -158,6 +178,17 @@ def load_context(
         now_local=booking_now(settings, location["timezone"]), settings=settings,
         sync_state=sync_state, booking_enabled=row["booking_enabled"],
     )
+
+
+def call_case_variables(conn, lead_id: str) -> dict[str, str]:
+    """Call variables for the booking agent: the lead's service and every service we book."""
+    row = conn.execute(CONTEXT_SQL, {"lead_id": lead_id, "location": "", "case_type": ""}).fetchone()
+    if not row:
+        return {"case_type": "", "case_types_offered": ""}
+    return {
+        "case_type": (row["case_type"] or {}).get("name", ""),
+        "case_types_offered": row["case_type_names"] or "",
+    }
 
 
 def _name_tokens(value: str) -> list[str]:
@@ -345,6 +376,7 @@ def find_slots(
     time_of_day: str | None = None,
     clinician_name: str | None = None,
     location_name: str | None = None,
+    case_type_name: str | None = None,
     settings: Settings | None = None,
     providers: ProviderClients | None = None,
 ) -> str:
@@ -355,7 +387,8 @@ def find_slots(
     call_key = call_id or f"direct:{lead_id}"
     # Normal case (fresh cache): load, search and remember offers in one transaction.
     with transaction() as conn:
-        context = load_context(conn, lead_id, location_name=location_name, settings=settings)
+        context = load_context(conn, lead_id, location_name=location_name,
+                               case_type_name=case_type_name, settings=settings)
         start, end = date_window(when, context.now_local, settings.booking_horizon_days,
                                  specific_date)
         pool = context.clinicians
@@ -414,6 +447,27 @@ def _offer(
     return (
         f"NO_OPENINGS: no {where} openings in the next {settings.booking_horizon_days} days. "
         "Offer to text the booking link or transfer to the team."
+    )
+
+
+def list_providers(
+    *, lead_id: str, location_name: str | None = None, case_type_name: str | None = None,
+    settings: Settings | None = None,
+) -> str:
+    """Who the caller can see: clinicians for this service at this clinic, from our own tables."""
+    with transaction() as conn:
+        context = load_context(conn, lead_id, location_name=location_name,
+                               case_type_name=case_type_name, settings=settings)
+    people = []
+    for clinician in context.clinicians:
+        details = "; ".join(
+            part for part in (clinician.get("credentials"), clinician.get("bio")) if part
+        )
+        people.append(f"{clinician['display_name']}" + (f" ({details})" if details else ""))
+    return (
+        f"PROVIDERS for {context.case_type['name']} at {context.location['name']}: "
+        f"{'; '.join(people)}. Answer only from this list; do not add anything else about them. "
+        "Then ask if they would like one of them, or whoever is available first."
     )
 
 
@@ -589,7 +643,7 @@ def book_slot(
 
     with transaction() as conn:
         context = load_context(conn, lead_id, location_name=arguments.get("location"),
-                               settings=settings)
+                               case_type_name=arguments.get("case_type"), settings=settings)
         patient = validate_patient(arguments, context.now_local.date())
         if not context.booking_enabled:
             raise BookingToolError("Booking is switched off for this practice.")

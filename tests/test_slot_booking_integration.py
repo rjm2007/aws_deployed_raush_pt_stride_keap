@@ -541,3 +541,60 @@ def test_spelled_names_split_by_the_voice_model_are_rejoined():
     assert slot_booking.clean_spelled_name("C H A U B H A R Y") == "Chaubhary"
     assert slot_booking.clean_spelled_name("De La Cruz") == "De La Cruz"
     assert slot_booking.clean_spelled_name("Gallina") == "Gallina"
+
+
+def add_pelvic_service(env, *, minutes=45, appointment_type=1453):
+    """A second service seen only by Alan Rome, with its own type and visit length."""
+    case_type = env.db.execute(
+        "insert into case_types(practice_id,name,stride_appointment_type_id,duration_minutes) "
+        "values(%s,'Physical Therapy - Pelvic',%s,%s) returning id",
+        (env.practice_id, appointment_type, minutes),
+    ).fetchone()["id"]
+    env.db.execute(
+        "insert into clinician_assignments(clinician_id,booking_location_id,case_type_id) "
+        "values(%s,%s,%s)", (env.clinicians[5982], env.location_id, case_type),
+    )
+    env.db.execute(
+        "update clinicians set credentials='PT, DPT',bio='Focuses on pelvic health.' where id=%s",
+        (env.clinicians[5982],),
+    )
+
+
+def test_service_said_on_the_call_changes_clinicians_and_visit_length(env):
+    add_pelvic_service(env)
+    open_days(env, c5981={DAY1: ["09:00:00"]}, c5982={DAY1: ["13:00:00"]})
+    env.sync()
+    lead = env.lead()
+    message = env.find(lead, case_type_name="pelvic")
+    assert message.startswith("OPENINGS for Physical Therapy - Pelvic") and "Alan Rome" in message
+    assert "Thao" not in message
+    booked = env.book(lead, date=DAY1, time="1:00 PM", case_type="Physical Therapy - Pelvic")
+    assert booked.startswith("BOOKED") and "45 minutes" in booked
+    appointment = next(p for name, p in env.stride.calls if name == "appointments")
+    assert appointment["appointment_type"] == 1453
+    assert appointment["end_date_utc"] == "2026-06-16T17:45:00+00:00"  # 1 PM Eastern + 45 min
+
+
+def test_unknown_service_lists_the_services_we_book(env):
+    add_pelvic_service(env)
+    with pytest.raises(ValueError, match="UNKNOWN_SERVICE.*Physical Therapy, Physical Therapy - Pelvic"):
+        env.find(env.lead(), case_type_name="Massage")
+
+
+def test_list_providers_comes_from_assignments_with_profile(env):
+    add_pelvic_service(env)
+    lead = env.lead()
+    general = slot_booking.list_providers(lead_id=lead, settings=env.settings())
+    assert general.startswith("PROVIDERS for Physical Therapy at Laguna Niguel")
+    assert "Alan Rome (PT, DPT; Focuses on pelvic health.)" in general and "Thao Nguyen" in general
+    pelvic = slot_booking.list_providers(lead_id=lead, case_type_name="pelvic",
+                                         settings=env.settings())
+    assert "Alan Rome" in pelvic and "Thao" not in pelvic
+
+
+def test_call_variables_name_the_matched_service_and_all_services(env):
+    add_pelvic_service(env)
+    lead = env.lead(lead_type="knee")  # no service called 'knee': the default applies
+    values = slot_booking.call_case_variables(env.db, lead)
+    assert values == {"case_type": "Physical Therapy",
+                      "case_types_offered": "Physical Therapy, Physical Therapy - Pelvic"}

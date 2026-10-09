@@ -21,6 +21,7 @@ from ..services.slot_booking import (
     BookingToolError,
     book_slot,
     find_slots,
+    list_providers,
 )
 from ..vapi_contract import _single_line, tool_error, tool_success
 from .tool_request import authenticated_tool_request
@@ -55,7 +56,7 @@ def _lead_id(arguments: dict[str, Any]) -> str:
         "the three nearest open times from the slot cache and remembers them for the call. "
         "Arguments: `when` (required: " + ", ".join(WHEN_VALUES) + "), `specific_date` "
         "(YYYY-MM-DD, with when=specific_date), `time_of_day` (morning/afternoon/evening), "
-        "`clinician_name`, `location`."
+        "`clinician_name`, `location`, `case_type` (only if the caller wants another service)."
     ),
     dependencies=[Depends(vapi_secret_scheme)],
 )
@@ -81,6 +82,7 @@ async def find_slots_tool(request: Request):
             time_of_day=str(arguments.get("time_of_day") or "").strip().lower() or None,
             clinician_name=str(arguments.get("clinician_name") or "").strip() or None,
             location_name=str(arguments.get("location") or "").strip() or None,
+            case_type_name=str(arguments.get("case_type") or "").strip() or None,
         )
         trace.complete()
         return _reply(tool_call_id, message)
@@ -105,13 +107,53 @@ async def find_slots_tool(request: Request):
 
 
 @router.post(
+    "/list-providers",
+    summary="List the clinicians the caller can see",
+    description=(
+        "Read-only. Clinicians assigned to the lead's service at the lead's clinic, with any "
+        "credentials and short bio on file. Optional `location` and `case_type` when the caller "
+        "changed clinic or service."
+    ),
+    dependencies=[Depends(vapi_secret_scheme)],
+)
+async def list_providers_tool(request: Request):
+    trace = None
+    tool_call_id = None
+    try:
+        trace, parsed = await authenticated_tool_request(request, "list_providers")
+        tool_call_id = parsed.tool_call_id
+        arguments = parsed.arguments
+        message = list_providers(
+            lead_id=_lead_id(arguments),
+            location_name=str(arguments.get("location") or "").strip() or None,
+            case_type_name=str(arguments.get("case_type") or "").strip() or None,
+        )
+        trace.complete()
+        return _reply(tool_call_id, message)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        if trace:
+            trace.log("validation_failed", error_category=type(exc).__name__)
+        return _reply(tool_call_id, str(exc))
+    except BookingToolError as exc:
+        if trace:
+            trace.log("booking_tool_refused", error_category=type(exc).__name__)
+        return _reply(tool_call_id, f"{exc} Offer to transfer the caller to the team.", failed=True)
+    except Exception as exc:  # noqa: BLE001 - never end a live call on a tool failure
+        if trace:
+            trace.fail(exc)
+        return _reply(tool_call_id, SYSTEM_DOWN, failed=True)
+
+
+@router.post(
     "/book-appointment",
     summary="Book the time the caller chose (creates real Stride records)",
     description=(
         "**Creates real records.** Holds the slot, re-checks it live in Stride, then creates the "
         "patient, case and appointment. Arguments: `date` (YYYY-MM-DD) and `time` the caller "
         "chose from find-slots, `first_name`, `last_name`, `date_of_birth` (YYYY-MM-DD), optional "
-        "`email`, `clinician_name`, `location`. Safe to resend: an existing booking is reported, "
+        "`email`, `clinician_name`, `location`, `case_type`. Safe to resend: an existing booking is reported, "
         "never duplicated."
     ),
     dependencies=[Depends(vapi_secret_scheme)],
