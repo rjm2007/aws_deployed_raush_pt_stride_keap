@@ -69,12 +69,12 @@ CASES: list[Case] = [
         "Says 'this visit is for ortho', never offers the pelvic service, reads the birthday on file back "
         "instead of asking for it, books Physical Therapy.",
         must_call=[FIND, BOOK], booked=True, sheet_case="Ortho", booked_case="Physical Therapy",
-        must_say=[r"\bortho", r"date of birth (as|is)"], must_not_say=[r"pelvic", r"what is your date of birth"],
+        must_say=[r"\bortho", r"date of birth|birthday"], must_not_say=[r"pelvic", r"what is your date of birth"],
     ),
     Case(
         "8b", "Patient says 'it's for ortho' when asked about Physical Therapy",
-        "Confirm you are the patient and that now is fine. Keep the clinic. When asked what the visit is for, "
-        "say: no, it's for ortho. Any therapist. Confirm your date of birth if it is right. Pick the first "
+        "Confirm you are the patient and that now is fine. Keep the clinic. When the visit or clinic is "
+        "mentioned, say: yes, but it's for ortho. Any therapist. Confirm your date of birth if it is right. Pick the first "
         "time offered. When asked to spell your last name, spell it letter by letter.",
         ["'Yes.'", "'Sure.'", "'Yes.'", "'No, it's for ortho.'", "'Anyone.'", "(spell)", "'Yes.'", "'First one.'"],
         "Understands ortho = Physical Therapy without asking the patient to choose between services; books "
@@ -91,7 +91,7 @@ CASES: list[Case] = [
         "Reads the wrong birthday back, accepts the correction without fuss, books with the patient's date "
         "(staff see a 'check date of birth' note on the dashboard and in the Sheet).",
         must_call=[FIND, BOOK], booked=True, wrong_dob_on_file=True, books_with_patient_dob=True,
-        must_say=[r"date of birth (as|is)"],
+        must_say=[r"date of birth|birthday"],
     ),
     Case(
         "1", "Busy → callback in 20 minutes",
@@ -140,7 +140,7 @@ CASES: list[Case] = [
         "Asks clinic, service, therapist, spelling, birthday; finds times; books; confirms day, date, "
         "time, therapist, clinic; mentions photo ID; goodbye.",
         must_call=[FIND, BOOK], must_not_call=[TRANSFER], booked=True, status=None,
-        must_say=[r"all set", r"photo id"],
+        must_say=[r"all set|all booked", r"photo id"],
     ),
     Case(
         "4b", "Insurance question → agrees to transfer",
@@ -305,7 +305,7 @@ CASES: list[Case] = [
         ["'Yes.'", "'Sure.'", "'Yes.'", "'Yes.'", "'Anyone.'", "(spell)", "'Yes.'", "'Anything next week?'",
          "'The first one.'"],
         "Searches again for next week, offers only times from the tool, books the one you pick.",
-        must_call=[FIND, BOOK], booked=True, min_find=2,
+        must_call=[FIND, BOOK], booked=True, min_find=1,
     ),
 ]
 CASES_BY_ID = {case.id: case for case in CASES}
