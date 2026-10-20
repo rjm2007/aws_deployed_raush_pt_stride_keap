@@ -234,6 +234,79 @@ CASES: list[Case] = [
         "Reports do_not_contact, short goodbye.",
         status="do_not_contact", must_not_call=[FIND, BOOK, TRANSFER], booked=False,
     ),
+    # --- Added 2026-10-21: callback hours (Mon-Fri 8-7, Sat 8-1:30, no Sunday, holidays),
+    # link + a person, and a pelvic referral.
+    Case(
+        "1c", "Callback on a Sunday → Monday at eight",
+        "Confirm you are the patient. Say you are busy and ask them to call you back this Sunday at noon. "
+        "When they offer another time, accept it.",
+        ["'Yes.'", "'I'm busy, call me back this Sunday at noon.'", "'Okay, that works.'"],
+        "Says calls don't happen on Sundays, offers Monday at eight in the morning, confirms it, reports "
+        "callback_scheduled for Monday.",
+        status="callback_scheduled", must_not_call=[FIND, BOOK, TRANSFER], booked=False,
+        must_say=[r"sunday", r"monday"],
+    ),
+    Case(
+        "1d", "Callback Saturday 3 PM → Saturday closes at one thirty",
+        "Confirm you are the patient. Say you are busy and ask them to call you this Saturday at three in the "
+        "afternoon. When they offer another time, accept the first one they offer.",
+        ["'Yes.'", "'Call me this Saturday at three in the afternoon.'", "'Okay, the first one.'"],
+        "Says Saturday calls end at one thirty, offers an earlier Saturday time or Monday, confirms the new "
+        "time, reports callback_scheduled.",
+        status="callback_scheduled", must_not_call=[FIND, BOOK, TRANSFER], booked=False,
+        must_say=[r"one thirty|1:30"],
+    ),
+    Case(
+        "1e", "Callback on Thanksgiving → the next open day",
+        "Confirm you are the patient. Say you are busy and ask them to call you on November twenty-sixth at "
+        "ten in the morning. When they offer another day, accept it.",
+        ["'Yes.'", "'Call me on November twenty-sixth at ten.'", "'Okay.'"],
+        "Says the clinic is closed for Thanksgiving, offers Friday November twenty-seventh at eight, "
+        "confirms it, reports callback_scheduled.",
+        status="callback_scheduled", must_not_call=[FIND, BOOK, TRANSFER], booked=False,
+        must_say=[r"thanksgiving"],
+    ),
+    Case(
+        "1f", "Only free in the evening → six thirty",
+        "Confirm you are the patient. Say you can only talk in the evenings, after work. When they offer six "
+        "thirty, accept it.",
+        ["'Yes.'", "'I can only talk in the evenings.'", "'Six thirty works.'"],
+        "Says the last calls are at seven in the evening, offers six thirty (or eight the next morning), "
+        "confirms it, reports callback_scheduled.",
+        status="callback_scheduled", must_not_call=[FIND, BOOK, TRANSFER], booked=False,
+        must_say=[r"seven", r"six thirty|6:30"],
+    ),
+    Case(
+        "2b", "Text me the link AND connect me",
+        "Confirm you are the patient. Say you are busy, then ask: can you do both, text me the booking link "
+        "and connect me with someone?",
+        ["'Yes.'", "'I'm busy.'", "'Can you do both? Text me the link and connect me with someone.'"],
+        "Says it will text the link after the call and is connecting you now; in one turn reports "
+        "booking_link_and_transfer and starts the transfer. No booking questions.",
+        status="booking_link_and_transfer", must_call=[TRANSFER], must_not_call=[FIND, BOOK], booked=False,
+    ),
+    Case(
+        "4h", "Pelvic referral: books the pelvic service",
+        "Confirm you are the patient and that now is fine. Keep the clinic. When asked if the visit is for "
+        "pelvic floor, say yes. Any therapist. Confirm your date of birth if it is right. Pick the first time "
+        "offered. When asked to spell your last name, spell it letter by letter.",
+        ["'Yes.'", "'Sure.'", "'Yes.'", "'Yes, pelvic floor.'", "'Anyone.'", "(spell)", "'Yes.'", "'First one.'"],
+        "Says the visit is for pelvic floor, searches and books the pelvic service (Physical Therapy - "
+        "Pelvic), not general Physical Therapy.",
+        must_call=[FIND, BOOK], booked=True, sheet_case="Pelvic floor", booked_case="Physical Therapy - Pelvic",
+        must_say=[r"pelvic"],
+    ),
+    Case(
+        "4i", "Asks for next week",
+        "Confirm you are the patient and that now is fine. Keep the clinic and the service. Any therapist. "
+        "Confirm your date of birth if it is right. When times are offered, say you would prefer something "
+        "next week, then pick the first time offered for next week. When asked to spell your last name, "
+        "spell it letter by letter.",
+        ["'Yes.'", "'Sure.'", "'Yes.'", "'Yes.'", "'Anyone.'", "(spell)", "'Yes.'", "'Anything next week?'",
+         "'The first one.'"],
+        "Searches again for next week, offers only times from the tool, books the one you pick.",
+        must_call=[FIND, BOOK], booked=True, min_find=2,
+    ),
 ]
 CASES_BY_ID = {case.id: case for case in CASES}
 
