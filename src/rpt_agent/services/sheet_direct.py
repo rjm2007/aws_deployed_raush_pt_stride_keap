@@ -73,7 +73,7 @@ FINAL_STATUSES = {"booked", "already booked", "do not contact applied", "complet
                   "lead already exists"}
 RETRYING = re.compile(r"^retrying ([12])/3: ", re.IGNORECASE)
 PROFILE = ("name", "phone", "email", "date_of_birth", "location", "case")
-FIELD_COLUMNS = {"full_name": "Name", "phone": "Phone Number", "email": "Email",
+FIELD_COLUMNS = {"full_name": "Name", "phone": "Phone Number", "email": "Email", "gender": "Gender",
                  "date_of_birth": "Date Of Birth", "location": "Location", "title": "Case",
                  "lead_type": "Case"}
 EMAIL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -235,6 +235,7 @@ def _lead_fields(row: SheetRow, phone: str | None, dob: str | None, email: str) 
         "full_name": row.get("name") or None,
         "phone": phone,
         "email": email or None,
+        "gender": row.get("gender") or None,
         "date_of_birth": dob,
         "location": row.get("location") or None,
         "title": row.get("case") or None,
@@ -243,6 +244,10 @@ def _lead_fields(row: SheetRow, phone: str | None, dob: str | None, email: str) 
 
 def profile_hash(row: SheetRow) -> str:
     joined = "\x1f".join(" ".join(row.get(key).split()) for key in PROFILE)
+    # Gender (2026-10-20) joins the fingerprint only when filled, so adding the column does not
+    # make every existing row look edited (and re-synced) at once.
+    if row.get("gender").strip():
+        joined += "\x1fgender=" + " ".join(row.get("gender").split()).casefold()
     return hashlib.sha256(joined.encode()).hexdigest()
 
 
@@ -301,7 +306,7 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-INPUT = ("name", "phone", "email", "date_of_birth", "location", "case", "action",
+INPUT = ("name", "phone", "email", "gender", "date_of_birth", "location", "case", "action",
          "outcome_status", "lead_id", "action_request_id")
 
 

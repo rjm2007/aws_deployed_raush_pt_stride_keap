@@ -25,6 +25,7 @@ COLUMNS = {
     "name": "Name",
     "phone": "Phone Number",
     "email": "Email",
+    "gender": "Gender",
     "date_of_birth": "Date Of Birth",
     "location": "Location",
     "case": "Case",

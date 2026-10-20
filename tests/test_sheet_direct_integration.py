@@ -243,6 +243,23 @@ def test_a_new_row_on_a_blocked_number_goes_to_review_not_into_cadence(env):
     assert env.cell(number, "lead_status") == "Needs Review"
 
 
+def test_the_sheet_gender_is_saved_on_the_lead_and_an_edit_updates_it(env):
+    number = env.start_row(gender="Male")
+    env.tick()
+    lead_id = env.cell(number, "lead_id")
+    assert env.lead(lead_id)["gender"] == "M"
+    env.sheet.set(number, "gender", "F")
+    env.tick(full=True)
+    env.tick(full=True)  # profile edits apply on the second full read, like any other field
+    assert env.lead(lead_id)["gender"] == "F"
+
+
+def test_an_unknown_sheet_gender_is_reported_on_the_row(env):
+    number = env.start_row(gender="X")
+    env.tick()
+    assert "Gender must be M, F or Other" in env.cell(number, "outcome_status")
+
+
 def test_a_result_for_a_lead_missing_from_the_sheet_is_retried_not_lost(env):
     number = env.start_row()
     env.tick()

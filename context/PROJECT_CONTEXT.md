@@ -2165,3 +2165,10 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
 - Windows note: the `pgserver` embedded Postgres has no time-zone data, so 14 clinic-hours / Stride status
   DB tests fail there ("time zone America/Los_Angeles not recognized"); unrelated to Keap.
 - Still needed: Rausch's real Stride appointment type ids, and production Keap tag ids before production.
+
+### 2026-10-20 — Gender from the Google Sheet (built on PR #15)
+- Optional Sheet column "Gender" (dropdown M / F / Other; Male/Female/lower case accepted, anything else is a row
+  error). Stored on `leads.gender` as M/F/O (migration 047), on intake and on profile edits.
+- Keap pelvic Booked tag: the Sheet's gender wins; without it the Stride patient's gender is used (a patient only
+  Stride knows). "Other" gets the male tag until Emma decides (owner, 2026-10-20).
+- The Sheet profile fingerprint only includes Gender when it is filled, so adding the column re-syncs nothing.

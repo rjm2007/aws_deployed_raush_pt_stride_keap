@@ -40,6 +40,7 @@ Action Request ID | Action Started At
 | Name | Patient name; one word is allowed | Staff |
 | Phone Number | Contact number and duplicate check | Staff |
 | Email | Optional email | Staff |
+| Gender | Optional dropdown M / F / Other (2026-10-20). Saved on the lead; the Keap pelvic tag uses it before Stride's gender. Other = male tag for now | Staff |
 | Date Of Birth | Staff enters `DD/MM/YYYY`; n8n sends `YYYY-MM-DD` | Staff |
 | Location | Location text | Staff |
 | Case | Any non-empty case/lead type | Staff |

@@ -219,3 +219,34 @@ def test_a_sheet_update_is_tried_three_times_then_given_up(monkeypatch):
     for before in (0, 1, 2):
         sheet_sync_worker._mark_failed([{"id": 1, "attempts": before}], error, settings)
     assert statuses == ["retry", "retry", "dead"]
+
+
+def test_an_empty_gender_keeps_the_old_fingerprint_and_a_filled_one_changes_it():
+    # Adding the Gender column (2026-10-20) must not make every existing row look edited.
+    import hashlib
+
+    row = _row(name="Asha Rao", phone="5555550101", lead_id="L")
+    old_formula = hashlib.sha256("\x1f".join(
+        " ".join(row.get(k).split()) for k in ("name", "phone", "email", "date_of_birth", "location", "case")
+    ).encode()).hexdigest()
+    assert profile_hash(row) == old_formula
+    row.cells["gender"] = "F"
+    assert profile_hash(row) != old_formula
+
+
+@pytest.mark.parametrize(("given", "stored"), [
+    ("M", "M"), ("male", "M"), (" F ", "F"), ("Female", "F"), ("Other", "O"), ("o", "O"), ("", None), (None, None),
+])
+def test_sheet_gender_is_stored_as_m_f_or_o(given, stored):
+    from rpt_agent.routes.n8n import SheetLeadInput
+
+    assert SheetLeadInput(phone="5555550101", gender=given).gender == stored
+
+
+def test_an_unknown_sheet_gender_is_an_error_for_the_row():
+    from pydantic import ValidationError
+
+    from rpt_agent.routes.n8n import SheetLeadInput
+
+    with pytest.raises(ValidationError, match="Gender must be M, F or Other"):
+        SheetLeadInput(phone="5555550101", gender="X")

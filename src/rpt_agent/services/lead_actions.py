@@ -134,13 +134,14 @@ def _update_lead_profile(conn, lead_id: str | UUID, lead_data: dict[str, Any]) -
     ).strip() or None
     email = str(lead_data.get("email") or "").strip().lower() or None
     location = str(lead_data.get("location") or "").strip() or None
+    gender = lead_data.get("gender") or None
     conn.execute(
         "update leads set full_name=coalesce(%s,full_name),"
         "first_name=coalesce(%s,first_name),"
         "last_name=case when %s::text is not null then %s else last_name end,"
         "email=coalesce(%s,email),date_of_birth=coalesce(%s,date_of_birth),"
-        "location=coalesce(%s,location),lead_type=coalesce(%s,lead_type),updated_at=now() "
-        "where id=%s",
+        "location=coalesce(%s,location),lead_type=coalesce(%s,lead_type),gender=coalesce(%s,gender),"
+        "updated_at=now() where id=%s",
         (
             full_name,
             first_name,
@@ -150,6 +151,7 @@ def _update_lead_profile(conn, lead_id: str | UUID, lead_data: dict[str, Any]) -
             lead_data.get("date_of_birth"),
             location,
             lead_type,
+            gender,
             lead_id,
         ),
     )
@@ -265,10 +267,10 @@ def _start_cadence(
         "insert into leads(practice_id,source_system,first_name,last_name,full_name,phone_e164,"
         "phone_original,email,date_of_birth,timezone,line_type,consent_captured_at,"
         "consent_source,consent_reference,consent_text_version,status,cadence_state,"
-        "lead_type,location,is_test) "
+        "lead_type,location,is_test,gender) "
         "values(%s,'google_sheets',%s,%s,%s,%s,%s,%s,%s,%s,'unknown',"
         "now(),'dashboard_staff_attestation',%s,'google-sheet-staff-attestation-v1',"
-        "'new','pending',%s,%s,%s) returning id",
+        "'new','pending',%s,%s,%s,%s) returning id",
         (
             practice["id"],
             first_name,
@@ -283,6 +285,7 @@ def _start_cadence(
             stored_lead_type,
             str(lead_data["location"]).strip(),
             synthetic,
+            lead_data.get("gender") or None,
         ),
     ).fetchone()
     lead_id = str(inserted["id"])
