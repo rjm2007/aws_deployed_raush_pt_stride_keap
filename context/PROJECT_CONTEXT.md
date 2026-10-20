@@ -2180,3 +2180,9 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   itself again. A second restart of the same row still needs Outcome Status cleared, as before.
 - `test_number_block_integration`: the two Administration tests act for their own practice (dependency
   override) instead of needing practice id 1; the full suite now passes on a fresh test database.
+
+### 2026-10-21 — Demo: a day the agent names lands on the pinned calendar
+- With `BOOKING_TODAY_OVERRIDE` (demo: 2026-06-15), "Thursday afternoon" was searched on the real Thursday
+  (October) and found nothing. `slot_booking.pinned_calendar_date` moves a real-calendar `specific_date` onto the
+  pinned calendar, same day of the week and distance from today; dates already on the pinned calendar are kept.
+  No override (production) = unchanged. Tests: `tests/test_pinned_calendar.py`.

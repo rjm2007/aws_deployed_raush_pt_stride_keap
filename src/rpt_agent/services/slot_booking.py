@@ -253,6 +253,27 @@ def date_window(
     raise ValueError(f"BAD_WHEN: when must be one of {', '.join(WHEN_VALUES)}.")
 
 
+def pinned_calendar_date(asked: date | None, now_local: datetime, pinned: date | None,
+                         horizon_days: int, real_today: date | None = None) -> date | None:
+    """A day the agent named, moved onto the pinned demo calendar (BOOKING_TODAY_OVERRIDE).
+
+    The agent turns "Thursday afternoon" into a date from the real calendar (its prompt knows today's
+    real date), but the demo's openings exist only around the pinned day, so it found nothing (demo
+    call 2026-10-20). A date inside the pinned calendar is kept; a real-calendar date keeps its day of
+    the week and its distance from today ("this Thursday" -> the first Thursday of the pinned
+    calendar, "next Tuesday" a week later). Without a pinned day (production) nothing changes.
+    """
+    if asked is None or pinned is None:
+        return asked
+    if pinned <= asked <= pinned + timedelta(days=horizon_days):
+        return asked
+    real_today = real_today or datetime.now(now_local.tzinfo).date()
+    if asked < real_today:
+        return asked  # a real past day stays past (PAST_DATE)
+    moved = pinned + timedelta(days=(asked - real_today).days)
+    return moved + timedelta(days=(asked.weekday() - moved.weekday()) % 7)
+
+
 def _spoken_date(value: date) -> str:
     return value.strftime("%A, %B %d").replace(" 0", " ")
 
@@ -402,6 +423,9 @@ def find_slots(
     with transaction() as conn:
         context = load_context(conn, lead_id, location_name=location_name,
                                case_type_name=case_type_name, settings=settings)
+        specific_date = pinned_calendar_date(specific_date, context.now_local,
+                                             settings.booking_today_override,
+                                             settings.booking_horizon_days)
         start, end = date_window(when, context.now_local, settings.booking_horizon_days,
                                  specific_date)
         pool = context.clinicians
