@@ -2172,3 +2172,11 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
 - Keap pelvic Booked tag: the Sheet's gender wins; without it the Stride patient's gender is used (a patient only
   Stride knows). "Other" gets the male tag until Emma decides (owner, 2026-10-20).
 - The Sheet profile fingerprint only includes Gender when it is filled, so adding the column re-syncs nothing.
+
+### 2026-10-20 — Sheet Restart on a finished cadence; clean DB test runs
+- "Restart cadence" on a row whose Outcome Status is "Cadence completed" now runs (staff had to clear the
+  cell first). It runs only when the row's last stored request was not itself a Restart
+  (`sheet_direct.restart_reruns`, one lookup per poll), so a finished *restarted* cadence never restarts
+  itself again. A second restart of the same row still needs Outcome Status cleared, as before.
+- `test_number_block_integration`: the two Administration tests act for their own practice (dependency
+  override) instead of needing practice id 1; the full suite now passes on a fresh test database.

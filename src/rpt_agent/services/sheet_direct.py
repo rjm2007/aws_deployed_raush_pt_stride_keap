@@ -159,7 +159,30 @@ def command_of(row: SheetRow) -> tuple[str, str] | None:
     return COMMANDS.get(" ".join(row.get("action").split()))
 
 
-def needs_processing(row: SheetRow, command: tuple[str, str]) -> bool:
+def restart_reruns(rows) -> set[int]:
+    """Rows where staff chose Restart cadence on a cadence that has ended ("Cadence completed").
+
+    Runs only when the cadence that ended was not itself started by this Restart (the row's last
+    request was a Start, or none is stored): otherwise every finished restart would restart itself
+    again, forever. One lookup per poll, only for these rows. Owner request 2026-10-20: staff had to
+    clear Outcome Status before such a Restart did anything.
+    """
+    candidates = {row.number: row.get("action_request_id") for row in rows
+                  if (command_of(row) or ("", ""))[1] == "restart_cadence"
+                  and row.get("outcome_status").strip().casefold() == "cadence completed"}
+    if not candidates:
+        return set()
+    ids = [rid for rid in candidates.values() if _is_uuid(rid)]
+    restarts: set[str] = set()
+    if ids:
+        with transaction() as conn:
+            restarts = {r["request_id"] for r in conn.execute(
+                "select request_id::text as request_id from lead_action_requests "
+                "where request_id=any(%s::uuid[]) and action='restart_cadence'", (ids,))}
+    return {number for number, rid in candidates.items() if rid not in restarts}
+
+
+def needs_processing(row: SheetRow, command: tuple[str, str], reruns: set[int] | None = None) -> bool:
     """The n8n "Action Needs Processing?" rules (live 2026-10-13), plus one fix.
 
     Fix: a Start cadence row that failed before it got a Lead ID can be re-run by clearing
@@ -181,8 +204,9 @@ def needs_processing(row: SheetRow, command: tuple[str, str]) -> bool:
     if action == "start_cadence" and status in {"cadence started", "already in cadence",
                                                 "cadence completed"}:
         return False
-    return not (action == "restart_cadence" and status in {"cadence restarted",
-                                                           "cadence completed"})
+    if action == "restart_cadence" and status == "cadence completed":
+        return row.number in (reruns or set())
+    return not (action == "restart_cadence" and status == "cadence restarted")
 
 
 def _readable(error: ValidationError) -> str:
@@ -345,9 +369,10 @@ def claim_commands(grid: SheetGrid, trace: WorkflowTrace, *, settle: Settle | No
     """
     claims = []
     waiting: set[int] = set()
+    reruns = restart_reruns(grid.rows)
     for row in grid.rows:
         command = command_of(row)
-        if not command or not needs_processing(row, command):
+        if not command or not needs_processing(row, command, reruns):
             continue
         waiting.add(row.number)
         if settle is not None and not settle.ready(row, now):
@@ -627,10 +652,10 @@ def _lead_status(row: SheetRow, sheet: dict[str, Any]) -> str:
 # --- narrow polls and the nightly archive -----------------------------------------------------
 
 
-def needs_attention(row: SheetRow) -> bool:
+def needs_attention(row: SheetRow, reruns: set[int] | None = None) -> bool:
     """From the scanned columns alone: a command to run, or one left in progress."""
     command = command_of(row)
-    if command and needs_processing(row, command):
+    if command and needs_processing(row, command, reruns):
         return True
     status = row.get("outcome_status")
     return status.casefold().startswith("processing: ") or bool(RETRYING.match(status))
@@ -644,7 +669,8 @@ ARCHIVE_LEAD_STATUSES = ["booked", "do_not_contact", "declined", "closed_no_resp
 
 def archive_candidates(grid: SheetGrid, days: int) -> list[SheetRow]:
     """Rows whose lead is finished (by the database, not the Sheet text) and quiet for `days`."""
-    rows = [r for r in grid.rows if _is_uuid(r.get("lead_id")) and not needs_attention(r)]
+    reruns = restart_reruns(grid.rows)
+    rows = [r for r in grid.rows if _is_uuid(r.get("lead_id")) and not needs_attention(r, reruns)]
     if not rows:
         return []
     with transaction() as conn:
@@ -707,9 +733,10 @@ def preview(grid: SheetGrid, stuck_seconds: int) -> dict[str, Any]:
     """What the next poll would do, without doing it. Row numbers and command names only."""
     pending, invalid, stuck = [], [], []
     now = _now()
+    reruns = restart_reruns(grid.rows)
     for row in grid.rows:
         command = command_of(row)
-        if command and needs_processing(row, command):
+        if command and needs_processing(row, command, reruns):
             _, error = build_action(row, command[1])
             (invalid if error else pending).append({"row": row.number, "action": command[0],
                                                     **({"error": error} if error else {})})

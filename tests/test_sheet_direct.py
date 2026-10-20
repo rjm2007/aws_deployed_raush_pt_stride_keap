@@ -74,6 +74,7 @@ def test_started_at_reads_our_iso_text_and_n8n_pacific_date_serials():
     ("Start cadence", "Cadence started", {}, False),
     ("Restart cadence", "", {"lead_id": "x"}, True),
     ("Restart cadence", "Cadence restarted", {"lead_id": "x"}, False),
+    ("Restart cadence", "Cadence completed", {"lead_id": "x"}, False),  # only via restart_reruns
     ("Restart cadence", "Cadence started", {"lead_id": "x"}, True),
     ("Restart cadence", "Processing: Restart cadence", {"lead_id": "x"}, False),
     ("Restart cadence", "Retrying 1/3: Restart cadence", {"lead_id": "x"}, False),
@@ -250,3 +251,10 @@ def test_an_unknown_sheet_gender_is_an_error_for_the_row():
 
     with pytest.raises(ValidationError, match="Gender must be M, F or Other"):
         SheetLeadInput(phone="5555550101", gender="X")
+
+
+def test_a_restart_on_a_finished_cadence_runs_only_when_restart_reruns_names_the_row():
+    row = _row(name="Asha Rao", action="Restart cadence", outcome_status="Cadence completed", lead_id="x")
+    command = command_of(row)
+    assert needs_processing(row, command) is False
+    assert needs_processing(row, command, {row.number}) is True
