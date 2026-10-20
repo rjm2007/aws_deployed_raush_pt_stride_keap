@@ -3,6 +3,8 @@
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from rpt_agent.services.keap_desired import (
     compute_desired,
     desired_hash,
@@ -125,6 +127,68 @@ def test_cancel_keeps_booked_when_the_setting_is_off():
             settings={"keap_remove_booked_on_cancel": False}).desired
     assert "180" in d["tags"]
     assert d["fields"]["6"]["value"] is None  # a cancelled visit never fills the date
+
+
+PELVIC = {"stride_appointment_type_id": 5, "booked_tag_id": "190", "male_booked_tag_id": "192",
+          "completed_tag_id": "194", "date_field_id": "6", "time_field_id": "8",
+          "clinician_field_id": "10"}
+
+
+def test_pelvic_booking_tag_follows_the_patients_sex():
+    mapping = [*MAPPING, PELVIC]
+    female = run(lead(), patient(gender="F"), appts=[appt(5)], mapping=mapping).desired
+    male = run(lead(), patient(gender="Male"), appts=[appt(5)], mapping=mapping).desired
+    done = run(lead(), patient(gender="M"), appts=[appt(5, days=-1, status="Checked In")],
+               mapping=mapping).desired
+    assert female["tags"] == ["190"]
+    assert male["tags"] == ["192"]
+    assert done["tags"] == ["192", "194"]  # one Completed tag for both
+    assert {"190", "192", "194"} <= set(male["owned_tags"])  # a cancel removes either one
+    # Types without a male tag stay one tag for everyone.
+    assert run(lead(), patient(gender="M"), appts=[appt(2)]).desired["tags"] == ["180"]
+
+
+# The sandbox mapping (supabase/dev/keap_sandbox_mapping.sql), Keap admin's tag list 2026-10-20.
+def _row(type_id, booked, done=None, male=None):
+    return {"stride_appointment_type_id": type_id, "booked_tag_id": booked,
+            "male_booked_tag_id": male, "completed_tag_id": done,
+            "date_field_id": "6", "time_field_id": "8", "clinician_field_id": "10"}
+
+
+# Initial Evaluation (2), Progress Note / POC (3) and Re-Evaluation (4) are not handled for now
+# (client, 2026-10-20).
+SANDBOX = [_row(1, "184", "176"), _row(5, "166", "164"), _row(6, "162", "158", male="160")]
+
+
+@pytest.mark.parametrize(("type_id", "gender", "booked", "completed"), [
+    (1, "F", "184", "176"),   # PT Appt Booked / PT Appt Completed
+    (5, "M", "166", "164"),   # PT Premium Appt Booked / Completed (same tag for both sexes)
+    (6, "F", "162", "158"),   # Pelvic Appt Booked - Female / Pelvic Appt Completed
+    (6, "M", "160", "158"),   # Pelvic Appt Booked - Male / Pelvic Appt Completed
+])
+def test_every_admin_tag_on_book_complete_and_cancel(type_id, gender, booked, completed):
+    def tags(status, days=2):
+        return run(lead(), patient(gender=gender), appts=[appt(type_id, days=days, status=status)],
+                   mapping=SANDBOX).desired["tags"]
+
+    assert run(lead(), patient(gender=gender), mapping=SANDBOX).desired["tags"] == [PENDING]
+    assert tags("Unmarked") == [booked]
+    assert tags("Checked In", days=-1) == sorted([booked, completed])
+    assert tags("Cancel") == [PENDING]
+
+
+@pytest.mark.parametrize("type_id", [2, 3, 4])
+def test_evaluation_re_evaluation_and_poc_get_no_keap_tag(type_id):
+    for status, days in (("Unmarked", 2), ("Checked In", -1)):
+        d = run(lead(), patient(gender="F"), appts=[appt(type_id, days=days, status=status)],
+                mapping=SANDBOX).desired
+        assert d["tags"] == [PENDING]  # ignored entirely: no Booked, no Completed
+        assert not {"180", "172", "178", "174", "156"} & set(d["owned_tags"])
+
+
+def test_unknown_gender_on_a_pelvic_booking_gets_the_default_tag():
+    d = run(lead(), patient(gender=None), appts=[appt(6)], mapping=SANDBOX).desired
+    assert d["tags"] == ["162"]
 
 
 def test_deleted_appointment_counts_as_cancelled():

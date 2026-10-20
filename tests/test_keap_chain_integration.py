@@ -46,7 +46,8 @@ pytestmark = pytest.mark.integration
 LIVE = os.getenv("KEAP_LIVE_SANDBOX") == "1"
 PENDING, GAVE_UP = "144", "186"
 IE_BOOKED, IE_DONE, FU_BOOKED, FU_DONE = "180", "172", "184", "176"
-BOOKED_TAGS = {"180", "184", "174"}
+PELVIC_F, PELVIC_M, PELVIC_DONE = "162", "160", "158"
+BOOKED_TAGS = {"180", "184", "174", "166", PELVIC_F, PELVIC_M}
 FIRST_PID = 810_000
 _PHONES = itertools.count(int(uuid.uuid4().int % 9000))
 _AIDS = itertools.count(9_000_000)
@@ -117,6 +118,20 @@ def chain(request, monkeypatch, tmp_path):
             " do update set booked_tag_id=excluded.booked_tag_id,"
             "completed_tag_id=excluded.completed_tag_id,is_active=true",
             (practice, type_id, booked, done))
+    db.execute(
+        "insert into keap_appointment_types(practice_id,stride_appointment_type_id,label,"
+        "booked_tag_id,male_booked_tag_id,completed_tag_id,date_field_id,time_field_id,"
+        "clinician_field_id) values(%s,6,'Pelvic',%s,%s,%s,'6','8','10') "
+        "on conflict(practice_id,stride_appointment_type_id) do update set "
+        "booked_tag_id=excluded.booked_tag_id,male_booked_tag_id=excluded.male_booked_tag_id,"
+        "completed_tag_id=excluded.completed_tag_id,is_active=true",
+        (practice, PELVIC_F, PELVIC_M, PELVIC_DONE))
+    db.execute(
+        "insert into keap_appointment_types(practice_id,stride_appointment_type_id,label,"
+        "booked_tag_id,completed_tag_id,date_field_id,time_field_id,clinician_field_id) "
+        "values(%s,5,'PT Premium','166','164','6','8','10') "
+        "on conflict(practice_id,stride_appointment_type_id) do update set is_active=true",
+        (practice,))
     fake = FakeKeap()
     if not live:
         db.execute(
@@ -218,7 +233,7 @@ def chain(request, monkeypatch, tmp_path):
         row = appointment(str(aid), str(pid), str(pid + 5), day(offset), start, end, status,
                           modified=mod or modified(), action=action)
         row.update({"Appointment Type Id": str(type_id), "Primary Attendee Name": clinician,
-                    "Appointment Type": {1: "Follow-up", 2: "Initial Evaluation",
+                    "Appointment Type": {1: "PT", 2: "Initial Evaluation",
                                          3: "Progress Note"}.get(type_id, "Other")})
         drop("appointments", APPOINTMENT_HEADER, [row])
         return aid
@@ -447,6 +462,33 @@ def test_a_second_appointment_type_adds_its_own_tag_and_the_next_date_wins(chain
     contact = chain.contact(lead)
     assert chain.tags(contact) == {IE_BOOKED, FU_BOOKED}
     assert chain.field(contact, "6").startswith(day(2)) and chain.field(contact, "10") == "Early Clinician"
+
+
+@pytest.mark.parametrize(("type_id", "gender", "booked", "done"), [
+    (1, "F", FU_BOOKED, FU_DONE),           # PT Appt Booked / Completed
+    (5, "M", "166", "164"),                 # PT Premium Appt Booked / Completed
+    (6, "F", PELVIC_F, PELVIC_DONE),        # Pelvic Appt Booked - Female / Completed
+    (6, "M", PELVIC_M, PELVIC_DONE),        # Pelvic Appt Booked - Male / Completed
+])
+def test_pending_then_booked_then_completed_for_each_appointment_type(chain, type_id, gender,
+                                                                      booked, done):
+    name = f"Chain{chain.run}"
+    lead = chain.sheet_lead("Typed", name, email=f"typed.{chain.run}@example.test")
+    chain.keap_tick()
+    assert chain.tags(chain.contact(lead)) == {PENDING}
+    pid = chain.stride_patient("Typed", name, Gender=gender)
+    aid = chain.stride_appt(pid, 3, type_id=type_id)
+    chain.stride_tick(); chain.keap_tick()
+    assert chain.tags(chain.contact(lead)) == {booked}
+    chain.agree(lead)
+    chain.stride_appt(pid, 3, aid=aid, type_id=type_id, status="Checked In")
+    chain.stride_tick(); chain.keap_tick()
+    assert chain.tags(chain.contact(lead)) == {booked, done}
+    chain.agree(lead)
+    chain.stride_appt(pid, 3, aid=aid, type_id=type_id, status="Cancel")
+    chain.stride_tick(); chain.keap_tick()
+    assert chain.tags(chain.contact(lead)) == {PENDING}
+    chain.agree(lead)
 
 
 def test_a_walk_in_patient_who_was_never_a_lead_gets_a_contact_without_pending(chain):
