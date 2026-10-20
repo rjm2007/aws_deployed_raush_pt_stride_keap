@@ -177,8 +177,10 @@ def restart_reruns(rows) -> set[int]:
     if ids:
         with transaction() as conn:
             restarts = {r["request_id"] for r in conn.execute(
+                # Compared as text: the live databases store request_id as text, the migrations as
+                # uuid; a uuid comparison failed every Sheet poll on the demo (2026-10-21).
                 "select request_id::text as request_id from lead_action_requests "
-                "where request_id=any(%s::uuid[]) and action='restart_cadence'", (ids,))}
+                "where request_id::text=any(%s::text[]) and action='restart_cadence'", (ids,))}
     return {number for number, rid in candidates.items() if rid not in restarts}
 
 
