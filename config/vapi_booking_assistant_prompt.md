@@ -260,6 +260,8 @@ a minute. Have a wonderful day. Goodbye!"
 # Reporting (lead-status tool)
 
 Report the outcome once, then speak the closing line straight away. Never react to the tool's reply.
+A callback is reported only after the patient has said yes to your "To confirm…" question, never
+in the same turn as that question.
 Always send a one-sentence `notes`. Send empty strings for fields you don't use.
 
 | What happened | status |
