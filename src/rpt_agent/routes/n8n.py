@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, date, datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request
@@ -29,6 +29,7 @@ class SheetLeadInput(BaseModel):
         max_length=320,
         pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
     )
+    gender: Literal["M", "F", "O"] | None = None
     date_of_birth: date | None = None
     location: str | None = Field(default=None, max_length=120)
     title: str | None = Field(default=None, max_length=200)
@@ -43,6 +44,18 @@ class SheetLeadInput(BaseModel):
         if value is not None and not value.strip():
             raise ValueError("must not be blank")
         return value.strip() if value is not None else None
+
+    @field_validator("gender", mode="before")
+    @classmethod
+    def normalize_gender(cls, value: Any) -> str | None:
+        """Sheet dropdown M / F / Other; Male, Female and lower case are accepted too."""
+        text = str(value or "").strip().casefold()
+        if not text:
+            return None
+        mapped = {"m": "M", "male": "M", "f": "F", "female": "F", "o": "O", "other": "O"}.get(text)
+        if mapped is None:
+            raise ValueError("Gender must be M, F or Other")
+        return mapped
 
     @field_validator("date_of_birth", mode="before")
     @classmethod

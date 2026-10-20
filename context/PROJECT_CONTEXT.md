@@ -2165,3 +2165,18 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
 - Windows note: the `pgserver` embedded Postgres has no time-zone data, so 14 clinic-hours / Stride status
   DB tests fail there ("time zone America/Los_Angeles not recognized"); unrelated to Keap.
 - Still needed: Rausch's real Stride appointment type ids, and production Keap tag ids before production.
+
+### 2026-10-20 — Gender from the Google Sheet (built on PR #15)
+- Optional Sheet column "Gender" (dropdown M / F / Other; Male/Female/lower case accepted, anything else is a row
+  error). Stored on `leads.gender` as M/F/O (migration 047), on intake and on profile edits.
+- Keap pelvic Booked tag: the Sheet's gender wins; without it the Stride patient's gender is used (a patient only
+  Stride knows). "Other" gets the male tag until Emma decides (owner, 2026-10-20).
+- The Sheet profile fingerprint only includes Gender when it is filled, so adding the column re-syncs nothing.
+
+### 2026-10-20 — Sheet Restart on a finished cadence; clean DB test runs
+- "Restart cadence" on a row whose Outcome Status is "Cadence completed" now runs (staff had to clear the
+  cell first). It runs only when the row's last stored request was not itself a Restart
+  (`sheet_direct.restart_reruns`, one lookup per poll), so a finished *restarted* cadence never restarts
+  itself again. A second restart of the same row still needs Outcome Status cleared, as before.
+- `test_number_block_integration`: the two Administration tests act for their own practice (dependency
+  override) instead of needing practice id 1; the full suite now passes on a fresh test database.

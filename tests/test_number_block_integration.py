@@ -272,6 +272,24 @@ def test_continue_with_nothing_left_changes_nothing(db):
         "select 1 from suppressed_numbers where phone_e164=%s", (phone,)).fetchone()
 
 
+@pytest.fixture
+def as_test_practice(db):
+    """The dashboard acts for practice 1 (one clinic per deployment); here it acts for this test's
+    own practice, so the audit row has a practice to point at on any test database."""
+    import dataclasses
+
+    from starlette.requests import Request
+
+    from rpt_agent.security import require_dashboard_auth
+
+    def actor(request: Request):
+        return dataclasses.replace(require_dashboard_auth(request), practice_id=db["practice"])
+
+    app.dependency_overrides[require_dashboard_auth] = actor
+    yield
+    app.dependency_overrides.pop(require_dashboard_auth, None)
+
+
 def _admin(method, path, body=None, role="super_admin"):
     client = TestClient(app)
     headers = {"X-Dashboard-Token": "x" * 32, "X-Dashboard-User-ID": "staff-1",
@@ -279,7 +297,7 @@ def _admin(method, path, body=None, role="super_admin"):
     return client.request(method, f"/api/v1/dashboard/{path}", json=body, headers=headers)
 
 
-def test_a_number_whose_lead_was_deleted_can_be_unblocked_from_administration(db):
+def test_a_number_whose_lead_was_deleted_can_be_unblocked_from_administration(db, as_test_practice):
     # 2026-10-16: a patient said "don't call me", staff deleted the lead, and the number stayed
     # blocked with no lead page to unblock it from.
     phone = _phone()
@@ -312,7 +330,7 @@ def test_an_open_lead_must_be_unblocked_from_its_own_page(db):
     assert refused.status_code == 409 and "lead's page" in refused.json()["detail"]
 
 
-def test_unblocking_a_closed_do_not_contact_number_tells_the_sheet(db):
+def test_unblocking_a_closed_do_not_contact_number_tells_the_sheet(db, as_test_practice):
     phone = _phone()
     lead = _lead(db, phone)
     _sheet_block(db, lead, phone, datetime.now(UTC) - timedelta(days=1))

@@ -243,6 +243,46 @@ def test_a_new_row_on_a_blocked_number_goes_to_review_not_into_cadence(env):
     assert env.cell(number, "lead_status") == "Needs Review"
 
 
+def test_the_sheet_gender_is_saved_on_the_lead_and_an_edit_updates_it(env):
+    number = env.start_row(gender="Male")
+    env.tick()
+    lead_id = env.cell(number, "lead_id")
+    assert env.lead(lead_id)["gender"] == "M"
+    env.sheet.set(number, "gender", "F")
+    env.tick(full=True)
+    env.tick(full=True)  # profile edits apply on the second full read, like any other field
+    assert env.lead(lead_id)["gender"] == "F"
+
+
+def test_an_unknown_sheet_gender_is_reported_on_the_row(env):
+    number = env.start_row(gender="X")
+    env.tick()
+    assert "Gender must be M, F or Other" in env.cell(number, "outcome_status")
+
+
+def test_restart_on_a_finished_cadence_runs_once_and_never_restarts_itself(env):
+    # Owner, 2026-10-20: Restart on a "Cadence completed" row did nothing until staff cleared the cell.
+    number = env.start_row()
+    env.tick()
+    lead_id = env.cell(number, "lead_id")
+    start_request = env.cell(number, "action_request_id")
+    env.sheet.set(number, "outcome_status", "Cadence completed")  # the first cadence ended
+    env.sheet.set(number, "action", "Restart cadence")
+    env.tick()
+    assert env.cell(number, "outcome_status") == "Cadence restarted"
+    restart_request = env.cell(number, "action_request_id")
+    assert restart_request and restart_request != start_request
+    planned = env.db.execute("select count(*) as n from outreach_events where lead_id=%s and status='planned'",
+                             (lead_id,)).fetchone()["n"]
+    assert planned > 0
+    # The restarted cadence ends too: the same Restart must not run again by itself.
+    env.sheet.set(number, "outcome_status", "Cadence completed")
+    env.tick()
+    env.tick()
+    assert env.cell(number, "outcome_status") == "Cadence completed"
+    assert env.cell(number, "action_request_id") == restart_request
+
+
 def test_a_result_for_a_lead_missing_from_the_sheet_is_retried_not_lost(env):
     number = env.start_row()
     env.tick()

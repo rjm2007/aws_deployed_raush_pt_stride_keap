@@ -242,7 +242,10 @@ def compute_desired(
     # --- tags ---
     pending_tag = settings.get("keap_pending_tag_id")
     gave_up_tag = settings.get("keap_gave_up_tag_id")
-    is_male = (p.get("gender") or "").strip().lower() in {"m", "male"}
+    # The Sheet's gender wins; without it, Stride's. "Other" gets the male tag for now (owner,
+    # 2026-10-20, until Emma decides).
+    sex = (lead.get("gender") or p.get("gender") or "").strip().lower()
+    is_male = sex in {"m", "male", "o", "other"}
     tags: set[str] = set()
     for a in tag_pool:
         m = by_type[a["appointment_type_id"]]
@@ -436,7 +439,7 @@ def _load_context(conn, practice_id, rows, settings, mapping):
     leads = {
         r["id"]: dict(r)
         for r in conn.execute(
-            "select id,full_name,first_name,last_name,email,phone_e164,date_of_birth,status,"
+            "select id,full_name,first_name,last_name,email,phone_e164,date_of_birth,gender,status,"
             "is_test,exists(select 1 from leads n where n.practice_id=l.practice_id "
             " and n.phone_e164=l.phone_e164 and n.id<>l.id and n.created_at>l.created_at "
             " and " + _SAME_FIRST_NAME + ") as superseded from leads l where id=any(%s)",

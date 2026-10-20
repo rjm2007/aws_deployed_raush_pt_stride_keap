@@ -7,7 +7,7 @@ import re
 from rpt_agent.services.google_sheet import COLUMNS
 
 HEADERS = [
-    "Name", "Phone Number", "Email", "Date Of Birth", "Location", "Case", "Action", "Lead Status",
+    "Name", "Phone Number", "Email", "Gender", "Date Of Birth", "Location", "Case", "Action", "Lead Status",
     "Cadence Day", "Outcome Status", "Call Outcome", "Message Outcome", "Email Outcome",
     "Transcript Link", "Action Request ID", "Action Started At", "Lead ID",
 ]

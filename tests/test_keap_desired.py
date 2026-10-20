@@ -324,3 +324,22 @@ def test_names_are_clipped_to_the_length_keap_stores():
     d = run(lead(first_name="G" * 100, last_name="F" * 60)).desired
     assert d["contact"]["given_name"] == "G" * 40 and d["contact"]["family_name"] == "F" * 40
     assert d["match"]["given_name"] == "G" * 40 and d["match"]["family_name"] == "F" * 40
+
+
+@pytest.mark.parametrize(("sheet", "stride", "tag"), [
+    ("F", "M", "162"),     # the Sheet's gender wins over Stride's
+    ("M", "F", "160"),
+    (None, "M", "160"),    # no Sheet gender: Stride's is used (e.g. a patient only Stride knows)
+    (None, "F", "162"),
+    ("O", None, "160"),    # Other gets the male tag for now (owner, 2026-10-20)
+    (None, "O", "160"),
+    (None, None, "162"),   # nothing known: the default tag, as before
+])
+def test_pelvic_tag_uses_the_sheet_gender_first_then_stride(sheet, stride, tag):
+    d = run(lead(gender=sheet), patient(gender=stride), appts=[appt(6)], mapping=SANDBOX).desired
+    assert d["tags"] == [tag]
+
+
+def test_a_stride_only_patient_uses_the_stride_gender():
+    only_stride = patient(gender="M", preferred_email="a@example.test")
+    assert run(None, only_stride, appts=[appt(6)], mapping=SANDBOX).desired["tags"] == ["160"]

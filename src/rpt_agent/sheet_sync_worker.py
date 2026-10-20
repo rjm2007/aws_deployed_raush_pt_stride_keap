@@ -326,7 +326,8 @@ def _direct_tick(backend: SheetBackend, settings: Settings, counts: dict[str, in
             for row in scanned:
                 if row.get("lead_id"):
                     first_row.setdefault(row.get("lead_id"), row.number)
-            wanted = {row.number for row in scanned if sheet_direct.needs_attention(row)}
+            reruns = sheet_direct.restart_reruns(scanned)
+            wanted = {row.number for row in scanned if sheet_direct.needs_attention(row, reruns)}
             wanted |= {first_row[lead] for lead in _due_outbox_leads(settings) if lead in first_row}
             load_rows(backend, grid, wanted)
     except SheetLayoutError as exc:
