@@ -2186,3 +2186,9 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   (October) and found nothing. `slot_booking.pinned_calendar_date` moves a real-calendar `specific_date` onto the
   pinned calendar, same day of the week and distance from today; dates already on the pinned calendar are kept.
   No override (production) = unchanged. Tests: `tests/test_pinned_calendar.py`.
+
+### 2026-10-21 — Emma's first test feedback
+- Sheet Date Of Birth is read month first (US: 05/09/1990 = May 9); day first only when the first part is over 12.
+  Staff messages say MM/DD/YYYY. (Was the n8n day-first rule.)
+- Booking confirmation text now names the clinic ("... at our Laguna Niguel office").
+- Booking agent closing: "a confirmation text shortly", "more than ten minutes late" (was twenty).

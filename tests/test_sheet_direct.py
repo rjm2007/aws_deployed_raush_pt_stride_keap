@@ -43,9 +43,10 @@ def test_phone_rules_match_the_n8n_intake(raw, expected):
 
 
 @pytest.mark.parametrize(("raw", "expected"), [
-    ("16/01/2007", "16/01/2007"),
-    ("1/16/2007", "16/01/2007"),     # second part > 12: month first
-    ("03/04/1980", "03/04/1980"),    # ambiguous: day first (n8n rule)
+    ("16/01/2007", "16/01/2007"),    # first part > 12: day first
+    ("1/16/2007", "16/01/2007"),     # month first
+    ("03/04/1980", "04/03/1980"),    # ambiguous: month first, US (clinic, 2026-10-21): March 4
+    ("05/09/1990", "09/05/1990"),    # Emma's example: May 9
     ("1990-12-31", "31/12/1990"),
     ("1990-12-31T00:00:00", "31/12/1990"),
     ("32874", "01/01/1990"),         # a date cell read unformatted (serial number)

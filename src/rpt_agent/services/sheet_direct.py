@@ -112,7 +112,8 @@ def _serial_date(text: str) -> date | None:
 def normalize_dob(value: Any) -> str | None:
     """DD/MM/YYYY, from what staff type or a date cell (read as a serial number).
 
-    Day first when ambiguous, MM/DD only when the second part cannot be a month (n8n rule).
+    Staff type US dates, month first (clinic, 2026-10-21: "05/09/1990" is May 9). Day first only when
+    the first part cannot be a month ("16/01/2007"). Until then the n8n rule read day first.
     """
     text = str(value if value is not None else "").strip()
     if not text:
@@ -121,7 +122,7 @@ def normalize_dob(value: Any) -> str | None:
         return f"{int(m[3]):02d}/{int(m[2]):02d}/{m[1]}"
     if m := re.fullmatch(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", text):
         first, second = int(m[1]), int(m[2])
-        day, month = (second, first) if first <= 12 < second else (first, second)
+        day, month = (first, second) if second <= 12 < first else (second, first)
         if 1 <= month <= 12 and 1 <= day <= 31:
             return f"{day:02d}/{month:02d}/{m[3]}"
     if found := _serial_date(text):
@@ -239,7 +240,7 @@ def build_action(row: SheetRow, action: str) -> tuple[Any | None, str | None]:
             if not row.get(key):
                 errors.append(f"{column} is required")
         if row.get("date_of_birth") and not dob:
-            errors.append("Date Of Birth must be DD/MM/YYYY")
+            errors.append("Date Of Birth must be MM/DD/YYYY")
     email = row.get("email").lower()
     if email and not EMAIL.match(email):
         errors.append("invalid email")
@@ -562,7 +563,7 @@ def sync_profiles(grid: SheetGrid, result: PollResult, trace: WorkflowTrace,
         if not phone:
             errors.append("invalid phone number")
         if row.get("date_of_birth") and not dob:
-            errors.append("Date Of Birth must be DD/MM/YYYY or YYYY-MM-DD")
+            errors.append("Date Of Birth must be MM/DD/YYYY or YYYY-MM-DD")
         if email and not EMAIL.match(email):
             errors.append("invalid email")
         lead = None

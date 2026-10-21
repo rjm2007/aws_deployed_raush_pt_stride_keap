@@ -658,3 +658,26 @@ def test_booking_keeps_the_birthday_the_patient_confirmed_and_flags_a_difference
     env.db.execute("update leads set date_of_birth='1990-08-19' where id=%s", (lead,))
     assert dob_check(env.db, lead) is None
     assert build_sheet_snapshot(env.db, str(lead))["sheet"]["needs_review"] == ""
+
+
+def test_the_confirmation_text_names_the_clinic(env):
+    # Clinic request 2026-10-21: the booking confirmation text says where the visit is.
+    from rpt_agent.services import delivery
+
+    lead = booked_setup(env)
+    assert env.book(lead, date=DAY1, time="9 AM").startswith("BOOKED")
+    env.one("update notification_log set next_attempt_at=now() where lead_id=%s returning id", lead)
+    phone = env.one("select phone_e164 from leads where id=%s", lead)["phone_e164"]
+    sent = []
+
+    class FakeProviders:
+        settings = get_settings()
+
+        def send_sms(self, trace, to, body):
+            sent.append((to, body))
+            return f"SM{uuid4().hex[:30]}"
+
+    delivery.process_pending_integrations(WorkflowTrace("test", "test"), FakeProviders())
+    ours = [body for to, body in sent if to == phone]
+    assert len(ours) == 1
+    assert "confirmed for Tuesday, June 16 at 9:00 AM at our " in ours[0] and " office." in ours[0]

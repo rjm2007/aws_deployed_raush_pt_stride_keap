@@ -45,10 +45,11 @@ def process_pending_integrations(
         )
         notifications = conn.execute(
             "select n.id,n.lead_id,n.appointment_id,n.notification_type,n.payload,n.attempts,"
-            "l.phone_e164,l.first_name,a.start_utc,"
+            "l.phone_e164,l.first_name,a.start_utc,bl.name as location_name,"
             "coalesce(ps.stride_location_timezone,l.timezone,'America/Los_Angeles') "
             "as stride_location_timezone from notification_log n join leads l on l.id=n.lead_id "
             "left join appointments a on a.id=n.appointment_id "
+            "left join booking_locations bl on bl.id=a.booking_location_id "
             "join practice_settings ps on ps.practice_id=l.practice_id "
             "where n.status='queued' and n.next_attempt_at<=now() "
             "and not l.sms_opt_out and not exists("
@@ -97,8 +98,10 @@ def process_pending_integrations(
                     ZoneInfo(row["stride_location_timezone"])
                 )
                 when = local_start.strftime("%A, %B %d at %I:%M %p").replace(" 0", " ")
+                # Clinic asked for the location in the text (2026-10-21).
+                where = f" at our {row['location_name']} office" if row.get("location_name") else ""
                 body = (
-                    f"{greeting}your Rausch PT appointment is confirmed for {when}. "
+                    f"{greeting}your Rausch PT appointment is confirmed for {when}{where}. "
                     "Call 949-276-5401 with questions. Reply STOP to opt out."
                 )
             sid = providers.send_sms(trace, row["phone_e164"], body)
