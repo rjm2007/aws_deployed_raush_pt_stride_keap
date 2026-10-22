@@ -169,8 +169,9 @@ SHEET_TEXTS_OFF = "Calls only (texts off)"
 
 
 def sheet_open_status(code: str | None, details: dict | None) -> str:
-    """Outcome Status while a review is open. Each contains "needs review", which the Sheet
-    worker reads as "no command to run on this row" (sheet_direct.needs_processing)."""
+    """Outcome Status while a review is open. Each starts "Needs review" (or "Number blocked;
+    needs review"): the Sheet worker then runs only Booked / Do Not Contact on the row, and keeps a
+    Restart waiting until the review is resolved (sheet_direct.needs_processing / parked)."""
     group = group_of(code)
     if code == "number_blocked":
         return "Number blocked; needs review"  # the words the Start command already writes

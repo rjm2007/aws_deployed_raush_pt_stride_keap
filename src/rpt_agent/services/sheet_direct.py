@@ -73,6 +73,19 @@ REVIEW_LABELS = {
 PHONE_CHANGED_LABELS = {"phone_changed_closed": ("Phone changed: add a new row", "Closed")}
 FINAL_STATUSES = {"booked", "already booked", "do not contact applied", "completed",
                   "lead already exists"}
+# On a row in review, Booked and Do Not Contact still run: they end the lead whatever the review was
+# about, and the backend closes the review as "booked" / "do_not_contact" (as the dashboard's Booked
+# move and Do not contact switch do). QA 2026-10-22: a Booked typed on a "Needs review: wrong number"
+# row was ignored without a word. Start / Restart would skip the decision the review asks for.
+REVIEW_ENDING = {"booked", "do_not_contact"}
+# Added to the review text when staff pick Restart cadence on a row in review. The Restart is kept
+# and runs once the review is resolved on the dashboard (the Resolved text is not final).
+REVIEW_FIRST = "; resolve it on the dashboard first, then the restart runs"
+# A dashboard decision that ends the lead (close, front desk, booking link, Booked, Do not contact) is
+# newer than the parked Restart and wins (tester 2026-10-22: "Front desk will handle", then the
+# Restart ran two minutes later and calls started again). The row says the Restart was dropped.
+NOT_RUN = "; the Restart in Action was not run"
+ENDED_LEAD_STATUSES = {"Closed", "Booked", "Do not outreach"}
 RETRYING = re.compile(r"^retrying ([12])/3: ", re.IGNORECASE)
 PROFILE = ("name", "phone", "email", "date_of_birth", "location", "case")
 FIELD_COLUMNS = {"full_name": "Name", "phone": "Phone Number", "email": "Email", "gender": "Gender",
@@ -162,6 +175,31 @@ def command_of(row: SheetRow) -> tuple[str, str] | None:
     return COMMANDS.get(" ".join(row.get("action").split()))
 
 
+def open_review_text(status: str) -> bool:
+    """An Outcome Status this backend writes for an open review (lead_review.sheet_open_status).
+
+    Older n8n texts ("Phone number changed; needs review") are left out on purpose: those rows
+    can still hold the stale Booked that n8n re-sent (2026-10-13), so they keep blocking everything.
+    """
+    text = status.strip().casefold()
+    return text.startswith(("needs review", "number blocked; needs review"))
+
+
+def _restart_ran(rows) -> set[int]:
+    """Rows whose Action Request ID is a stored Restart cadence: that Restart already ran here."""
+    ids = {row.number: row.get("action_request_id") for row in rows}
+    wanted = [rid for rid in ids.values() if _is_uuid(rid)]
+    if not wanted:
+        return set()
+    with transaction() as conn:
+        restarts = {r["request_id"] for r in conn.execute(
+            # Compared as text: the live databases store request_id as text, the migrations as
+            # uuid; a uuid comparison failed every Sheet poll on the demo (2026-10-21).
+            "select request_id::text as request_id from lead_action_requests "
+            "where request_id::text=any(%s::text[]) and action='restart_cadence'", (wanted,))}
+    return {number for number, rid in ids.items() if rid in restarts}
+
+
 def restart_reruns(rows) -> set[int]:
     """Rows where staff chose Restart cadence on a cadence that has ended ("Cadence completed").
 
@@ -170,21 +208,46 @@ def restart_reruns(rows) -> set[int]:
     again, forever. One lookup per poll, only for these rows. Owner request 2026-10-20: staff had to
     clear Outcome Status before such a Restart did anything.
     """
-    candidates = {row.number: row.get("action_request_id") for row in rows
-                  if (command_of(row) or ("", ""))[1] == "restart_cadence"
-                  and row.get("outcome_status").strip().casefold() == "cadence completed"}
+    candidates = [row for row in rows if (command_of(row) or ("", ""))[1] == "restart_cadence"
+                  and row.get("outcome_status").strip().casefold() == "cadence completed"]
     if not candidates:
         return set()
-    ids = [rid for rid in candidates.values() if _is_uuid(rid)]
-    restarts: set[str] = set()
-    if ids:
-        with transaction() as conn:
-            restarts = {r["request_id"] for r in conn.execute(
-                # Compared as text: the live databases store request_id as text, the migrations as
-                # uuid; a uuid comparison failed every Sheet poll on the demo (2026-10-21).
-                "select request_id::text as request_id from lead_action_requests "
-                "where request_id::text=any(%s::text[]) and action='restart_cadence'", (ids,))}
-    return {number for number, rid in candidates.items() if rid not in restarts}
+    ran = _restart_ran(candidates)
+    return {row.number for row in candidates if row.number not in ran}
+
+
+def parked(row: SheetRow) -> bool:
+    """Restart cadence on a row in review: staff typed it, and it waits until the review is resolved.
+
+    Typed, because the backend never leaves a Restart next to a review text it writes: a flag turns
+    a Restart already run into "Start cadence" (`_show_review`, `_write_outcome`), as a resolution
+    does. Not the row's Action Request ID: after a Restart ran once it still names that Restart, and
+    a Restart typed on the next review was taken for the old one and lost (tester 2026-10-22).
+    """
+    return ((command_of(row) or ("", ""))[1] == "restart_cadence"
+            and open_review_text(row.get("outcome_status")))
+
+
+def _hinted(row: SheetRow) -> bool:
+    return row.get("outcome_status").casefold().endswith(REVIEW_FIRST.casefold())
+
+
+def _hint_due(row: SheetRow) -> bool:
+    """A parked Restart whose row does not say yet that it waits for the review."""
+    return parked(row) and not _hinted(row)
+
+
+def _hint_stale(row: SheetRow) -> bool:
+    """The row still says a Restart waits, but staff took it out of Action."""
+    return _hinted(row) and not parked(row)
+
+
+def _with_hint(status: str, is_parked: bool) -> str:
+    """A review text written over a parked Restart keeps saying the Restart waits."""
+    if is_parked and open_review_text(status) and not status.casefold().endswith(
+            REVIEW_FIRST.casefold()):
+        return status + REVIEW_FIRST
+    return status
 
 
 def needs_processing(row: SheetRow, command: tuple[str, str], reruns: set[int] | None = None) -> bool:
@@ -193,6 +256,8 @@ def needs_processing(row: SheetRow, command: tuple[str, str], reruns: set[int] |
     Fix: a Start cadence row that failed before it got a Lead ID can be re-run by clearing
     Outcome Status (n8n also demanded clearing Action Request ID, so staff got stuck);
     `_start_row_already_done` makes that re-run safe.
+    Review (2026-10-22): Booked and Do Not Contact run on a row in review (REVIEW_ENDING); Start and
+    Restart do not (a Restart is `parked` until the review is resolved).
     """
     _, action = command
     status = row.get("outcome_status").casefold()
@@ -202,8 +267,10 @@ def needs_processing(row: SheetRow, command: tuple[str, str], reruns: set[int] |
         return True
     if status.endswith(" in dashboard"):
         return action != "do_not_contact"
-    if status.startswith(("processing:", "retrying ", "error:")) or "needs review" in status:
+    if status.startswith(("processing:", "retrying ", "error:")):
         return False
+    if "needs review" in status:
+        return action in REVIEW_ENDING and open_review_text(status)
     if status in FINAL_STATUSES:
         return False
     if action == "start_cadence" and status in {"cadence started", "already in cadence",
@@ -377,11 +444,22 @@ def claim_commands(grid: SheetGrid, trace: WorkflowTrace, *, settle: Settle | No
     waiting: set[int] = set()
     reruns = restart_reruns(grid.rows)
     for row in grid.rows:
+        if _hint_stale(row):
+            grid.set(row, "outcome_status", row.get("outcome_status")[:-len(REVIEW_FIRST)])
         command = command_of(row)
-        if not command or not needs_processing(row, command, reruns):
+        if not command:
+            continue
+        hint = _hint_due(row)
+        if not hint and not needs_processing(row, command, reruns):
             continue
         waiting.add(row.number)
         if settle is not None and not settle.ready(row, now):
+            continue
+        if hint:
+            # A Restart picked on a row in review used to be ignored without a word (QA
+            # 2026-10-22). It still waits for the review; the row now says so, and keeps it.
+            grid.set(row, "outcome_status", _with_hint(row.get("outcome_status"), True))
+            trace.log("sheet_command_waits_for_review", row=row.number, action=command[1])
             continue
         if limit is not None and len(claims) >= limit:
             continue
@@ -516,6 +594,10 @@ def _write_outcome(grid: SheetGrid, row: SheetRow, outcome: Outcome,
     if outcome.lead_status:
         grid.set(row, "lead_status", outcome.lead_status)
     grid.set(row, "outcome_status", outcome.status)
+    # A Restart that ended in a review ("Number blocked; needs review") has run: next to that text
+    # it would read as a Restart staff typed (`parked`), so the cell gets "Start cadence".
+    if open_review_text(outcome.status) and (command_of(row) or ("", ""))[1] == "restart_cadence":
+        grid.set(row, "action", "Start cadence")
     # A new lead starts from the row as it is: no profile "change" to send next poll. Other
     # commands leave the fingerprint alone, so a profile edit made with them still syncs.
     if result is not None and lead_id and _is_uuid(lead_id) and not outcome.status.startswith(
@@ -597,12 +679,15 @@ def sync_profiles(grid: SheetGrid, result: PollResult, trace: WorkflowTrace,
             code = (synced.body or {}).get("code")
             if code in REVIEW_LABELS:
                 grid.set(row, "lead_status", "Needs Review")
-                grid.set(row, "outcome_status", REVIEW_LABELS[code])
+                _show_review(grid, row, REVIEW_LABELS[code], pending=_command_pending(row),
+                             is_parked=parked(row))
             elif code in PHONE_CHANGED_LABELS:
                 outcome_status, lead_status = PHONE_CHANGED_LABELS[code]
                 grid.set(row, "lead_status", lead_status)
                 if not _command_pending(row):  # a command staff just typed runs (and is refused)
-                    grid.set(row, "outcome_status", outcome_status)
+                    # The lead is closed: a Restart waiting for a review goes, and the row says so.
+                    grid.set(row, "outcome_status",
+                             outcome_status + (NOT_RUN if parked(row) else ""))
                     grid.set(row, "action", "Start cadence")
             elif synced.status_code >= 400:
                 detail = synced.body.get("detail") if isinstance(synced.body.get("detail"), str) \
@@ -657,24 +742,61 @@ def apply_snapshot(grid: SheetGrid, snapshot: dict[str, Any]) -> bool:
     if row is None:
         return False
     sheet = snapshot.get("sheet") or {}
+    # What staff typed is judged on the row as it is now, before this snapshot writes into it.
+    pending = _command_pending(row)
+    waits = not pending and parked(row)
     for key in ALWAYS_WRITTEN:
         if key in sheet:
             grid.set(row, key, sheet[key] or "")
+    if waits and sheet.get("lead_status") in ENDED_LEAD_STATUSES:
+        _drop_parked(grid, row, sheet)
+        grid.set(row, "lead_status", _lead_status(row, sheet))
+        return True
     if "action_status" in sheet:
-        grid.set(row, "outcome_status", sheet["action_status"] or "")
+        grid.set(row, "outcome_status", _with_hint(sheet["action_status"] or "", waits))
     # Review flagged / resolved (services/lead_review.py). Never over a command staff typed and the
     # Sheet worker has not run yet (still settling, or waiting) or one still running: QA 2026-10-22,
     # "Start cadence" overwrote a Booked typed seconds earlier, and a new "Needs review" text would
     # block it. The command's own result is written when it runs.
-    if sheet.get("review_status") and not _command_pending(row):
-        grid.set(row, "outcome_status", sheet["review_status"])
-        if sheet.get("review_action"):
+    if sheet.get("review_status") and not pending:
+        if open_review_text(sheet["review_status"]):
+            _show_review(grid, row, sheet["review_status"], pending=pending, is_parked=waits)
+        else:
+            grid.set(row, "outcome_status", sheet["review_status"])
+        # A Restart parked behind the review keeps its cell: with the Resolved text it now runs.
+        if sheet.get("review_action") and not waits:
             grid.set(row, "action", sheet["review_action"])
-    # n8n never wrote this (spec F.3); the backend sends it to stop a stale command re-running.
-    if "action" in sheet:
+    # n8n never wrote this (spec F.3); the backend sends it to stop a stale command re-running
+    # ("Booked" once booked, "" after a Stride cancel). Only over a cell no command is waiting in:
+    # QA 2026-10-22, a Booked staff typed was replaced before it ran and the lead was never booked.
+    if "action" in sheet and not pending and not waits:
         grid.set(row, "action", sheet["action"] or "")
     grid.set(row, "lead_status", _lead_status(row, sheet))
     return True
+
+
+def _show_review(grid: SheetGrid, row: SheetRow, text: str, *, pending: bool,
+                 is_parked: bool) -> None:
+    """Write an open review's text (pending / is_parked: the row before this write).
+
+    A Restart left in Action from before the review (it ran from the Sheet, or the dashboard wrote
+    it with "Cadence restarted") becomes "Start cadence", as a resolution does: next to the review
+    text it would read as a Restart staff just picked, wait for the review, and run once resolved.
+    """
+    stale = (not pending and not is_parked
+             and (command_of(row) or ("", ""))[1] == "restart_cadence")
+    grid.set(row, "outcome_status", _with_hint(text, is_parked))
+    if stale:
+        grid.set(row, "action", "Start cadence")
+
+
+def _drop_parked(grid: SheetGrid, row: SheetRow, sheet: dict[str, Any]) -> None:
+    """The lead ended on the dashboard (or by Stride) while a Restart waited: the Restart goes."""
+    text = sheet.get("review_status") or sheet.get("action_status") or sheet.get("lead_status") or ""
+    if text.strip().casefold() not in FINAL_STATUSES:  # "Booked" stays exactly that (final)
+        text += NOT_RUN
+    grid.set(row, "outcome_status", text)
+    grid.set(row, "action", sheet.get("action") or sheet.get("review_action") or "Start cadence")
 
 
 def _in_progress(status: str) -> bool:
@@ -712,7 +834,9 @@ def _lead_status(row: SheetRow, sheet: dict[str, Any]) -> str:
 def needs_attention(row: SheetRow, reruns: set[int] | None = None) -> bool:
     """From the scanned columns alone: a command to run, or one left in progress."""
     command = command_of(row)
-    if command and needs_processing(row, command, reruns):
+    if command and (needs_processing(row, command, reruns) or _hint_due(row)):
+        return True
+    if _hint_stale(row):
         return True
     status = row.get("outcome_status")
     return status.casefold().startswith("processing: ") or bool(RETRYING.match(status))

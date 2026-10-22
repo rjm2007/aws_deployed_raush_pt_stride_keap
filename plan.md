@@ -252,6 +252,17 @@ states and inbound replies. These endpoints update Supabase first; they never ca
    dashboard", "Cadence restarted in dashboard") is written by AWS when an admin unblocks a number. Such a row
    is processed unless Action still reads Do Not Contact, so the stale command cannot block the patient again
    while a changed Action (Restart cadence, Booked) still goes through.
+   Direct mode, a row in review (2026-10-22; Outcome Status "Needs review: ..." or "Number blocked; needs
+   review"): Booked and Do Not Contact run as on any row and close the review ("booked" / "do_not_contact").
+   Restart cadence does not run past the review: the row gets "<review text>; resolve it on the dashboard
+   first, then the restart runs", the Action cell is kept, and the Restart runs once the review is resolved.
+   If the dashboard ends the lead instead (close, front desk, booking link, Booked, Do not contact, or Stride
+   books it), that newer decision wins: the Restart is dropped, Action is reset, and Outcome Status says
+   "<result>; the Restart in Action was not run" (a final "Booked" / "Do Not Contact applied" stays as is).
+   Clearing Action removes the "resolve it on the dashboard first" words on the next poll.
+   Start cadence on a linked row is never a command (as before). The backend never writes Action
+   (resolution "Start cadence", "Booked", "" after a Stride cancel) over a command staff typed that has
+   not run yet. Old n8n texts ("Phone number changed; needs review") still block every command.
 3. Normalize phone and DOB. Accept a one-word Name and any non-empty Case.
 4. Generate one Action Request ID.
 5. Using the trigger `row_number`, write `Processing: <Action>`, Action Request ID, and Action Started At to

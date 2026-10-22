@@ -2234,3 +2234,25 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   258). Migration 049 adds the column for fresh databases; the live demo DB already has it (no-op there).
   Demo-only (production has no booking engine).
 - The BOOKED tool reply says "more than 10 minutes late", matching the booking prompt.
+
+### 2026-10-22 — Sheet: commands typed on a row in review
+- QA (row "QA Actionkeep"): a Booked typed on a "Needs review: wrong number" row was ignored without a word, and
+  resolving "Number is right" then wrote "Start cadence" over it: the lead was never booked and calls restarted.
+- Direct mode: on a row whose Outcome Status is a review text this backend writes ("Needs review: ...",
+  "Number blocked; needs review"), Booked and Do Not Contact run as on any row; the backend closes the review
+  ("booked" / "do_not_contact"), as the board's Booked move and the Do not contact switch do. Old n8n texts
+  ("Phone number changed; needs review") still block every command (stale Booked, 2026-10-13).
+- Restart cadence on such a row still waits for the review. The row now says
+  "<review text>; resolve it on the dashboard first, then the restart runs" and keeps the Action; once the review
+  is resolved the Restart runs (10-minute cooldown and refusals unchanged). The backend never leaves a
+  Restart next to a review text it writes (a flag, or a Restart that ends in "Number blocked; needs review",
+  turns it into "Start cadence"), so a Restart there was typed by staff. Not judged by the row's Action
+  Request ID: after one parked Restart ran, it still named that Restart, and a Restart typed on the next
+  review was lost (tester, same day).
+- A parked Restart is dropped when the dashboard ends the lead (close choices, front desk, booking link, board
+  Booked, Do not contact, Stride booking): Outcome Status "<result>; the Restart in Action was not run" (a final
+  "Booked" / "Do Not Contact applied" stays as is), Action reset. Clearing Action removes the waiting words.
+- `apply_snapshot` decides on the row before it writes: Action (resolution "Start cadence", "Booked", "" after a
+  Stride cancel) is never written over a command staff typed that has not run, nor over a parked Restart.
+- Production `main` has the same rule (`sheet_direct.needs_processing`, unconditional Action write in
+  `apply_snapshot`); not ported. Tests: `test_sheet_direct.py`, `test_lead_review_integration.py`.

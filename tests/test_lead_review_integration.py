@@ -23,6 +23,7 @@ from rpt_agent.config import get_settings
 from rpt_agent.observability import WorkflowTrace
 from rpt_agent.services.delivery import apply_twilio_message_status
 from rpt_agent.services.lead_status import report_lead_status
+from rpt_agent.services.sheet_direct import REVIEW_FIRST
 from rpt_agent.worker import CLAIM_SQL, run_safety_checks
 
 pytestmark = pytest.mark.integration
@@ -335,6 +336,165 @@ def test_wrong_person_number_is_right_continues(review_env):
     lead = senv.lead(lead_id)
     assert (lead["status"], lead["cadence_state"], lead["needs_review"]) == ("in_progress", "active", False)
     assert any(e["status"] == "planned" for e in _events(senv, lead_id))
+
+
+def test_booked_typed_on_a_flagged_row_books_and_closes_the_review(review_env):
+    # QA 2026-10-22 (row "QA Actionkeep"): Booked on a "Needs review: wrong number" row was ignored.
+    senv = review_env
+    number, lead_id = _started(senv)
+    _wrong_person(senv, lead_id)
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == "Needs review: wrong number"
+    senv.sheet.set(number, "action", "Booked")
+    senv.tick()
+    senv.tick()
+    lead = senv.lead(lead_id)
+    assert (lead["status"], lead["needs_review"]) == ("booked", False)
+    [review] = _reviews(senv, lead_id)
+    assert review["resolved_at"] is not None and review["resolution"] == "booked"
+    assert review["resolved_by_name"] == "Google Sheet"
+    assert senv.cell(number, "outcome_status") == "Booked"
+    assert (senv.cell(number, "action"), senv.cell(number, "lead_status")) == ("Booked", "Booked")
+    assert not any(e["status"] == "planned" for e in _events(senv, lead_id))
+    assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 409
+
+
+def test_do_not_contact_typed_on_a_flagged_row_blocks_the_number_and_closes_the_review(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    _wrong_person(senv, lead_id)
+    senv.tick()
+    senv.sheet.set(number, "action", "Do Not Contact")
+    senv.tick()
+    senv.tick()
+    lead = senv.lead(lead_id)
+    assert (lead["status"], lead["needs_review"]) == ("do_not_contact", False)
+    [review] = _reviews(senv, lead_id)
+    assert review["resolution"] == "do_not_contact"
+    blocked = senv.db.execute("select 1 from suppressed_numbers where phone_e164=%s",
+                              (lead["phone_e164"],)).fetchone()
+    assert blocked
+    assert senv.cell(number, "outcome_status") == "Do Not Contact applied"
+    assert senv.cell(number, "action") == "Do Not Contact"
+
+
+def test_restart_typed_on_a_flagged_row_waits_for_the_review_then_runs(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    _wrong_person(senv, lead_id)
+    senv.tick()
+    senv.sheet.set(number, "action", "Restart cadence")
+    senv.tick()
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == (
+        "Needs review: wrong number; resolve it on the dashboard first, then the restart runs")
+    assert senv.cell(number, "action") == "Restart cadence"
+    lead = senv.lead(lead_id)
+    assert (lead["status"], lead["needs_review"]) == ("invalid_phone", True)  # no bypass
+    assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 200
+    senv.tick()  # the resolution is written; the typed Restart is kept
+    assert senv.cell(number, "outcome_status") == "Resolved: number confirmed"
+    assert senv.cell(number, "action") == "Restart cadence"
+    senv.tick()  # and runs
+    assert senv.cell(number, "outcome_status") == "Cadence restarted"
+    restarts = senv.db.execute(
+        "select count(*) as n from lead_action_requests where lead_id::text=%s "
+        "and action='restart_cadence' and status='completed'", (lead_id,)).fetchone()["n"]
+    assert restarts == 1
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == "Cadence restarted"  # once
+
+
+def test_a_booked_typed_before_the_review_is_resolved_still_runs(review_env, monkeypatch):
+    # The QA repro: Booked typed, then "Number is right" resolved while the row was still settling.
+    # The resolution put "Start cadence" over the Booked; calls restarted and nothing was booked.
+    from rpt_agent import sheet_sync_worker
+
+    senv = review_env
+    number, lead_id = _started(senv)
+    _wrong_person(senv, lead_id)
+    senv.tick()
+    monkeypatch.setattr(get_settings(), "sheet_settle_seconds", 60)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(sheet_sync_worker, "_clock", lambda: clock["t"])
+    senv.sheet.set(number, "action", "Booked")
+    senv.tick()  # seen, settling
+    assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 200
+    clock["t"] += 30
+    senv.tick()  # the resolution's snapshot arrives while the Booked still settles
+    assert senv.cell(number, "action") == "Booked"
+    clock["t"] += 31
+    senv.tick()
+    assert senv.lead(lead_id)["status"] == "booked"
+    assert senv.cell(number, "outcome_status") == "Booked"
+    assert senv.cell(number, "action") == "Booked"
+
+
+def _no_cooldown(senv, lead_id):
+    senv.db.execute("update lead_status_history set changed_at=changed_at-interval '11 minutes' "
+                    "where lead_id=%s", (lead_id,))
+
+
+def _restarts(senv, lead_id):
+    return senv.db.execute(
+        "select count(*) as n from lead_action_requests where lead_id::text=%s "
+        "and action='restart_cadence' and status='completed'", (lead_id,)).fetchone()["n"]
+
+
+def test_a_restart_typed_on_the_next_review_is_not_lost(review_env):
+    # Tester 2026-10-22: after one parked Restart ran, a Restart typed on the next review showed no
+    # message and the resolution put "Start cadence" over it (the row's request ID was the old one).
+    senv = review_env
+    number, lead_id = _started(senv)
+    for round_ in (1, 2):
+        _wrong_person(senv, lead_id)
+        senv.tick()
+        assert senv.cell(number, "outcome_status") == "Needs review: wrong number"
+        assert senv.cell(number, "action") == "Start cadence"
+        senv.sheet.set(number, "action", "Restart cadence")
+        senv.tick()
+        assert senv.cell(number, "outcome_status").endswith(REVIEW_FIRST)
+        assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 200
+        _no_cooldown(senv, lead_id)
+        senv.tick()
+        assert senv.cell(number, "action") == "Restart cadence"
+        senv.tick()
+        assert senv.cell(number, "outcome_status") == "Cadence restarted"
+        assert _restarts(senv, lead_id) == round_
+
+
+@pytest.mark.parametrize("choice", ["front_desk", "wrong_number"])
+def test_a_waiting_restart_is_dropped_when_the_review_closes_the_lead(review_env, choice):
+    senv = review_env
+    number, lead_id = _started(senv)
+    _wrong_person(senv, lead_id)
+    senv.tick()
+    senv.sheet.set(number, "action", "Restart cadence")
+    senv.tick()
+    assert _post(f"review/{lead_id}/resolve", {"choice": choice}).status_code == 200
+    for _ in range(3):
+        senv.tick()
+    words = {"front_desk": "Closed: handled by front desk", "wrong_number": "Closed: wrong number"}
+    assert senv.cell(number, "outcome_status") == (
+        words[choice] + "; the Restart in Action was not run")
+    assert senv.cell(number, "action") == "Start cadence"
+    assert senv.lead(lead_id)["cadence_state"] == "terminated"
+    assert _restarts(senv, lead_id) == 0
+    assert not any(e["status"] == "planned" for e in _events(senv, lead_id))
+
+
+def test_a_waiting_restart_is_dropped_when_the_board_books_the_lead(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    _wrong_person(senv, lead_id)
+    senv.tick()
+    senv.sheet.set(number, "action", "Restart cadence")
+    senv.tick()
+    assert _post(f"leads/{lead_id}/stage", {"stage": "booked"}).status_code == 200
+    senv.tick()
+    senv.tick()
+    assert (senv.cell(number, "outcome_status"), senv.cell(number, "action")) == ("Booked", "Booked")
+    assert senv.lead(lead_id)["status"] == "booked" and _restarts(senv, lead_id) == 0
 
 
 def test_wrong_number_close(review_env):

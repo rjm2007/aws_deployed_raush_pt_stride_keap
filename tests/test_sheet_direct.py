@@ -1,13 +1,17 @@
 """Direct Google Sheet sync: the n8n rules it reimplements (no database, no network)."""
 
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 from fake_sheet import FakeSheet
 
+from rpt_agent.observability import WorkflowTrace
+from rpt_agent.services import sheet_direct
 from rpt_agent.services.google_sheet import parse_grid
 from rpt_agent.services.lead_actions import ActionExecution
 from rpt_agent.services.sheet_direct import (
+    REVIEW_FIRST,
     apply_snapshot,
     build_action,
     command_of,
@@ -85,10 +89,18 @@ def test_started_at_reads_our_iso_text_and_n8n_pacific_date_serials():
     ("Do Not Contact", "Do not contact applied", {"lead_id": "x"}, False),
     ("Do Not Contact", "Unblocked in dashboard", {"lead_id": "x"}, False),
     ("Restart cadence", "Unblocked in dashboard", {"lead_id": "x"}, True),
-    # Review texts (2026-10-22): an open review blocks every command; a resolution is written with
-    # Action "Start cadence" (never runs on a linked row), and a command staff then pick runs once.
+    # Review texts (2026-10-22): an open review holds Start / Restart back, but Booked and Do Not
+    # Contact still run (QA: a Booked typed on a flagged row was ignored). A resolution is written
+    # with Action "Start cadence" (never runs on a linked row), and a command staff then pick runs.
     ("Restart cadence", "Needs review: name changed", {"lead_id": "x"}, False),
-    ("Booked", "Needs review: text failed (landline)", {"lead_id": "x"}, False),
+    ("Booked", "Needs review: text failed (landline)", {"lead_id": "x"}, True),
+    ("Do Not Contact", "Needs review: wrong number", {"lead_id": "x"}, True),
+    ("Booked", "Number blocked; needs review", {"lead_id": "x"}, True),
+    ("Booked", "Needs review: wrong number" + REVIEW_FIRST, {"lead_id": "x"}, True),
+    ("Restart cadence", "Needs review: wrong number" + REVIEW_FIRST, {"lead_id": "x"}, False),
+    # The old n8n review texts may still sit next to the stale Booked n8n re-sent: still blocked.
+    ("Booked", "Phone number changed; needs review", {"lead_id": "x"}, False),
+    ("Booked", "Error: Lead ID is required", {"lead_id": "x"}, False),
     ("Start cadence", "Resolved: calls only", {"lead_id": "x"}, False),
     ("Start cadence", "Phone changed: add a new row", {"lead_id": "x"}, False),
     ("Booked", "Resolved: calls only", {"lead_id": "x"}, True),
@@ -266,3 +278,130 @@ def test_a_restart_on_a_finished_cadence_runs_only_when_restart_reruns_names_the
     command = command_of(row)
     assert needs_processing(row, command) is False
     assert needs_processing(row, command, {row.number}) is True
+
+
+# --- a command typed on a row in review (QA 2026-10-22, row "QA Actionkeep") ------------------
+
+RESOLVED = {"review_status": "Resolved: number confirmed", "review_action": "Start cadence",
+            "lead_status": "In cadence"}
+
+
+def test_a_booked_typed_on_a_flagged_row_is_not_overwritten_by_the_resolution():
+    # Staff typed Booked on "Needs review: wrong number", then resolved "Number is right" before the
+    # Sheet worker ran it: the resolution put "Start cadence" back and the lead was never booked.
+    _, _, grid = _grid_with(name="Asha Rao", lead_id="L1", action="Booked",
+                            outcome_status="Needs review: wrong number")
+    apply_snapshot(grid, {"lead_id": "L1", "sheet": RESOLVED})
+    row = grid.rows[0]
+    assert row.get("action") == "Booked"
+    assert row.get("outcome_status") == "Needs review: wrong number"  # the Booked runs next
+    assert needs_processing(row, command_of(row)) is True
+
+
+def test_a_stride_cancel_snapshot_does_not_clear_a_booked_staff_typed():
+    _, _, grid = _grid_with(name="Asha Rao", lead_id="L1", action="Booked",
+                            outcome_status="Needs review: appointment cancelled in Stride")
+    apply_snapshot(grid, {"lead_id": "L1", "sheet": {
+        "action_status": "Needs review: appointment cancelled in Stride", "action": ""}})
+    assert grid.rows[0].get("action") == "Booked"
+
+
+def test_a_stride_cancel_still_clears_the_booked_the_backend_wrote():
+    _, _, grid = _grid_with(name="Asha Rao", lead_id="L1", action="Booked", outcome_status="Booked")
+    apply_snapshot(grid, {"lead_id": "L1", "sheet": {
+        "action_status": "Needs review: appointment cancelled in Stride", "action": ""}})
+    assert grid.rows[0].get("action") == ""
+
+
+def test_a_restart_typed_on_a_flagged_row_waits_and_the_row_says_so(monkeypatch):
+    monkeypatch.setattr(sheet_direct, "_restart_ran", lambda rows: set())  # never run on this row
+    _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id="L1",
+                            action="Restart cadence", outcome_status="Needs review: wrong number")
+    claims = sheet_direct.claim_commands(grid, WorkflowTrace("t", "test"))
+    assert claims == []
+    row = grid.rows[0]
+    assert row.get("outcome_status") == (
+        "Needs review: wrong number; resolve it on the dashboard first, then the restart runs")
+    assert row.get("action") == "Restart cadence"
+    # Written once: the next poll finds nothing to do.
+    assert not sheet_direct.needs_attention(row, sheet_direct.restart_reruns([row]))
+    # Resolved on the dashboard: the Restart stays and now runs.
+    apply_snapshot(grid, {"lead_id": "L1", "sheet": RESOLVED})
+    assert row.get("outcome_status") == "Resolved: number confirmed"
+    assert row.get("action") == "Restart cadence"
+    assert needs_processing(row, command_of(row)) is True
+
+
+def test_a_restart_typed_after_an_earlier_restart_ran_still_waits(monkeypatch):
+    # Tester 2026-10-22: the row's Action Request ID still named the Restart that ran on the last
+    # review, so a Restart typed on the next review was taken for it: no message, then overwritten.
+    monkeypatch.setattr(sheet_direct, "_restart_ran", lambda rows: {r.number for r in rows})
+    _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id="L1",
+                            action="Restart cadence", outcome_status="Needs review: wrong number",
+                            action_request_id=str(uuid4()))
+    assert sheet_direct.claim_commands(grid, WorkflowTrace("t", "test")) == []
+    assert grid.rows[0].get("outcome_status").endswith(REVIEW_FIRST)
+    apply_snapshot(grid, {"lead_id": "L1", "sheet": RESOLVED})
+    assert grid.rows[0].get("action") == "Restart cadence"
+
+
+def test_a_restart_that_ended_in_a_review_leaves_start_cadence_behind():
+    # "Number blocked; needs review" from the Restart itself: it ran, so it must not look typed.
+    _, _, grid = _grid_with(name="Asha Rao", lead_id="L1", action="Restart cadence",
+                            outcome_status="Processing: Restart cadence")
+    sheet_direct._write_outcome(grid, grid.rows[0], sheet_direct.Outcome(
+        "Number blocked; needs review", "Needs Review", "L1"))
+    assert grid.rows[0].get("action") == "Start cadence"
+    assert not sheet_direct.parked(grid.rows[0])
+
+
+def test_a_review_over_a_restart_that_ran_from_the_sheet_leaves_start_cadence():
+    _, _, grid = _grid_with(name="Asha Rao", lead_id="L1", action="Restart cadence",
+                            outcome_status="Cadence restarted", action_request_id=str(uuid4()))
+    apply_snapshot(grid, {"lead_id": "L1", "sheet": {"review_status": "Needs review: wrong number"}})
+    assert grid.rows[0].get("action") == "Start cadence"
+    assert grid.rows[0].get("outcome_status") == "Needs review: wrong number"
+
+
+HINTED = "Needs review: wrong number" + REVIEW_FIRST
+
+
+@pytest.mark.parametrize(("sheet", "status", "action"), [
+    # A close on the dashboard is the newer decision: the waiting Restart is dropped, and said so.
+    ({"review_status": "Closed: handled by front desk", "review_action": "Start cadence",
+      "lead_status": "Closed"},
+     "Closed: handled by front desk; the Restart in Action was not run", "Start cadence"),
+    ({"review_status": "Closed: wrong number", "review_action": "Start cadence",
+      "lead_status": "Closed"}, "Closed: wrong number; the Restart in Action was not run",
+     "Start cadence"),
+    # Booked on the board or by Stride: the row reads Booked, with no Restart left looking pending.
+    ({"action_status": "Booked", "action": "Booked", "lead_status": "Booked"}, "Booked", "Booked"),
+    ({"action_status": "Do Not Contact applied", "lead_status": "Do not outreach"},
+     "Do Not Contact applied", "Start cadence"),
+])
+def test_a_waiting_restart_is_dropped_when_the_lead_ends(sheet, status, action):
+    _, _, grid = _grid_with(name="Asha Rao", lead_id="L1", action="Restart cadence",
+                            outcome_status=HINTED)
+    apply_snapshot(grid, {"lead_id": "L1", "sheet": sheet})
+    row = grid.rows[0]
+    assert (row.get("outcome_status"), row.get("action")) == (status, action)
+    assert needs_processing(row, command_of(row)) is False
+
+
+def test_the_waiting_text_goes_when_staff_clear_the_restart():
+    _, _, grid = _grid_with(name="Asha Rao", lead_id="L1", action="", outcome_status=HINTED)
+    row = grid.rows[0]
+    assert sheet_direct.needs_attention(row, set())  # a narrow poll loads the row
+    sheet_direct.claim_commands(grid, WorkflowTrace("t", "test"))
+    assert row.get("outcome_status") == "Needs review: wrong number"
+    assert not sheet_direct.needs_attention(row, set())
+
+
+def test_a_new_review_turns_a_dashboard_restart_into_start_cadence():
+    # The dashboard's restart writes "Restart cadence" + "Cadence restarted" without a Sheet request.
+    # Left next to a later review text it would look like a Restart staff just typed.
+    _, _, grid = _grid_with(name="Asha Rao", lead_id="L1", action="Restart cadence",
+                            outcome_status="Cadence restarted")
+    apply_snapshot(grid, {"lead_id": "L1", "sheet": {"review_status": "Needs review: text failed"}})
+    assert grid.rows[0].get("outcome_status") == "Needs review: text failed"
+    assert grid.rows[0].get("action") == "Start cadence"

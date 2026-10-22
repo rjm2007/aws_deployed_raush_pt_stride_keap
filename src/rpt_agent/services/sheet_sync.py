@@ -361,7 +361,9 @@ def build_sheet_snapshot(
     # Booked ends the lead however it happened (board, Sheet or call), so the
     # Action cell must stop showing the last command staff picked - "Restart
     # cadence" next to "Booked" reads as a pending instruction. Other states
-    # omit the key so n8n leaves the cell as staff set it.
+    # omit the key so n8n leaves the cell as staff set it. Direct mode never
+    # writes this over a command staff typed that has not run yet
+    # (sheet_direct.apply_snapshot).
     if lead["status"] == "booked":
         sheet["action"] = "Booked"
     # The booking fell through in Stride, so a "Booked" left in the Action cell is
