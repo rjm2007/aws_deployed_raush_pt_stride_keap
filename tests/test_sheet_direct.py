@@ -405,3 +405,95 @@ def test_a_new_review_turns_a_dashboard_restart_into_start_cadence():
     apply_snapshot(grid, {"lead_id": "L1", "sheet": {"review_status": "Needs review: text failed"}})
     assert grid.rows[0].get("outcome_status") == "Needs review: text failed"
     assert grid.rows[0].get("action") == "Start cadence"
+
+
+# --- "Same person, keep old name": the Name cell goes back (owner, demo test 2026-10-23) ---------
+
+KEPT = {"review_status": "Resolved: old name kept", "review_action": "Start cadence",
+        "name": "QA Nameone", "name_replaces": "QA Namekeep"}
+LEAD = "00000000-0000-4000-8000-000000000001"
+
+
+def _kept_row(**cells):
+    sheet, number, grid = _grid_with(**{"name": "QA Namekeep", "phone": "5555550101",
+                                        "lead_id": LEAD, "action": "Start cadence",
+                                        "outcome_status": "Needs review: name changed", **cells})
+    return sheet, number, grid
+
+
+def test_keep_old_name_writes_the_old_name_back_and_stores_its_fingerprint():
+    from rpt_agent.services.google_sheet import flush
+
+    sheet, number, grid = _kept_row()
+    poll = sheet_direct.PollResult()
+    apply_snapshot(grid, {"lead_id": LEAD, "sheet": KEPT}, poll)
+    result = flush(sheet, grid)
+    assert result.deferred_rows == set() and result.skipped_rows == set()
+    assert sheet.cell(number, "name") == "QA Nameone"
+    assert sheet.cell(number, "outcome_status") == "Resolved: old name kept"
+    # The fingerprint saved with the write is the row as it now reads: the profile sync sees it in sync.
+    fresh = parse_grid(sheet.read_values(), 2).rows[0]
+    before = parse_grid(_kept_row()[0].read_values(), 2).rows[0]
+    assert poll.renamed[LEAD] == (profile_hash(before), profile_hash(fresh), number, "QA Nameone")
+
+
+def test_keep_old_name_never_overwrites_a_third_name_already_in_the_row():
+    _, _, grid = _kept_row(name="QA Namethree")
+    poll = sheet_direct.PollResult()
+    apply_snapshot(grid, {"lead_id": LEAD, "sheet": KEPT}, poll)
+    assert grid.rows[0].get("name") == "QA Namethree" and LEAD not in poll.renamed
+
+
+def test_keep_old_name_skips_the_cell_when_staff_type_a_third_name_before_the_write():
+    from rpt_agent.services.google_sheet import flush
+
+    sheet, number, grid = _kept_row()
+    poll = sheet_direct.PollResult()
+    apply_snapshot(grid, {"lead_id": LEAD, "sheet": KEPT}, poll)
+    sheet.before_write = lambda: sheet.set(number, "name", "QA Namethree")
+    result = flush(sheet, grid)
+    # Their text stays; the rest of the row is written; no fingerprint for the skipped Name.
+    assert sheet.cell(number, "name") == "QA Namethree"
+    assert sheet.cell(number, "outcome_status") == "Resolved: old name kept"
+    assert result.deferred_rows == set() and result.skipped_rows == {number}
+    assert grid.rows[0].get("name") == "QA Namethree"
+
+
+def test_use_new_name_leaves_the_name_cell_alone():
+    _, _, grid = _kept_row()
+    apply_snapshot(grid, {"lead_id": LEAD, "sheet": {"review_status": "Resolved: new name used"}})
+    assert grid.rows[0].get("name") == "QA Namekeep" and not grid.expect
+
+
+def test_a_landed_name_write_back_clears_the_kept_sheet_name(monkeypatch):
+    # Tester 2026-10-23: the kept name stayed in leads.sheet_name_accepted, so the same new name
+    # retyped later never opened a review.
+    from contextlib import contextmanager
+
+    calls = []
+
+    class Cursor:
+        def executemany(self, sql, params):
+            calls.append((sql, list(params)))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class Conn:
+        def cursor(self):
+            return Cursor()
+
+    @contextmanager
+    def fake_transaction():
+        yield Conn()
+
+    monkeypatch.setattr(sheet_direct, "transaction", fake_transaction)
+    poll = sheet_direct.PollResult()
+    poll.renamed = {LEAD: ("before", "after", 3, "QA Nameone"),
+                    "00000000-0000-4000-8000-000000000002": ("b", "a", 4, "Other")}
+    poll.save_baselines({4})  # row 4 was not written
+    cleared = [params for sql, params in calls if "sheet_name_accepted=null" in sql]
+    assert cleared == [[(LEAD,)]]

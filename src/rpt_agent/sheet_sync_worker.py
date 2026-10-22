@@ -370,7 +370,7 @@ def _direct_tick(backend: SheetBackend, settings: Settings, counts: dict[str, in
                     conn, lead_id, practice_slug=settings.n8n_practice_slug,
                     reasons=[str((r.get("payload") or {}).get("reason", "")) for r in lead_rows],
                 )
-            found = sheet_direct.apply_snapshot(grid, snapshot)
+            found = sheet_direct.apply_snapshot(grid, snapshot, poll)
         except LookupError as exc:
             _count(counts, _mark_failed(lead_rows, SheetDeliveryError(str(exc), retryable=False),
                                         settings))
@@ -395,7 +395,14 @@ def _direct_tick(backend: SheetBackend, settings: Settings, counts: dict[str, in
         write_heartbeat(mode="direct", ok=False, error=f"write failed: {type(exc).__name__}")
         return counts
     counts["deferred"] += len(written.deferred_rows)
-    poll.save_baselines(written.deferred_rows)
+    not_written = written.deferred_rows | written.skipped_rows
+    poll.save_baselines(not_written)
+    # A Name we wrote back is not staff still editing the row: the last read's fingerprint follows
+    # it, so another edit made meanwhile syncs on the next full read, not one later.
+    seen = _direct_state.get("profiles")
+    for lead_id, (_, after, number, _) in poll.renamed.items():
+        if seen is not None and lead_id in seen and number not in not_written:
+            seen[lead_id] = after
     for lead_id, number in placed.items():
         if number in written.deferred_rows:
             _count(counts, _mark_failed(grouped[lead_id], SheetDeliveryError(

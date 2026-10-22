@@ -133,3 +133,19 @@ def test_a_scan_reads_only_the_narrow_columns_and_loads_just_the_rows_asked_for(
     load_rows(sheet, grid, {first})
     assert [r.number for r in grid.rows] == [first] and grid.rows[0].get("name") == "Asha Rao"
     assert sheet.reads == 0
+
+
+def test_an_expected_cell_that_changed_is_skipped_and_the_rest_of_the_row_written():
+    sheet = FakeSheet()
+    number = sheet.add(name="Asha Kumar", phone="5555550101", lead_id="L1")
+    grid = parse_grid(sheet.read_values(), header_row=2)
+    row = grid.rows[0]
+    grid.set(row, "name", "Asha Rao", expect="Asha Kumar")
+    grid.set(row, "cadence_day", "Day 1")
+    sheet.before_write = lambda: sheet.set(number, "name", "Asha Third")
+    result = flush(sheet, grid)
+    assert (sheet.cell(number, "name"), sheet.cell(number, "cadence_day")) == ("Asha Third", "Day 1")
+    assert result.skipped_rows == {number} and result.deferred_rows == set()
+    # A Name change is not a moved row: the Lead ID decides, so the write is not refused.
+    grid.set(row, "name", "Asha Rao", expect="Asha Third")
+    assert flush(sheet, grid).skipped_rows == set() and sheet.cell(number, "name") == "Asha Rao"

@@ -38,6 +38,7 @@ from .lead_actions import (
     ActionExecution,
     _replay_stored_response,
     _request_hash,
+    _same_name,
     execute_lead_action,
     sync_sheet_lead,
 )
@@ -394,9 +395,15 @@ class PollResult:
     # lead id -> (fingerprint, row, the row's Name): the name is what a pre-048 name review lacks.
     baselines: dict[str, tuple[str, int, str]] = field(default_factory=dict)
 
+    # Names written back after "keep old name": lead id -> (fingerprint before, after, row, Name).
+    renamed: dict[str, tuple[str, str, int, str]] = field(default_factory=dict)
+
     def save_baselines(self, deferred_rows: set[int]) -> None:
+        """`deferred_rows`: rows not written (moved), or whose guarded Name write was skipped."""
         _save_baseline({lead_id: item for lead_id, item in self.baselines.items()
                         if item[1] not in deferred_rows})
+        _save_renamed({lead_id: item for lead_id, item in self.renamed.items()
+                       if item[2] not in deferred_rows})
 
 
 def _now() -> datetime:
@@ -729,19 +736,45 @@ def _save_baseline(items: dict[str, tuple[str, int, str]]) -> None:
         )
 
 
+def _save_renamed(items: dict[str, tuple[str, str, int, str]]) -> None:
+    """The fingerprint after a Name write-back, if the stored one is the row's from before it.
+
+    Otherwise staff changed something else in the row since the last sync (an Email, say): the
+    stored fingerprint stays, and the next full read syncs the row with the kept name, so no
+    review is flagged and their edit is not lost.
+    """
+    if not items:
+        return
+    with transaction() as conn, conn.cursor() as cursor:
+        cursor.executemany(
+            "update sheet_row_state set profile_hash=%s,row_number=%s,sheet_name=%s,seen_at=now(),"
+            "updated_at=now() where lead_id=%s and profile_hash=%s",
+            [(after, number, name or None, lead_id, before)
+             for lead_id, (before, after, number, name) in items.items()],
+        )
+        # The row shows the name on file again, so the kept Sheet name is spent (as a profile sync
+        # of that name would do, lead_actions.sync_sheet_lead). Tester 2026-10-23: left set, the
+        # same new name retyped later was accepted silently and never opened a review.
+        cursor.executemany("update leads set sheet_name_accepted=null where id=%s",
+                           [(lead_id,) for lead_id in items])
+
+
 # --- results from the backend (n8n webhook-flow) ---------------------------------------------
 
 ALWAYS_WRITTEN = ("cadence_day", "call_outcome", "message_outcome", "email_outcome",
                   "transcript_link")
 
 
-def apply_snapshot(grid: SheetGrid, snapshot: dict[str, Any]) -> bool:
+def apply_snapshot(grid: SheetGrid, snapshot: dict[str, Any],
+                   result: PollResult | None = None) -> bool:
     """Write one lead's snapshot into its row (first row with that Lead ID). False: not in Sheet."""
     lead_id = str(snapshot["lead_id"])
     row = next((r for r in grid.rows if r.get("lead_id") == lead_id), None)
     if row is None:
         return False
     sheet = snapshot.get("sheet") or {}
+    if sheet.get("name"):
+        _restore_name(grid, row, sheet, result)
     # What staff typed is judged on the row as it is now, before this snapshot writes into it.
     pending = _command_pending(row)
     waits = not pending and parked(row)
@@ -773,6 +806,30 @@ def apply_snapshot(grid: SheetGrid, snapshot: dict[str, Any]) -> bool:
         grid.set(row, "action", sheet["action"] or "")
     grid.set(row, "lead_status", _lead_status(row, sheet))
     return True
+
+
+def _restore_name(grid: SheetGrid, row: SheetRow, sheet: dict[str, Any],
+                  result: PollResult | None) -> None:
+    """"Same person, keep old name": the Name cell goes back to the name on file.
+
+    Owner, demo test 2026-10-23: calls resumed under the old name but the row kept showing the new
+    one. Only over the exact name the review was about (`name_replaces`): a third name staff typed
+    since is theirs, and the normal name-change flow handles it. The pre-write identity check is
+    unaffected: the row has a Lead ID, which decides alone (`_same_row`), and the cell itself is
+    re-checked just before the write (`expect`). The new fingerprint is stored with the write, so
+    the profile sync sees the old name as in sync (no new review, no sync loop). Only when the
+    row was otherwise in sync (`_save_renamed`): another edit staff made meanwhile still syncs.
+    The kept-name marker (`leads.sheet_name_accepted`) is cleared with it, so the same new name
+    typed again opens a new review.
+    """
+    shown = row.get("name")
+    if _same_name(shown, sheet["name"]) or not _same_name(shown, sheet.get("name_replaces")):
+        return
+    before = profile_hash(row)
+    grid.set(row, "name", sheet["name"], expect=shown)
+    if result is not None:
+        result.renamed[str(row.get("lead_id"))] = (before, profile_hash(row), row.number,
+                                                   _sheet_name(row))
 
 
 def _show_review(grid: SheetGrid, row: SheetRow, text: str, *, pending: bool,

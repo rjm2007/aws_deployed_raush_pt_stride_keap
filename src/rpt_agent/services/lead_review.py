@@ -983,6 +983,10 @@ def resolve_review(
         event_type="review_flagged" if result.get("remaining_reviews") else "review_resolved",
         source_key=f"{lead_id}:{rows[0].get('id')}:{choice}:{now.isoformat()}",
     )
+    if choice == "keep_old_name" and details.get("new_name"):
+        # The Sheet's Name cell still shows the new name; this update writes the kept one back.
+        enqueue_sheet_update(conn, lead_id=lead_id, event_type="name_kept",
+                             source_key=f"{lead_id}:{rows[0].get('id')}:{now.isoformat()}")
     return {
         "status": "resolved",
         "choice": choice,

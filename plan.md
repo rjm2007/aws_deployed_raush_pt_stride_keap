@@ -281,6 +281,11 @@ states and inbound replies. These endpoints update Supabase first; they never ca
 - The person's name does not affect the duplicate check.
 - Editing Name or Phone Number on a linked row does not change either stored identity field. The row receives
   the matching review explanation, and the backend pauses outreach for staff review.
+- Name review resolved "Same person, keep old name" (direct mode, 2026-10-23): the Sheet worker writes the
+  name on file back into the row's Name cell, only while the cell still shows the reviewed new name (a third
+  name staff typed is left for the normal name-change review), and stores the row's new fingerprint so this
+  write never triggers a profile sync or a new review; the kept-name marker is cleared, so the same new name
+  typed again opens a review. "Use new name" leaves the cell as it is.
 
 This is why intake writes cannot match by Phone Number.
 

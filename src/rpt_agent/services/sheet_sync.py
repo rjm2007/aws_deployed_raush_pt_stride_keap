@@ -219,6 +219,25 @@ def _review_status(conn, lead, reasons: set[str]) -> tuple[str | None, str | Non
     return None, None
 
 
+def _kept_name(conn, lead) -> tuple[str, str] | None:
+    """(name on file, the Sheet name it replaces) after "Same person, keep old name" (2026-10-23).
+
+    Sent only with that resolution's own update: the row's Name goes back to the name on file, and
+    only over the exact name the review was about.
+    """
+    row = conn.execute(
+        "select l.full_name,r.details from lead_reviews r join leads l on l.id=r.lead_id "
+        "where r.lead_id=%s and r.code='name_changed' and r.resolution='keep_old_name' "
+        "and r.resolved_at is not null order by r.resolved_at desc,r.id desc limit 1",
+        (lead["id"],),
+    ).fetchone() or {}
+    kept = " ".join(str(row.get("full_name") or "").split())
+    new = " ".join(str((row.get("details") or {}).get("new_name") or "").split())
+    if not (kept and new) or kept.casefold() == new.casefold():
+        return None
+    return kept, new
+
+
 def _needs_review_text(conn, lead) -> str:
     if lead["needs_review"]:
         return "Needs Review"
@@ -355,6 +374,9 @@ def build_sheet_snapshot(
         sheet["review_status"] = review_status
         if review_action:
             sheet["review_action"] = review_action
+    if "name_kept" in pending and (kept := _kept_name(conn, lead)):
+        # Direct mode writes it back into the Name cell (sheet_direct._restore_name); n8n ignores it.
+        sheet["name"], sheet["name_replaces"] = kept
     # Lead Status always mirrors the dashboard column (client decision 2026-10-15), so a pause, a
     # resolved review or a board move shows in the Sheet too, and "Needs Review" never sticks.
     sheet["lead_status"] = sheet_lead_status(lead)

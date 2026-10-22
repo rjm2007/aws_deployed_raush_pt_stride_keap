@@ -25,7 +25,7 @@ Optional suites, skipped by default:
 | `test_google_sheet.py`, `test_sheet_direct.py`, `test_sheet_direct_integration.py` | Direct Sheet sync with `fake_sheet.FakeSheet`: header mapping, moved-row safety, n8n rules and labels; end to end on a real schema (`TEST_DATABASE_URL`) |
 | `test_delivery.py`, `test_unspoken_call.py`, `test_last_decision.py` | Vapi end-of-call settlement and outcomes |
 | `test_review_pause.py`, `test_callback_timing.py` | Review/pause behaviour, callback scheduling |
-| `test_lead_review.py`, `test_lead_review_integration.py` | Review codes/choices/Sheet words; every group's choices end to end, no Resume/board shortcut, history, phone change closes, calls only never texts; Booked / Do Not Contact / Restart typed on a flagged Sheet row |
+| `test_lead_review.py`, `test_lead_review_integration.py` | Review codes/choices/Sheet words; every group's choices end to end, no Resume/board shortcut, history, phone change closes, calls only never texts; Booked / Do Not Contact / Restart typed on a flagged Sheet row; keep old name writes the old name back (no new review, no sync loop, a third name is kept) |
 | `test_demo_review_integration.py` | Demo-only review groups: Stride cancel (front desk / restart / booking link, rebook still books), agent booking not confirmed (front desk only, Stride file books it), calls only stops the confirmation text |
 | `test_booking_check_integration.py` | Unclear booking check with a fake Stride: not before a minute, time still open = not made, found in Stride's file = booked, backoff and stop after 30 min, run twice |
 | `test_live_column_types_integration.py` | Sheet paths on the live text types of `lead_action_requests` |

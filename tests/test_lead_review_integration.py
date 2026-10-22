@@ -21,9 +21,11 @@ from test_sheet_direct_integration import _phone, env  # noqa: F401 - the shared
 from rpt_agent.api import app
 from rpt_agent.config import get_settings
 from rpt_agent.observability import WorkflowTrace
+from rpt_agent.services import sheet_direct
 from rpt_agent.services.delivery import apply_twilio_message_status
+from rpt_agent.services.google_sheet import parse_grid
 from rpt_agent.services.lead_status import report_lead_status
-from rpt_agent.services.sheet_direct import REVIEW_FIRST
+from rpt_agent.services.sheet_direct import REVIEW_FIRST, profile_hash
 from rpt_agent.worker import CLAIM_SQL, run_safety_checks
 
 pytestmark = pytest.mark.integration
@@ -150,6 +152,100 @@ def test_keep_old_name_is_remembered_so_the_next_sync_does_not_flag_again(review
     assert lead["needs_review"] is False and lead["email"] == "kept@example.test"
     assert lead["full_name"] == "Asha Rao"  # the accepted Sheet name is never applied silently
     assert len(_reviews(senv, lead_id)) == 1
+
+
+def test_keep_old_name_writes_the_old_name_back_into_the_sheet_without_a_new_review(review_env,
+                                                                                    monkeypatch):
+    """Owner, demo test 2026-10-23: "QA Nameone" -> "QA Namekeep", keep old name: calls resumed but
+    the row still showed "QA Namekeep". The Name cell now goes back, and nothing flags or re-syncs."""
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "name", "Asha Kumar")
+    senv.tick()
+    senv.tick()
+    assert _post(f"review/{lead_id}/resolve", {"choice": "keep_old_name"}).status_code == 200
+    senv.tick(full=False)  # a narrow poll writes the result
+    assert senv.cell(number, "name") == "Asha Rao"
+    assert senv.cell(number, "outcome_status") == "Resolved: old name kept"
+    state = senv.db.execute("select profile_hash,sheet_name from sheet_row_state where lead_id=%s",
+                            (lead_id,)).fetchone()
+    grid = parse_grid(senv.sheet.read_values(), 2)
+    assert state == {"profile_hash": profile_hash(grid.rows[0]), "sheet_name": "Asha Rao"}
+    calls = []
+    real = sheet_direct.sync_sheet_lead
+    monkeypatch.setattr(sheet_direct, "sync_sheet_lead", lambda **kw: calls.append(kw) or real(**kw))
+    for _ in range(3):
+        senv.tick()
+    assert calls == []  # in sync: no profile sync, so no loop
+    lead = senv.lead(lead_id)
+    assert (lead["needs_review"], lead["full_name"], lead["cadence_state"]) == (False, "Asha Rao", "active")
+    assert len(_reviews(senv, lead_id)) == 1
+    assert senv.cell(number, "name") == "Asha Rao"
+
+
+def test_the_same_new_name_retyped_after_the_write_back_opens_a_review_again(review_env):
+    """Tester case 5, 2026-10-23: keep old name, the Sheet went back, then staff typed the same new
+    name again: nothing was flagged and the Sheet and the lead disagreed silently."""
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "name", "Asha Kumar")
+    senv.tick()
+    senv.tick()
+    assert _post(f"review/{lead_id}/resolve", {"choice": "keep_old_name"}).status_code == 200
+    senv.tick()
+    assert senv.cell(number, "name") == "Asha Rao"
+    assert senv.lead(lead_id)["sheet_name_accepted"] is None
+    senv.sheet.set(number, "name", "Asha Kumar")
+    senv.tick()
+    senv.tick()
+    assert senv.lead(lead_id)["needs_review"] is True
+    assert senv.cell(number, "outcome_status") == "Needs review: name changed"
+    assert len(_reviews(senv, lead_id)) == 2
+
+
+def test_keep_old_name_leaves_a_third_name_staff_typed_to_the_normal_review(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "name", "Asha Kumar")
+    senv.tick()
+    senv.tick()
+    assert _post(f"review/{lead_id}/resolve", {"choice": "keep_old_name"}).status_code == 200
+    senv.sheet.set(number, "name", "Someone Else")  # typed before the write lands
+    senv.tick()
+    assert senv.cell(number, "name") == "Someone Else"
+    senv.tick()
+    assert senv.cell(number, "name") == "Someone Else"
+    assert senv.lead(lead_id)["needs_review"] is True
+    assert [r["details"]["new_name"] for r in _reviews(senv, lead_id)] == ["Asha Kumar", "Someone Else"]
+
+
+def test_keep_old_name_skips_a_third_name_typed_between_the_read_and_the_write(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "name", "Asha Kumar")
+    senv.tick()
+    senv.tick()
+    assert _post(f"review/{lead_id}/resolve", {"choice": "keep_old_name"}).status_code == 200
+    # The poll's only row read before its write is the pre-write check: staff type then.
+    senv.sheet.before_write = lambda: senv.sheet.set(number, "name", "Someone Else")
+    senv.tick(full=False)
+    assert senv.cell(number, "name") == "Someone Else"
+    assert senv.cell(number, "outcome_status") == "Resolved: old name kept"  # the rest landed
+    senv.tick()
+    senv.tick()
+    assert senv.lead(lead_id)["needs_review"] is True and senv.cell(number, "name") == "Someone Else"
+
+
+def test_use_new_name_leaves_the_sheet_name_as_it_is(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "name", "Asha Kumar")
+    senv.tick()
+    senv.tick()
+    assert _post(f"review/{lead_id}/resolve", {"choice": "use_new_name"}).status_code == 200
+    senv.tick()
+    senv.tick()
+    assert senv.cell(number, "name") == "Asha Kumar" and senv.lead(lead_id)["needs_review"] is False
 
 
 def test_different_person_closes_for_good(review_env):
@@ -684,8 +780,10 @@ def test_legacy_name_review_keep_old_name_accepts_the_sheet_name_once(review_env
     senv.tick()
     senv.tick()
     lead = senv.lead(lead_id)
+    # The row's Name went back to the name on file (2026-10-23), so the kept Sheet name is spent.
+    assert senv.cell(number, "name") == "Asha Rao"
     assert (lead["needs_review"], lead["full_name"], lead["sheet_name_accepted"]) == (
-        False, "Asha Rao", "Dana Smyth")
+        False, "Asha Rao", None)
     senv.sheet.set(number, "name", "Someone Else")
     senv.tick()
     senv.tick()

@@ -2268,3 +2268,22 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   now offers the nearest earlier times from today ("for that time or later. Nearest openings: ...") instead of
   NO_OPENINGS; `book_slot`'s other openings do the same. With a pinned day a real past date (Oct 1) is
   PAST_DATE, no longer "too far ahead". "No" is capitalised after the too-far note.
+
+### 2026-10-23 — Sheet: "keep old name" writes the old name back into the row
+- Owner, demo test: a Name edited in the Sheet ("QA Nameone" -> "QA Namekeep") was resolved "Same person, keep old
+  name & continue". Calls resumed, but the row's Name still read "QA Namekeep".
+- `resolve_review` (choice `keep_old_name` with a recorded new name) queues a second Sheet update, reason
+  `name_kept`. `build_sheet_snapshot` then adds `name` (the name on file) and `name_replaces` (the reviewed new
+  name); n8n mode ignores both. `apply_snapshot` writes the Name cell only while it still shows `name_replaces`;
+  a third name already in the row is left to the normal name-change review.
+- Pre-write check: the row has a Lead ID, which decides alone in `_same_row`, so changing the Name is not a "moved
+  row". The cell itself is re-checked just before the write (`SheetGrid.set(expect=...)`): if staff typed another
+  name in between, only that cell is skipped (`FlushResult.skipped_rows`), the rest of the row is written.
+- No loop, no new review: after the write the stored fingerprint (`sheet_row_state`) becomes the row's new one,
+  but only if it was the row's fingerprint from before the write (`_save_renamed`); another edit staff made
+  meanwhile (an Email) still syncs on the next full read, with the kept name, so nothing is flagged. The
+  worker's last-read fingerprints follow the write too, so that edit is not delayed a poll.
+- When the write-back lands, `leads.sheet_name_accepted` is cleared too (tester case 5, same day: left set, the
+  same new name retyped later was accepted silently and never opened a review). "Use new name" is unchanged. Production `main` does not have this; not ported.
+- Tests: `test_sheet_direct.py`, `test_google_sheet.py`, `test_lead_review_integration.py` (one legacy
+  keep-old-name test now expects the Sheet back on the name on file and `sheet_name_accepted` cleared).
