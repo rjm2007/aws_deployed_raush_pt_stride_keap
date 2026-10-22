@@ -681,3 +681,31 @@ def test_the_confirmation_text_names_the_clinic(env):
     ours = [body for to, body in sent if to == phone]
     assert len(ours) == 1
     assert "confirmed for Tuesday, June 16 at 9:00 AM at our " in ours[0] and " office." in ours[0]
+
+
+# --------------------------------------------------------------------------- 2026-10-22 fixes
+
+def test_a_clinic_holiday_is_never_offered_or_booked(env):
+    """The Stride sandbox has no holiday blocks, so the agent booked Sat July 4 (2026-10-22)."""
+    open_days(env, c5981={DAY1: ["09:00:00", "10:00:00"], DAY2: ["08:00:00", "09:00:00", "10:00:00"]})
+    env.sync()
+    env.db.execute("update practice_settings set holidays=%s::jsonb where practice_id=%s",
+                   (f'["{DAY1}", {{"date": "{DAY2}", "close": "10:00"}}]', env.practice_id))
+    lead = env.lead()
+    offered = env.find(lead)
+    assert "June 16" not in offered  # the whole day is closed
+    assert "June 17 (2026-06-17) at 8:00 AM" in offered and "9:00 AM" in offered
+    assert "10:00 AM" not in offered  # would run past the early close
+    creates = sum(env.stride.count(kind) for kind in ("patients", "cases", "appointments"))
+    assert not env.book(lead, date=DAY1, time="9:00 AM").startswith("BOOKED")
+    assert not env.book(lead, date=DAY2, time="10:00 AM").startswith("BOOKED")
+    assert sum(env.stride.count(kind) for kind in ("patients", "cases", "appointments")) == creates
+
+
+def test_a_booking_saves_the_stride_patient_on_the_appointment_and_says_ten_minutes(env):
+    lead = booked_setup(env)
+    message = env.book(lead, date=DAY1, time="9:00 AM")
+    assert message.startswith("BOOKED") and "more than 10 minutes late" in message
+    row = env.one("select a.stride_patient_id,l.stride_patient_id as lead_patient from appointments a "
+                  "join leads l on l.id=a.lead_id where a.lead_id=%s", lead)
+    assert row["stride_patient_id"] and row["stride_patient_id"] == row["lead_patient"]

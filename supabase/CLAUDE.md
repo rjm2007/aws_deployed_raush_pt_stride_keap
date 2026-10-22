@@ -5,7 +5,7 @@ client).
 
 | Path | Purpose |
 | --- | --- |
-| `migrations/NNN_name.sql` | Ordered, idempotent schema changes (001 … 048). 048 (`lead_reviews`) is byte-identical to production's; demo-only review codes come from Python. `rpt migrate` applies any file not yet recorded in `public.schema_migrations`, in filename order. |
+| `migrations/NNN_name.sql` | Ordered, idempotent schema changes (001 … 049). 048 (`lead_reviews`) is byte-identical to production's; demo-only review codes come from Python. 046, 047 and 049 (`appointments.stride_patient_id`, booking engine) are demo-only. `rpt migrate` applies any file not yet recorded in `public.schema_migrations`, in filename order. |
 | `seed.sql` | Fresh-sandbox seed (`rpt seed`): the `rausch-pt` practice, settings, default cadence. Leaves `stride_booking_enabled=false`. |
 | `dev/reset_test_lead_by_name.sql` | Dev/test only. Used by `rpt test-lead` to reset synthetic leads; can only match `is_test` dashboard leads. Remove before a real production release (see `docs/FUTURE_DEPLOYMENT.md`). |
 

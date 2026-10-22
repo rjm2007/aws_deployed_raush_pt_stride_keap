@@ -2225,3 +2225,12 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   (2) Stride's openings, read only, 1 / 3 / 7 / 15 / 29 minutes after: that time still open -> appointment
   failed, slot open again, review becomes "Booking did not go through" (front desk only); time gone -> wait for
   Stride's file; Stride failing -> next attempt. After 30 minutes only (1) runs. Tests use a fake Stride.
+
+### 2026-10-22 — Booking engine: holidays, patient on the appointment, ten minutes
+- `find_slots` / `book_slot` never offer or book a slot on a clinic holiday from `practice_settings.holidays`
+  (a date closes the day; `{"date", "close"}` drops visits that would run past the close), by the slot's local
+  date at the location time zone. The Stride sandbox has no holiday blocks, so the agent booked Sat July 4.
+- `appointments.stride_patient_id` is saved as soon as the patient is known or created (it stayed empty, e.g. row
+  258). Migration 049 adds the column for fresh databases; the live demo DB already has it (no-op there).
+  Demo-only (production has no booking engine).
+- The BOOKED tool reply says "more than 10 minutes late", matching the booking prompt.

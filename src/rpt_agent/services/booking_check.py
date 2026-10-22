@@ -72,7 +72,8 @@ _FILE_MATCH_SQL = (
     "left join stride_patients p on p.practice_id=sa.practice_id and p.stride_id=sa.patient_stride_id "
     " and p.deleted_at is null "
     "where a.id=%s and ("
-    " (l.stride_patient_id is not null and sa.patient_stride_id=l.stride_patient_id)"
+    " (coalesce(a.stride_patient_id,l.stride_patient_id) is not null"
+    "  and sa.patient_stride_id=coalesce(a.stride_patient_id,l.stride_patient_id))"
     " or (a.stride_case_id is not null and sa.case_stride_id=a.stride_case_id)"
     " or (p.stride_id is not null and l.date_of_birth is not null and p.date_of_birth=l.date_of_birth"
     "  and lower(trim(coalesce(p.first_name,'')))=lower(trim(coalesce(l.first_name,'')))"
@@ -171,6 +172,7 @@ def confirm_booking(conn, appointment_id: int, stride_appointment_id: int) -> bo
     lead_id = str(appt["lead_id"])
     conn.execute(
         "update appointments set state='scheduled',stride_appointment_id=%s,confirmed_at=now(),"
+        "stride_patient_id=coalesce(stride_patient_id,(select stride_patient_id from leads where id=lead_id)),"
         "needs_staff_review=false,stride_error=null,updated_at=now() where id=%s",
         (stride_appointment_id, appointment_id),
     )
