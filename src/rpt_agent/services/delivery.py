@@ -341,9 +341,9 @@ def _call_turns(message: dict) -> list[tuple[str, str]]:
 
 def _patient_replied_after(message: dict, *, introduction: bool) -> bool:
     """Whether the patient said anything after Sarah's first line, or - with
-    introduction=True - after she said why she was calling (her first line that
-    names Rausch). "Yes" to "Am I speaking with ...?" and then silence is not an
-    answer to anything, so it cannot be a refusal."""
+    introduction=True - said more than a yes after she said why she was calling
+    (her first line that names Rausch). "Yes" to "Am I speaking with ...?" and
+    then silence is not an answer to anything, so it cannot be a refusal."""
     turns = _call_turns(message)
     bot_lines = [i for i, (role, _) in enumerate(turns) if role == "bot"]
     if not bot_lines:
@@ -353,7 +353,26 @@ def _patient_replied_after(message: dict, *, introduction: bool) -> bool:
         start = next(
             (i for i in bot_lines if "rausch" in turns[i][1].lower()), bot_lines[0]
         )
-    return any(role == "user" and words.strip() for role, words in turns[start + 1 :])
+    replies = [words for role, words in turns[start + 1 :] if role == "user" and words.strip()]
+    if not introduction:
+        return bool(replies)
+    # "Sure" to the introduction and then a hang-up is not a refusal either: the
+    # summary has called exactly that "declined" (21 Oct, demo). A refusal needs
+    # at least one reply that is more than a yes or a hello.
+    return any(_words(reply) - _AGREEMENT_WORDS for reply in replies)
+
+
+_AGREEMENT_WORDS = frozenset(
+    {
+        "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright", "right", "fine",
+        "great", "good", "sounds", "go", "ahead", "hello", "hi", "hey", "uh", "um", "mm",
+        "hmm", "huh",
+    }
+)
+
+
+def _words(text: str) -> set[str]:
+    return set(re.findall(r"[a-z]+", text.lower()))
 
 
 def _settle_from_structured_output(

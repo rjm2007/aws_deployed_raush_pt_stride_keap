@@ -170,6 +170,20 @@ def test_silence_after_the_introduction_is_never_a_refusal(monkeypatch):
     assert "The patient did not respond." in applied["notes"]  # evidence kept
 
 
+def test_sure_then_a_hang_up_is_never_a_refusal(monkeypatch):
+    """21 Oct (demo): "Yes", "Sure", then the patient hung up at the location
+    question. The summary said "declined" and the lead was closed."""
+    sure = [("user", "Hello?"), ("bot", "Am I speaking with Test Drive?"), ("user", "Yes."),
+            ("bot", "This is Sarah calling from Rausch. Is now a good time?"), ("user", "Sure."),
+            ("bot", "Great. This is for your neck visit at our Dana Point office. Is that location good for you?")]
+    applied = _settle_with(
+        monkeypatch, {"status": "declined", "summary": "The patient hung up."}, sure
+    )
+    assert applied["status"] == "no_answer"
+    no = sure[:-2] + [("user", "No.")]
+    assert _settle_with(monkeypatch, {"status": "declined"}, no)["status"] == "declined"
+
+
 def test_opt_out_said_before_the_introduction_is_still_honoured(monkeypatch):
     early = [("bot", "Hi. Am I speaking with Devyansh?"), ("user", "Stop calling me.")]
     assert _settle_with(monkeypatch, {"status": "do_not_contact"}, early)["status"] == "do_not_contact"
