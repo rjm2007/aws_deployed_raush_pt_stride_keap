@@ -90,6 +90,42 @@ def _fail_day0_text(senv, lead_id, error_code):
     return event["id"]
 
 
+# --- a stale page: the review closed while it was open ----------------------------------------
+
+
+def test_closed_review_says_who_resolved_it_or_that_the_lead_was_replaced(review_env):
+    """2026-10-23: a page opened before the review closed said only "no longer available"."""
+    from rpt_agent.services.review import hand_over_number
+
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "name", "Asha Kumar")
+    senv.tick()
+    senv.tick()
+    assert _post(f"review/{lead_id}/resolve", {"choice": "use_new_name"}).status_code == 200
+    message = "This review was already resolved by Emma: Same person, use new name & continue."
+    card = _get(f"review/{lead_id}").json()
+    assert card["review"] is None and card["options"] == []
+    assert card["closed"]["reason"] == "resolved" and card["closed"]["message"] == message
+    again = _post(f"review/{lead_id}/resolve", {"choice": "use_new_name"})
+    assert again.status_code == 409 and again.json()["detail"] == message
+
+    # Flag it again, then a newer Sheet row on the same number takes over (one lead per phone).
+    senv.sheet.set(number, "name", "Asha Rao")
+    senv.tick()
+    senv.tick()
+    assert senv.lead(lead_id)["needs_review"] is True
+    lead = senv.lead(lead_id)
+    with senv.db.transaction():
+        hand_over_number(senv.db, practice_id=lead["practice_id"], phone=lead["phone_e164"],
+                         lead_id=str(uuid4()))
+    replaced = "This lead was closed: a newer Sheet row uses the same phone number. Its history is kept."
+    card = _get(f"review/{lead_id}").json()
+    assert card["review"] is None and card["closed"] == {"reason": "replaced", "message": replaced}
+    refused = _post(f"review/{lead_id}/resolve", {"choice": "keep_old_name"})
+    assert refused.status_code == 409 and refused.json()["detail"] == replaced
+
+
 # --- name changed -----------------------------------------------------------------------------
 
 

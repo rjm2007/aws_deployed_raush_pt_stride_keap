@@ -27,6 +27,7 @@ from ..services.lead_review import (
     describe,
     lead_review_summary,
     options_preview,
+    resolution_label,
     resolve_review,
 )
 from ..services.lead_stage import stage_of as _stage
@@ -389,14 +390,7 @@ def _build_activity(audits, events, status_history, appointments, reviews=()) ->
             title=f"Flagged: {title}",
         ))
         if review.get("resolved_at"):
-            label = CHOICE_LABELS.get(review.get("resolution") or "") or {
-                "booked": "Marked Booked", "do_not_contact": "Do Not Contact", "restarted": "Restarted",
-                "replaced": "Replaced by a newer referral", "unblocked": "Number unblocked",
-                "closed": "Closed", "board_closed": "Moved to Closed on the board",
-                "board_booked": "Moved to Booked on the board",
-                "board_new": "Restarted from the board",
-                "confirmed_in_stride": "Booking confirmed in Stride",
-            }.get(review.get("resolution") or "", "Review cleared")
+            label = resolution_label(review.get("resolution")) or "Review cleared"
             note = f" Note: {review['note']}" if review.get("note") else ""
             by = review.get("resolved_by_name") or "System"
             entries.append(_activity_entry(

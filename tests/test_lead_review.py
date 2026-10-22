@@ -134,3 +134,68 @@ def test_demo_reasons_get_demo_groups_and_never_continue():
     assert group_of(card["code"]) == "appointment"
     # Calls only: no booking-link text either.
     assert [o["choice"] for o in card["options"]] == ["front_desk", "restart_cadence"]
+
+
+class _OneRowConn:
+    """Answers closed_review's single query with `row` (or no row)."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def execute(self, sql, params):
+        assert "from lead_reviews" in sql and params == ("lead-1",)
+        return self
+
+    def fetchone(self):
+        return self.row
+
+
+@pytest.mark.parametrize(("lead", "row", "reason", "message"), [
+    # 2026-10-23: a newer Sheet row on the same number replaced the lead while its page was open.
+    ({"status_reason": "replaced by a newer referral on this number"}, None, "replaced",
+     "This lead was closed: a newer Sheet row uses the same phone number. Its history is kept."),
+    ({}, {"resolution": "replaced", "resolved_by_name": "System"}, "replaced",
+     "This lead was closed: a newer Sheet row uses the same phone number. Its history is kept."),
+    ({}, {"resolution": "calls_only", "resolved_by_name": "Emma"}, "resolved",
+     "This review was already resolved by Emma: Continue with calls only."),
+    ({}, {"resolution": "booked", "resolved_by_name": "Google Sheet"}, "resolved",
+     "This review was already resolved by Google Sheet: Marked Booked."),
+    ({}, {"resolution": "mystery", "resolved_by_name": "Emma"}, "closed", "This review is already closed."),
+    ({}, None, "closed", "This review is already closed."),
+])
+def test_closed_review_says_why(lead, row, reason, message):
+    from rpt_agent.services.lead_review import closed_review, options_preview
+
+    lead = {"id": "lead-1", "needs_review": False, **lead}
+    closed = closed_review(_OneRowConn(row), lead)
+    assert closed["reason"] == reason and closed["message"] == message
+    # The confirm pop-up's GET keeps its old keys and adds `closed`.
+    preview = options_preview(_OneRowConn(row), lead)
+    assert preview["review"] is None and preview["options"] == [] and preview["closed"] == closed
+
+
+def test_resolving_a_closed_review_returns_the_reason():
+    from rpt_agent.services.lead_review import ReviewError, resolve_review
+
+    lead = {"id": "lead-1", "needs_review": False,
+            "status_reason": "replaced by a newer referral on this number"}
+
+    class Conn:
+        """The lead row first (locked), then no open and no resolved review rows."""
+
+        def __init__(self):
+            self.rows = [lead]
+
+        def execute(self, sql, params):
+            return self
+
+        def fetchone(self):
+            return self.rows.pop(0) if self.rows else None
+
+        def fetchall(self):
+            return []
+
+    with pytest.raises(ReviewError) as error:
+        resolve_review(Conn(), "lead-1", "calls_only", note=None, actor_id="u", actor_name="Emma")
+    assert error.value.status_code == 409
+    assert error.value.detail.startswith("This lead was closed: a newer Sheet row")
