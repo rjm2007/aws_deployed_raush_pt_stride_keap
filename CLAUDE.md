@@ -81,3 +81,7 @@ Production: `docker-compose.prod.yml` behind Caddy (`Caddyfile`, domain `demo.ai
   production DB (`supabase-production`, `.env.production`) only after it works in demo and the user says so.
 - Comments explain *why* (often a past incident); match that style and keep them.
 - Every behavior fix gets a regression test in `tests/`.
+
+## Commits
+
+- Commits and PRs are the owner's (rjm2007) alone: never add a `Co-Authored-By: Claude` line, a "Generated with Claude Code" note or any other Claude attribution to commit messages or PR descriptions.
