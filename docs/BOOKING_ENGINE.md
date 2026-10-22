@@ -44,6 +44,9 @@ otherwise the default case type is used.
   `NOTHING_IN_RANGE: <day> is too far ahead to book yet; we can only book up to <last day>. ...` with the
   nearest openings from today (time of day kept if possible). `book-appointment` on such a day says the
   same before its other openings. Before 2026-10-22 it answered `NO_OPENINGS` although times were open.
+- Nothing on the asked day or after it (e.g. the last day of the window): `NOTHING_IN_RANGE: no ... openings
+  for that time or later. Nearest openings: ...` from today; `NO_OPENINGS` only when the whole window is empty.
+  With a pinned day, a real past date (Oct 1 with June 15 pinned) is `PAST_DATE`.
 
 **`/api/v1/tools/book-appointment`** — creates real Stride records.
 - `date` (YYYY-MM-DD) and `time` the caller chose, `first_name`, `last_name`, `date_of_birth`

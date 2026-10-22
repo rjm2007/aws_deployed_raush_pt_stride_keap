@@ -737,8 +737,9 @@ def test_a_day_past_the_horizon_with_nothing_open_says_both(env):
     lead = env.lead()
     open_days(env)
     env.sync()
-    reply = env.find(lead, when="specific_date", specific_date=date(2026, 7, 20))
-    assert reply.startswith("NO_OPENINGS: Monday, July 20 is too far ahead to book yet")
+    reply = env.find(lead, when="specific_date", specific_date=date(2026, 11, 26))
+    assert reply.startswith("NO_OPENINGS: Thursday, November 26 is too far ahead to book yet; we "
+                            "can only book up to Wednesday, July 15. No Physical Therapy at")
     assert "in the next 31 days" in reply
 
 
@@ -769,6 +770,34 @@ def test_too_far_without_a_pinned_day_uses_the_real_calendar(env):
     last = today + timedelta(days=30)
     assert reply.startswith(f"NOTHING_IN_RANGE: {slot_booking._spoken_date(asked)} is too far ahead")
     assert f"up to {slot_booking._spoken_date(last)}." in reply and f"({soon}) at 9:00 AM" in reply
-    # The last day is still inside the window: the usual reply, not "too far".
+    # The last day is still inside the window: not "too far", and the opening 2 days out is offered.
     inside = find(when="specific_date", specific_date=last)
-    assert inside.startswith("NO_OPENINGS: no ") and "too far" not in inside
+    assert inside.startswith("NOTHING_IN_RANGE: no ") and "too far" not in inside
+    assert f"Nearest openings: (1) {slot_booking._spoken_date(today + timedelta(days=2))}" in inside
+
+
+def test_a_late_day_with_nothing_after_it_offers_the_nearest_earlier_times(env):
+    """QA 2026-10-22: the last day of the window (Thanksgiving) got NO_OPENINGS; only later days
+    were searched, never the open days before it."""
+    open_days(env, c5981={DAY1: ["09:00:00", "14:00:00"]})
+    env.sync()
+    lead = env.lead()
+    last = date(2026, 7, 15)
+    reply = env.find(lead, when="specific_date", specific_date=last)
+    assert reply.startswith("NOTHING_IN_RANGE: no Physical Therapy at Laguna Niguel openings for "
+                            "that time or later. Nearest openings: (1) Tuesday, June 16")
+    afternoon = env.find(lead, call_id="call-2", when="specific_date", specific_date=last,
+                         time_of_day="afternoon")
+    assert "Nearest openings: (1) Tuesday, June 16 (2026-06-16) at 2:00 PM" in afternoon
+    evening = env.find(lead, call_id="call-3", when="specific_date", specific_date=last,
+                       time_of_day="evening")
+    assert "Nearest openings: (1) Tuesday, June 16 (2026-06-16) at 9:00 AM" in evening
+    # Booking a taken late day offers the earlier times too, not "no other openings soon".
+    booked = env.book(lead, date=last.isoformat(), time="9:00 AM")
+    assert booked.startswith("NOT_AVAILABLE") and "Other openings: (1) Tuesday, June 16" in booked
+    assert "too far" not in booked
+
+
+def test_a_real_past_day_on_the_pinned_calendar_is_past(env):
+    with pytest.raises(ValueError, match="PAST_DATE"):
+        env.find(env.lead(), when="specific_date", specific_date=date(2026, 10, 1))

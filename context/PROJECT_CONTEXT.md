@@ -2242,3 +2242,7 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   nearest openings from today; `book_slot` on such a day prefixes its other openings the same way. The code
   stays NOTHING_IN_RANGE, which the booking prompt already handles (no prompt change). Days inside the window
   (holidays included) are unchanged. On the demo (pinned June 15) Nov 26 is moved to Thu July 23, past July 15.
+- Follow-up (tester): when the asked day and every later day are empty (Thanksgiving, the last day), the reply
+  now offers the nearest earlier times from today ("for that time or later. Nearest openings: ...") instead of
+  NO_OPENINGS; `book_slot`'s other openings do the same. With a pinned day a real past date (Oct 1) is
+  PAST_DATE, no longer "too far ahead". "No" is capitalised after the too-far note.
