@@ -27,7 +27,12 @@ from typing import Any
 from psycopg.types.json import Jsonb
 
 from .lead_status import _practice_clock, clamp_to_business_hours, record_status
-from .review import PAUSE_SKIP_REASON, restore_pause_skipped, skip_remaining_planned
+from .review import (
+    PAUSE_SKIP_REASON,
+    REPLACED_REASON,
+    restore_pause_skipped,
+    skip_remaining_planned,
+)
 from .sheet_sync import enqueue_sheet_update
 
 # --- codes, groups, choices -----------------------------------------------------------------
@@ -628,7 +633,7 @@ def options_preview(conn, lead: dict, now: datetime | None = None) -> dict[str, 
     now = now or datetime.now(UTC)
     summary = lead_review_summary(conn, lead)
     if not summary:
-        return {"review": None, "options": []}
+        return {"review": None, "options": [], "closed": closed_review(conn, lead)}
     rows = open_reviews(conn, str(lead["id"])) or [_legacy_row(lead)]
     details = rows[0].get("details") or {}
     options = []
@@ -655,6 +660,51 @@ def options_preview(conn, lead: dict, now: datetime | None = None) -> dict[str, 
             "confirm": f"{option['label']} for {lead.get('full_name')}. {effect}. {next_step}",
         })
     return {"review": summary, "options": options}
+
+
+# How a review closed without a staff choice (lead page Activity and the closed-review message).
+OUTCOME_LABELS = {
+    "booked": "Marked Booked", "do_not_contact": "Do Not Contact", "restarted": "Restarted",
+    "replaced": "Replaced by a newer referral", "unblocked": "Number unblocked",
+    "closed": "Closed", "board_closed": "Moved to Closed on the board",
+    "board_booked": "Moved to Booked on the board",
+    "board_new": "Restarted from the board",
+    "confirmed_in_stride": "Booking confirmed in Stride",
+}
+
+REPLACED_REVIEW_MESSAGE = (
+    "This lead was closed: a newer Sheet row uses the same phone number. Its history is kept."
+)
+CLOSED_REVIEW_MESSAGE = "This review is already closed."
+
+
+def resolution_label(resolution: str | None) -> str | None:
+    """The plain words for a stored lead_reviews.resolution, or None when unknown."""
+    return CHOICE_LABELS.get(resolution or "") or OUTCOME_LABELS.get(resolution or "")
+
+
+def closed_review(conn, lead: dict) -> dict[str, str]:
+    """Why a lead has no open review any more, for a page opened before it closed.
+
+    A stale lead page still showed Resolve review after a newer Sheet row on the same number
+    replaced the lead (2026-10-23), and Confirm only said the choice was no longer available.
+    """
+    latest = conn.execute(
+        "select resolution,resolved_by_name from lead_reviews where lead_id=%s "
+        "and resolved_at is not null order by resolved_at desc,id desc limit 1",
+        (lead["id"],),
+    ).fetchone()
+    if lead.get("status_reason") == REPLACED_REASON or (latest and latest["resolution"] == "replaced"):
+        return {"reason": "replaced", "message": REPLACED_REVIEW_MESSAGE}
+    label = resolution_label(latest["resolution"]) if latest else None
+    if latest and latest.get("resolved_by_name") and label:
+        return {
+            "reason": "resolved",
+            "message": f"This review was already resolved by {latest['resolved_by_name']}: {label}.",
+            "resolved_by_name": latest["resolved_by_name"],
+            "resolution": latest["resolution"],
+        }
+    return {"reason": "closed", "message": CLOSED_REVIEW_MESSAGE}
 
 
 # --- resolving ---------------------------------------------------------------------------------
@@ -924,7 +974,7 @@ def resolve_review(
         raise ReviewError(404, "lead not found")
     rows = open_reviews(conn, lead_id)
     if not lead["needs_review"]:
-        raise ReviewError(409, "This lead has no open review.")
+        raise ReviewError(409, closed_review(conn, lead)["message"])
     rows = rows or [_legacy_row(lead)]
     primary = describe(rows[0], lead)
     allowed = {option["choice"] for option in primary["options"]}
