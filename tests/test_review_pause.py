@@ -11,6 +11,12 @@ from rpt_agent.services.review import PAUSE_SKIP_REASON, flag_lead_for_review
 TRIGGER_SQL = Path("supabase/migrations/030_review_pause_trigger_is_a_fallback.sql").read_text(
     encoding="utf-8"
 )
+# 048 replaces the same function (adds the review row); it must keep 030's rules.
+REVIEW_TRIGGER_SQL = Path("supabase/migrations/048_lead_reviews.sql").read_text(encoding="utf-8")
+FAILSAFE_SQL = REVIEW_TRIGGER_SQL[
+    REVIEW_TRIGGER_SQL.index("create or replace function public.pause_failed_outreach_for_review"):
+    REVIEW_TRIGGER_SQL.index("create or replace function public.lead_review_failsafe")
+]
 
 
 class RecordingConnection:
@@ -25,6 +31,9 @@ class RecordingConnection:
 
     def fetchall(self):
         return []
+
+    def fetchone(self):
+        return None
 
 
 def test_both_paths_flag_pause_and_stop_the_schedule():
@@ -49,3 +58,13 @@ def test_only_the_application_sets_the_lead_status():
     conn = RecordingConnection()
     flag_lead_for_review(conn, "lead-1", "reason")
     assert "needs_attention" in " ".join(conn.statements)
+
+
+def test_048_failsafe_keeps_the_030_rules_and_writes_a_review_row():
+    for fragment in ("needs_review = true", "cadence_state = 'paused'", "status = 'skipped'",
+                     "insert into public.lead_reviews"):
+        assert fragment in FAILSAFE_SQL, fragment
+    assert PAUSE_SKIP_REASON in FAILSAFE_SQL
+    lowered = FAILSAFE_SQL.lower()
+    assert "status = case" not in lowered
+    assert "status = 'needs_attention'" not in lowered

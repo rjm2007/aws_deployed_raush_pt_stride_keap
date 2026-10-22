@@ -13,6 +13,7 @@ from ..db import transaction
 from ..observability import WorkflowTrace
 from ..providers import ProviderClients, ProviderError
 from ..security import sign_slot, verify_slot
+from .lead_review import demo_code_for_reason
 from .lead_status import mark_booked
 from .review import flag_lead_for_review
 
@@ -527,5 +528,7 @@ class BookingService:
 
     @staticmethod
     def _flag_review(lead_id: str, reason: str) -> None:
+        # The dashboard's "Booking" group (front desk only; Stride's next file can book the lead).
         with transaction() as conn:
-            flag_lead_for_review(conn, lead_id, reason)
+            flag_lead_for_review(conn, lead_id, reason, code=demo_code_for_reason(reason) or "booking_unclear",
+                                 source="booking")

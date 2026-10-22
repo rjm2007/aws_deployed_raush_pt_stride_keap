@@ -40,6 +40,7 @@ from ..db import transaction
 from ..observability import WorkflowTrace
 from ..providers import ProviderClients, ProviderError
 from .availability_sync import booking_now, sync_target, sync_targets
+from .lead_review import demo_code_for_reason
 from .lead_status import mark_booked
 from .review import flag_lead_for_review
 from .sheet_sync import enqueue_sheet_update
@@ -688,8 +689,11 @@ def _booked_elsewhere(conn, lead_id: str) -> str | None:
 
 
 def _flag(lead_id: str, reason: str) -> None:
+    # The dashboard's "Booking" group: front desk only, never Continue, because the patient may be
+    # booked already; Stride's next file books the lead by itself (stride_leads.mark_leads_booked_from_stride).
     with transaction() as conn:
-        flag_lead_for_review(conn, lead_id, reason)
+        flag_lead_for_review(conn, lead_id, reason, code=demo_code_for_reason(reason) or "booking_unclear",
+                             source="booking")
 
 
 def book_slot(

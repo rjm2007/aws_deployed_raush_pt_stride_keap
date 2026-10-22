@@ -2192,3 +2192,36 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   Staff messages say MM/DD/YYYY. (Was the n8n day-first rule.)
 - Booking confirmation text now names the clinic ("... at our Laguna Niguel office").
 - Booking agent closing: "a confirmation text shortly", "more than ten minutes late" (was twenty).
+
+### 2026-10-22 — Needs Review: clear reasons, resolve with a choice (port of production migration 048)
+- Ported from production branch `feature/review-resolution` (22114f6 + aa6dcc1), for testing on the demo before
+  production. Migration `048_lead_reviews.sql` is byte-identical to production's (one schema).
+- Every flag writes a `lead_reviews` row (code, message, details, source). Staff resolve it with a choice on the
+  Review Queue or the lead page; Resume and dragging to In cadence return 409 on a flagged lead. The old free-text
+  resolve body returns 422: backend and dashboard ship together, after 048.
+- A phone change in the Sheet closes the lead at once (never restartable on the old number). A name change shows
+  old -> new. A failed text offers "Continue with calls only" (`leads.sms_disabled`: no text of any kind, the
+  booking-link and booking-confirmation texts included) or "Try texting again" (hidden for landline codes).
+- Demo-only groups (owner, 2026-10-22):
+  - Appointment (Stride cancel / late cancel / no show / removed / unclear): Front desk, Restart cadence from Day 0
+    (same 10-minute cooldown as a Sheet restart), Text the booking link. No Continue. A new future visit in a
+    later Stride file still books the lead; the "only a visit changed after the flag" rule now also holds after
+    staff settle the review (flag time from `lead_reviews`), and only for the appointment reasons.
+  - Booking (the agent could not confirm a Stride booking, PATIENT_EXISTS, stale booking sweeper): Front desk only.
+    Stride's next file showing the visit books the lead and closes the review (the old rule wrongly required a
+    visit changed after the flag, because "...; confirm in Stride" ends in " in Stride").
+  - Rows 048 wrote from older reasons are recognised by their words (`lead_review.demo_code_for_reason`).
+- A confirmed booking (`mark_booked`, voice agent) now clears an open review, as the Sheet's Booked does.
+- Live column types: the demo DB stores `lead_action_requests.request_id/lead_id/practice_id` as text; the new
+  Sheet query compares as text. Tested locally with those columns altered to text.
+- Sheet: direct mode only for the new review texts (Outcome Status "Needs review: ...", "Resolved: ...",
+  "Closed: handled by front desk", "Phone changed: add a new row", "Cadence restarted"; Message Outcome
+  "Calls only (texts off)"). The n8n path is unchanged.
+- Automatic check of an unclear voice booking (`services/booking_check.py`, booking-worker every 30 s; owner,
+  2026-10-22). The public Stride API has no way to read a patient's appointments (its only read is
+  availability), so: (1) Stride's imported files (`stride_appointments`): the same start + clinician for the
+  saved patient / case, or name + DOB -> appointment scheduled with that Stride id, lead booked the normal way
+  (confirmation text unless texts are off, Keap handoff for real leads), review resolved "confirmed_in_stride";
+  (2) Stride's openings, read only, 1 / 3 / 7 / 15 / 29 minutes after: that time still open -> appointment
+  failed, slot open again, review becomes "Booking did not go through" (front desk only); time gone -> wait for
+  Stride's file; Stride failing -> next attempt. After 30 minutes only (1) runs. Tests use a fake Stride.

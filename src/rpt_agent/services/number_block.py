@@ -21,6 +21,7 @@ from typing import Literal
 from uuid import uuid4
 
 from ..worker import materialize_cadence
+from .lead_review import close_open_reviews, closed_for_good
 from .lead_status import record_status
 from .review import REPLACED_REASON, hand_over_number, skip_remaining_planned
 from .sheet_sync import enqueue_sheet_update
@@ -53,6 +54,7 @@ def _sheet_update(conn, lead_id: str, reason: str) -> None:
 def block_number(conn, lead: dict, staff_name: str) -> None:
     """Dashboard Do Not Contact: the same effect as the Sheet's command."""
     lead_id = str(lead["id"])
+    close_open_reviews(conn, lead_id, "do_not_contact", by="dashboard", by_name=staff_name)
     conn.execute(
         "update leads set status='do_not_contact',cadence_state='terminated',call_opt_out=true,"
         "sms_opt_out=true,needs_review=false,review_reason=null,review_resolved_at=case when needs_review then now() else review_resolved_at end,"
@@ -105,6 +107,9 @@ def unblock_number(conn, lead: dict, after: AfterUnblock, staff_name: str) -> di
     if not block and lead["status"] != "do_not_contact":
         raise NumberBlockError(409, "this number is not blocked")
     blocked_at = block["created_at"] if block else lead["status_changed_at"]
+    # Continue or restart would call the old number of a lead whose phone changed in the Sheet.
+    if closed := closed_for_good(conn, lead):
+        raise NumberBlockError(409, closed + " Unblock the number from Administration instead.")
 
     remaining: list[dict] = []
     if after == "continue":
@@ -129,6 +134,8 @@ def unblock_number(conn, lead: dict, after: AfterUnblock, staff_name: str) -> di
         ).fetchall()
     else:
         others = []
+    # The "number blocked" review (and any other open one) is settled by the unblock.
+    close_open_reviews(conn, lead_id, "unblocked", by="dashboard", by_name=staff_name)
     conn.execute(
         "update leads set call_opt_out=false,sms_opt_out=false,status='in_progress',"
         "status_reason=null,needs_review=false,review_reason=null,review_flagged_at=null,"

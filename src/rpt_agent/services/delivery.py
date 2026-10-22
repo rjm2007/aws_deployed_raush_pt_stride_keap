@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from zoneinfo import ZoneInfo
 
 from ..config import get_settings
@@ -12,6 +13,8 @@ from ..vapi_contract import extract_vapi_context, outcome_from_ended_reason
 from .lead_status import apply_call_outcome
 from .review import flag_lead_for_review
 from .sheet_sync import dashboard_call_link, enqueue_sheet_update
+
+TWILIO_ERROR = re.compile(r"Twilio error (\d{5})")
 
 # The patient's last word on the call wins. A booking link waits two minutes
 # after it is requested; if by then the lead is no longer booking_link_sent
@@ -39,6 +42,12 @@ def process_pending_integrations(
             "select 1 from suppressed_numbers s where s.phone_e164=l.phone_e164))",
             ("notification canceled because the recipient is opted out or suppressed",),
         )
+        # Calls only (texts off, e.g. a landline): the booking link would fail the same way.
+        conn.execute(
+            "update notification_log n set status='skipped',error=%s,updated_at=now() "
+            "from leads l where n.lead_id=l.id and n.status='queued' and l.sms_disabled",
+            ("notification canceled because texts are off for this lead (calls only)",),
+        )
         conn.execute(
             CANCEL_CHANGED_BOOKING_LINK_SQL,
             ("booking link canceled because the patient changed their decision",),
@@ -52,7 +61,7 @@ def process_pending_integrations(
             "left join booking_locations bl on bl.id=a.booking_location_id "
             "join practice_settings ps on ps.practice_id=l.practice_id "
             "where n.status='queued' and n.next_attempt_at<=now() "
-            "and not l.sms_opt_out and not exists("
+            "and not l.sms_opt_out and not l.sms_disabled and not exists("
             "select 1 from suppressed_numbers s where s.phone_e164=l.phone_e164) "
             "order by n.id limit 20 for update of n skip locked"
         ).fetchall()
@@ -174,6 +183,7 @@ def process_pending_integrations(
                     "update notification_log set status=%s,error=%s,updated_at=now() where id=%s",
                     (status, str(exc)[:500], row["id"]),
                 )
+                found = TWILIO_ERROR.search(str(exc))
                 flag_lead_for_review(
                     conn,
                     row["lead_id"],
@@ -182,6 +192,11 @@ def process_pending_integrations(
                         "SMS notification retries exhausted"
                         if exc.retryable else "booking link text could not be delivered"
                     ),
+                    code="booking_link_unconfirmed" if exc.ambiguous or exc.retryable
+                    else "booking_link_failed",
+                    source="text",
+                    details={"refused": True, "error_code": found[1] if found else None,
+                             "failure_reason": str(exc)[:300]},
                 )
             counts["failed"] += 1
         except Exception as exc:  # noqa: BLE001 - an accepted SMS cannot be retried safely
@@ -197,7 +212,8 @@ def process_pending_integrations(
                     (f"unexpected delivery error: {type(exc).__name__}", row["id"]),
                 )
                 flag_lead_for_review(
-                    conn, row["lead_id"], "SMS notification delivery requires review"
+                    conn, row["lead_id"], "SMS notification delivery requires review",
+                    code="notification_unconfirmed", source="text",
                 )
             counts["failed"] += 1
     for row in outbox:
@@ -360,7 +376,9 @@ def _settle_from_structured_output(
                 ("call was answered but no outcome was reported", event_id),
             )
             flag_lead_for_review(
-                conn, lead_id, "call answered but no outcome reported; see transcript"
+                conn, lead_id, "call answered but no outcome reported; see transcript",
+                code="call_no_outcome", source="call", outreach_event_id=event_id,
+                details={"call_id": call_id},
             )
         trace.log("state_transition_applied", transition="fallback_review", event_id=event_id)
         return "manual"
@@ -401,7 +419,9 @@ def _settle_from_structured_output(
     except (TypeError, ValueError) as exc:
         with transaction() as conn:
             flag_lead_for_review(
-                conn, lead_id, f"structured outcome could not be applied: {exc}"
+                conn, lead_id, f"structured outcome could not be applied: {exc}",
+                code="call_outcome_not_applied", source="call", outreach_event_id=event_id,
+                details={"call_id": call_id, "extracted_status": status},
             )
         trace.log("validation_failed", reason="structured_output_rejected")
         return None
@@ -640,7 +660,7 @@ def apply_twilio_message_status(conn, form_data: dict[str, str]) -> int:
             "settled_by='webhook',"
             "failure_reason=case when %s in ('sent','delivered') then oe.failure_reason "
             "else %s end,"
-            "updated_at=now() where oe.id=%s returning oe.id,oe.lead_id",
+            "updated_at=now() where oe.id=%s returning oe.id,oe.lead_id,oe.day_offset",
             (
                 actual_status,
                 actual_status,
@@ -654,6 +674,13 @@ def apply_twilio_message_status(conn, form_data: dict[str, str]) -> int:
                     conn,
                     str(event["lead_id"]),
                     "cadence SMS was not delivered",
+                    code="sms_failed",
+                    source="text",
+                    outreach_event_id=event["id"],
+                    details={"channel": "sms", "day_offset": event.get("day_offset"),
+                             "error_code": sms_record["failure_reason"]
+                             if str(sms_record["failure_reason"] or "").isdigit() else None,
+                             "delivery_status": actual_status},
                 )
             enqueue_sheet_update(
                 conn,
