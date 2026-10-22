@@ -167,6 +167,49 @@ DASHBOARD_OUTCOMES = {
 }
 
 
+SHEET_TEXTS_OFF = "Calls only (texts off)"
+
+
+def _review_status(conn, lead, reasons: set[str]) -> tuple[str | None, str | None]:
+    """Outcome Status for a review that was just flagged or resolved, and the Action to set.
+
+    Sent only with the review's own update, like DASHBOARD_OUTCOMES: a later snapshot leaves the
+    cell alone, so a staff member who cleared it to run a command is not overwritten. A resolution
+    also sets Action to "Start cadence": "Resolved: …" is not a final status, so a stale
+    "Restart cadence" or "Booked" next to it would otherwise run again.
+    """
+    from .lead_review import (  # lead_review imports this module
+        SHEET_RESOLVED,
+        SHEET_RESOLVED_ACTION,
+        sheet_open_status,
+    )
+
+    if lead["status"] in {"booked", "do_not_contact"}:
+        return None, None
+    if "review_flagged" in reasons and lead["needs_review"]:
+        row = conn.execute(
+            "select code,details from lead_reviews where lead_id=%s and resolved_at is null "
+            "order by flagged_at,id limit 1",  # the one the dashboard shows first
+            (lead["id"],),
+        ).fetchone()
+        return (sheet_open_status(row["code"], row["details"]) if row else "Needs review"), None
+    if "review_resolved" in reasons and not lead["needs_review"]:
+        # A Sheet command that finished after the resolution (staff restarted the row before this
+        # poll) owns the cell: its result is already there and is newer.
+        row = conn.execute(
+            "select r.resolution from lead_reviews r where r.lead_id=%s and r.resolved_at is not null "
+            # As text: the live databases store lead_action_requests.lead_id as text (2026-10-22).
+            "and not exists(select 1 from lead_action_requests a where a.lead_id::text=r.lead_id::text "
+            "and a.completed_at>r.resolved_at) "
+            "order by r.resolved_at desc,r.id desc limit 1",
+            (lead["id"],),
+        ).fetchone()
+        text = SHEET_RESOLVED.get(row["resolution"]) if row else None
+        action = SHEET_RESOLVED_ACTION.get(row["resolution"], "Start cadence") if row else None
+        return (text, action) if text else (None, None)
+    return None, None
+
+
 def _needs_review_text(conn, lead) -> str:
     if lead["needs_review"]:
         return "Needs Review"
@@ -189,6 +232,7 @@ def build_sheet_snapshot(
     """Build the current Sheet view from committed database truth."""
     lead = conn.execute(
         "select l.id,l.status,l.cadence_state,l.needs_review,l.review_reason,l.callback_requested_at,"
+        "l.sms_disabled,"
         "coalesce(l.timezone,p.timezone,'America/Los_Angeles') as timezone,"
         # For the board column (Lead Status): is the cadence spent?
         "(select count(*) from outreach_events t where t.lead_id=l.id) as cadence_total,"
@@ -267,6 +311,11 @@ def build_sheet_snapshot(
             lead["callback_requested_at"], lead["timezone"]
         )
 
+    if lead.get("sms_disabled"):
+        # Staff chose calls only: no text goes out, so the column says that instead of the last
+        # text's fate (usually "Not delivered", the reason texts were turned off).
+        message_outcome = SHEET_TEXTS_OFF
+
     # Omit action_status unless outreach changed it — n8n keeps the existing cell.
     sheet: dict[str, Any] = {
         "cadence_day": cadence_day,
@@ -292,6 +341,11 @@ def build_sheet_snapshot(
             sheet["action"] = action
     if action_status is not None:
         sheet["action_status"] = action_status
+    review_status, review_action = _review_status(conn, lead, pending)
+    if review_status:
+        sheet["review_status"] = review_status
+        if review_action:
+            sheet["review_action"] = review_action
     # Lead Status always mirrors the dashboard column (client decision 2026-10-15), so a pause, a
     # resolved review or a board move shows in the Sheet too, and "Needs Review" never sticks.
     sheet["lead_status"] = sheet_lead_status(lead)

@@ -40,6 +40,7 @@ from ..db import transaction
 from ..observability import WorkflowTrace
 from ..providers import ProviderClients, ProviderError
 from .availability_sync import booking_now, sync_target, sync_targets
+from .lead_review import demo_code_for_reason
 from .lead_status import mark_booked
 from .review import flag_lead_for_review
 from .sheet_sync import enqueue_sheet_update
@@ -332,6 +333,20 @@ def refresh_cache(
             raise
 
 
+# Never offer or book a visit on a clinic holiday (practice_settings.holidays, the list the cadence
+# uses: "YYYY-MM-DD" closes the day, {"date": ..., "close": "HH:MM"} closes from that time). The
+# Stride sandbox has no holiday blocks, so the agent booked Sat July 4 (2026-10-22). The slot's
+# local_date / local_time are at the clinic location's time zone.
+NOT_ON_HOLIDAY_SQL = (
+    "not exists(select 1 from practice_settings ps "
+    "cross join lateral jsonb_array_elements(coalesce(ps.holidays,'[]'::jsonb)) h "
+    "where ps.practice_id=s.practice_id "
+    "and coalesce(h->>'date', h#>>'{}')=to_char(s.local_date,'YYYY-MM-DD') "
+    "and (coalesce(h->>'close','') !~ '^[0-9]{1,2}:[0-9]{2}' "
+    "or s.local_time+make_interval(mins=>s.duration_minutes)>(h->>'close')::time))"
+)
+
+
 def search_slots(
     conn,
     context: BookingContext,
@@ -353,7 +368,7 @@ def search_slots(
         "and (%s::time is null or s.local_time>=%s::time) "
         "and (%s::time is null or s.local_time<%s::time) "
         "and not exists(select 1 from slot_holds h where h.slot_id=s.id and h.status='active' "
-        "and h.expires_at>now()) "
+        "and h.expires_at>now()) and " + NOT_ON_HOLIDAY_SQL + " "
         "order by s.start_utc,c.display_name limit 60",
         (
             context.location["id"], context.case_type["duration_minutes"], clinician_ids,
@@ -598,7 +613,7 @@ def _find_slot_for_booking(
         "from availability_slots s join clinicians c on c.id=s.clinician_id "
         "where s.booking_location_id=%s and s.duration_minutes=%s and s.clinician_id = any(%s) "
         "and s.local_date=%s and s.local_time=%s and s.status='open' "
-        "and (%s::bigint is null or s.id=%s) "
+        "and (%s::bigint is null or s.id=%s) and " + NOT_ON_HOLIDAY_SQL + " "
         "order by offered desc,c.display_name",
         (call_key, OFFER_MEMORY, context.location["id"], context.case_type["duration_minutes"],
          [c["id"] for c in pool], wanted_date, wanted_time, slot_id, slot_id),
@@ -688,8 +703,11 @@ def _booked_elsewhere(conn, lead_id: str) -> str | None:
 
 
 def _flag(lead_id: str, reason: str) -> None:
+    # The dashboard's "Booking" group: front desk only, never Continue, because the patient may be
+    # booked already; Stride's next file books the lead by itself (stride_leads.mark_leads_booked_from_stride).
     with transaction() as conn:
-        flag_lead_for_review(conn, lead_id, reason)
+        flag_lead_for_review(conn, lead_id, reason, code=demo_code_for_reason(reason) or "booking_unclear",
+                             source="booking")
 
 
 def book_slot(
@@ -871,6 +889,11 @@ def book_slot(
             with transaction() as conn:
                 conn.execute("update leads set stride_patient_id=%s where id=%s",
                              (patient_id, lead_id))
+        # The appointment row names its patient too (it stayed empty: row 258, 2026-10-22), also
+        # when the visit itself ends unclear, so the later Stride check knows whom to look for.
+        with transaction() as conn:
+            conn.execute("update appointments set stride_patient_id=%s where id=%s",
+                         (patient_id, appointment_id))
 
         # 3b. Case. Stride allows one Initial Evaluation per case, so a case is
         # reused only while no appointment has been made on it.
@@ -984,7 +1007,7 @@ def book_slot(
         f"BOOKED: {_spoken_date(slot['local_date'])} at {_spoken_time(slot['local_time'])} with "
         f"{slot['display_name']} at our {context.location['name']} clinic, {duration} minutes. "
         "Confirm this to the caller, say a confirmation text is on its way, and remind them "
-        "to call if they will be more than 20 minutes late."
+        "to call if they will be more than 10 minutes late."
     )
 
 
@@ -999,8 +1022,8 @@ def _finish_booking(
         with transaction() as conn:
             conn.execute(
                 "update appointments set state='scheduled',stride_appointment_id=%s,"
-                "stride_case_id=%s,confirmed_at=now(),updated_at=now() where id=%s",
-                (stride_appointment_id, case_id, appointment_id),
+                "stride_case_id=%s,stride_patient_id=%s,confirmed_at=now(),updated_at=now() where id=%s",
+                (stride_appointment_id, case_id, patient_id, appointment_id),
             )
             conn.execute("update slot_holds set status='booked' where id=%s", (hold_id,))
             conn.execute("update availability_slots set status='booked',updated_at=now() "

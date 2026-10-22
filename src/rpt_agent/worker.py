@@ -190,7 +190,7 @@ def materialize_cadence(
     if not settings:
         raise ValueError("practice settings not found")
     lead = conn.execute(
-        "select is_test,cadence_state from leads where id=%s", (lead_id,)
+        "select is_test,cadence_state,sms_disabled from leads where id=%s", (lead_id,)
     ).fetchone()
     # The optional version id needs an explicit cast. Passing None leaves
     # Postgres with a bare NULL it cannot type ("could not determine data type
@@ -245,9 +245,12 @@ def materialize_cadence(
         if accelerated and previous and scheduled_for < previous:
             scheduled_for = previous
         previous = scheduled_for
+        # Texts off (calls only) survives a restart: the text steps are planned as skipped, so the
+        # cadence still finishes (a planned step the worker never claims would keep it open).
+        texts_off = step["channel"] == "sms" and bool(lead and lead.get("sms_disabled"))
         conn.execute(
             "insert into outreach_events(lead_id,cadence_step_id,cadence_version_id,channel,"
-            "day_offset,scheduled_for,status) values(%s,%s,%s,%s,%s,%s,'planned')",
+            "day_offset,scheduled_for,status,failure_reason) values(%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 lead_id,
                 step["id"],
@@ -255,6 +258,8 @@ def materialize_cadence(
                 step["channel"],
                 step["day_offset"],
                 scheduled_for,
+                "skipped" if texts_off else "planned",
+                "texts off (calls only)" if texts_off else None,
             ),
         )
     if update_lead:
@@ -277,6 +282,8 @@ with eligible as (
  and not l.needs_review
  and l.status not in ('booked','declined','do_not_contact','invalid_phone')
  and ((oe.channel='call' and not l.call_opt_out) or (oe.channel='sms' and not l.sms_opt_out))
+ -- Staff chose "Continue with calls only" (a landline, 2026-10-21): never text this lead.
+ and (oe.channel<>'sms' or not l.sms_disabled)
  and (oe.channel<>'call' or coalesce(l.line_type,'unknown')<>'mobile' or l.consent_captured_at is not null)
  and not exists(select 1 from suppressed_numbers s where s.phone_e164=l.phone_e164)
  and ((%(test_mode)s and l.is_test) or (
@@ -434,6 +441,27 @@ def dispatch_job(trace: WorkflowTrace, job: Job, providers: ProviderClients) -> 
         )
 
 
+TWILIO_ERROR = re.compile(r"Twilio error (\d{5})")
+
+
+def _dispatch_review(job: Job, state: str, value: str) -> dict:
+    """Review code and details for a step the provider refused or left unconfirmed.
+
+    A text Twilio refused outright (21614: not a mobile number) is a failed text with the same
+    choices as a carrier failure; a refused call or anything unconfirmed is a technical review.
+    """
+    details = {"channel": job.channel, "day_offset": job.day_offset, "failure_reason": value[:300]}
+    if state == "unknown":
+        code = "dispatch_unconfirmed"
+    elif job.channel == "sms":
+        code = "sms_failed"
+        found = TWILIO_ERROR.search(value)
+        details.update(refused=True, error_code=found[1] if found else None)
+    else:
+        code = "call_failed"
+    return {"code": code, "details": details, "source": "worker", "outreach_event_id": job.event_id}
+
+
 def run_safety_checks(trace: WorkflowTrace) -> dict[str, int]:
     """Flag ambiguous work for review; never blindly resend it."""
     counts = {
@@ -450,22 +478,24 @@ def run_safety_checks(trace: WorkflowTrace) -> dict[str, int]:
             "update outreach_events set status='unknown',settled_at=now(),settled_by='sweeper',"
             "failure_reason='worker stopped before dispatch result was recorded' "
             "where status='in_flight' and updated_at<now()-interval '15 minutes' "
-            "returning id,lead_id"
+            "returning id,lead_id,channel,day_offset"
         ).fetchall()
         orphaned = conn.execute(
             "update outreach_events set status='delivered',settled_at=now(),settled_by='sweeper',outcome='manual',"
             "failure_reason='call outcome was not reported' where channel='call' and status='attempted' "
-            "and executed_at<now()-interval '2 hours' returning id,lead_id,vapi_call_id"
+            "and executed_at<now()-interval '2 hours' returning id,lead_id,vapi_call_id,day_offset"
         ).fetchall()
         stale_sms = conn.execute(
             "update outreach_events set status='unknown',settled_at=now(),settled_by='sweeper',"
             "failure_reason='SMS delivery callback was not reported' "
             "where channel='sms' and status='attempted' "
-            "and executed_at<now()-interval '2 hours' returning id,lead_id"
+            "and executed_at<now()-interval '2 hours' returning id,lead_id,day_offset"
         ).fetchall()
         for row in stuck:
             flag_lead_for_review(
-                conn, row["lead_id"], "ambiguous provider dispatch; do not retry"
+                conn, row["lead_id"], "ambiguous provider dispatch; do not retry",
+                code="dispatch_unconfirmed", source="worker", outreach_event_id=row["id"],
+                details={"channel": row["channel"], "day_offset": row["day_offset"]},
             )
             enqueue_sheet_update(
                 conn,
@@ -477,7 +507,11 @@ def run_safety_checks(trace: WorkflowTrace) -> dict[str, int]:
         for row in orphaned:
             # A lead whose cadence already ended has nothing left to act on, so
             # settling its stale event must not drag it back into the review queue.
-            flag_lead_for_review(conn, row["lead_id"], "call outcome not reported")
+            flag_lead_for_review(
+                conn, row["lead_id"], "call outcome not reported", code="call_result_missing",
+                source="worker", outreach_event_id=row["id"],
+                details={"channel": "call", "day_offset": row["day_offset"]},
+            )
             if row["vapi_call_id"]:
                 conn.execute(
                     "update test_usage_ledger set status='ended',outcome='manual',"
@@ -493,7 +527,11 @@ def run_safety_checks(trace: WorkflowTrace) -> dict[str, int]:
                 outreach_event_id=row["id"],
             )
         for row in stale_sms:
-            flag_lead_for_review(conn, row["lead_id"], "SMS delivery status not reported")
+            flag_lead_for_review(
+                conn, row["lead_id"], "SMS delivery status not reported", code="sms_unconfirmed",
+                source="worker", outreach_event_id=row["id"],
+                details={"channel": "sms", "day_offset": row["day_offset"]},
+            )
             enqueue_sheet_update(
                 conn,
                 lead_id=str(row["lead_id"]),
@@ -509,7 +547,8 @@ def run_safety_checks(trace: WorkflowTrace) -> dict[str, int]:
         for row in stuck_notifications:
             if row["lead_id"]:
                 flag_lead_for_review(
-                    conn, row["lead_id"], "ambiguous confirmation SMS; do not retry"
+                    conn, row["lead_id"], "ambiguous confirmation SMS; do not retry",
+                    code="notification_unconfirmed", source="worker",
                 )
         stuck_handoffs = conn.execute(
             "update integration_outbox set status='pending',next_attempt_at=now(),last_error=%s,updated_at=now() "
@@ -524,8 +563,11 @@ def run_safety_checks(trace: WorkflowTrace) -> dict[str, int]:
             ("booking did not reach a durable result; reconcile with Stride before retry",),
         ).fetchall()
         for row in stuck_bookings:
+            # The dashboard's "Booking" group: Stride's next file books the lead if the visit
+            # was made; otherwise the front desk settles it (never Continue).
             flag_lead_for_review(
-                conn, row["lead_id"], "stale Stride booking requires reconciliation"
+                conn, row["lead_id"], "stale Stride booking requires reconciliation",
+                code="booking_unclear", source="worker",
             )
         # A cadence is spent when nothing is left to send and nothing is still
         # out with a provider -- not when the calendar says so. The old rule also
@@ -686,6 +728,7 @@ def run_tick() -> dict[str, int]:
                         f"ambiguous dispatch: {value}"
                         if state == "unknown" else f"dispatch failed: {value}"
                     ),
+                    **_dispatch_review(job, state, value),
                 )
                 # Migration 025 creates the Sheet outbox row from the terminal
                 # status transition, including transitions made by stale workers.

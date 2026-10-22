@@ -251,7 +251,7 @@ def test_sheet_sync_same_identity_updates_existing_lead(monkeypatch):
             normalized = " ".join(query.split())
             if normalized.startswith("select id from practices"):
                 return _Rows({"id": 7})
-            if normalized.startswith("select id,full_name,phone_e164 from leads"):
+            if normalized.startswith("select id,full_name,phone_e164,"):
                 return _Rows({
                     "id": params[0],
                     "full_name": "Original Name",
@@ -288,6 +288,7 @@ def test_sheet_sync_same_identity_updates_existing_lead(monkeypatch):
 
 def test_sheet_sync_changed_name_requires_review(monkeypatch):
     queries = []
+    reviews = []
 
     class _Rows:
         def __init__(self, row):
@@ -305,12 +306,19 @@ def test_sheet_sync_changed_name_requires_review(monkeypatch):
             queries.append(normalized)
             if normalized.startswith("select id from practices"):
                 return _Rows({"id": 7})
-            if normalized.startswith("select id,full_name,phone_e164 from leads"):
+            if normalized.startswith("select id,full_name,phone_e164,"):
                 return _Rows({
                     "id": params[0],
                     "full_name": "Original Name",
                     "phone_e164": "+15555550100",
+                    "status": "in_progress",
+                    "cadence_state": "active",
                 })
+            if normalized.startswith("update leads set needs_review=true"):
+                return _Rows({"id": params[-1]})  # the lead is open, so the flag applies
+            if normalized.startswith(("update lead_reviews", "insert into lead_reviews")):
+                reviews.append((normalized, params))
+                return _Rows({"id": 11} if normalized.startswith("insert") else None)
             return _Rows(None)
 
     @contextmanager
@@ -327,18 +335,16 @@ def test_sheet_sync_changed_name_requires_review(monkeypatch):
     assert result.body["result"] == "name_changed_needs_review"
     assert any("update leads set needs_review=true" in query for query in queries)
     assert not any("update leads set full_name=" in query for query in queries)
+    # 2026-10-21: the review records what changed, so staff can see the old and new name.
+    review = next(params for query, params in reviews if query.startswith("insert into lead_reviews"))
+    assert review[1] == "name_changed"
+    assert review[3].obj == {"old_name": "Original Name", "new_name": "Changed Name"}
 
 
-@pytest.mark.parametrize(
-    ("incoming_name", "expected_result"),
-    [
-        ("Changed Name", "phone_changed_needs_review"),
-        ("Another Name", "name_and_phone_changed_needs_review"),
-    ],
-)
-def test_sheet_sync_changed_phone_requires_review(
-    monkeypatch, incoming_name, expected_result
-):
+@pytest.mark.parametrize("incoming_name", ["Changed Name", "Another Name"])
+def test_sheet_sync_changed_phone_closes_the_lead(monkeypatch, incoming_name):
+    """Owner, 2026-10-22: a new phone number in the Sheet is a new lead. The old one closes at
+    once (no review, never resumable) and the Sheet asks staff to add a new row."""
     queries = []
 
     class _Rows:
@@ -354,15 +360,19 @@ def test_sheet_sync_changed_phone_requires_review(
     class Connection:
         def execute(self, query, params=None):
             normalized = " ".join(query.split())
-            queries.append(normalized)
+            queries.append((normalized, params))
             if normalized.startswith("select id from practices"):
                 return _Rows({"id": 7})
-            if normalized.startswith("select id,full_name,phone_e164 from leads"):
+            if normalized.startswith("select id,full_name,phone_e164,"):
                 return _Rows({
                     "id": params[0],
                     "full_name": "Changed Name",
-                    "phone_e164": "+15555550100",
+                    "phone_e164": "+15555558847",
+                    "status": "in_progress",
+                    "cadence_state": "active",
                 })
+            if normalized.startswith("select coalesce(l.timezone,p.timezone)"):
+                return _Rows({"tz": "America/Los_Angeles", "business_hours": {}, "holidays": []})
             return _Rows(None)
 
     @contextmanager
@@ -376,18 +386,26 @@ def test_sheet_sync_changed_phone_requires_review(
         lead_id=old_id,
         lead={
             "full_name": incoming_name,
-            "phone": "+15555550101",
+            "phone": "+15555551234",
             "date_of_birth": date(1990, 3, 15),
             "location": "Dana Point",
             "title": "Sports Rehab",
         },
     )
+    sql = [query for query, _ in queries]
     assert result.status_code == 409
-    assert result.body["result"] == expected_result
+    assert result.body["result"] == "phone_changed_closed"
     assert result.body["lead_id"] == str(old_id)
-    assert any("update leads set needs_review=true" in query for query in queries)
-    assert any("update outreach_events set status='skipped'" in query for query in queries)
-    assert not any("update leads set full_name=" in query for query in queries)
+    assert not any("needs_review=true" in query for query in sql)
+    close = next(q for q in sql if q.startswith("update leads set status='invalid_phone'"))
+    assert "cadence_state='terminated'" in close and "needs_review=false" in close
+    assert any(q.startswith("update outreach_events set status='skipped'") for q in sql)
+    review = next(params for query, params in queries if query.startswith("insert into lead_reviews"))
+    assert "from …8847 to …1234" in review[1]
+    assert review[2].obj["old_phone"] == "…8847" and review[2].obj["new_phone"] == "…1234"
+    # Only the last four digits are kept on the record.
+    assert "5555551234" not in str(review)
+    assert not any(q.startswith("update leads set full_name=") for q in sql)
 
 
 def test_n8n_route_rejects_bad_or_stale_signature(monkeypatch):

@@ -85,6 +85,13 @@ def test_started_at_reads_our_iso_text_and_n8n_pacific_date_serials():
     ("Do Not Contact", "Do not contact applied", {"lead_id": "x"}, False),
     ("Do Not Contact", "Unblocked in dashboard", {"lead_id": "x"}, False),
     ("Restart cadence", "Unblocked in dashboard", {"lead_id": "x"}, True),
+    # Review texts (2026-10-22): an open review blocks every command; a resolution is written with
+    # Action "Start cadence" (never runs on a linked row), and a command staff then pick runs once.
+    ("Restart cadence", "Needs review: name changed", {"lead_id": "x"}, False),
+    ("Booked", "Needs review: text failed (landline)", {"lead_id": "x"}, False),
+    ("Start cadence", "Resolved: calls only", {"lead_id": "x"}, False),
+    ("Start cadence", "Phone changed: add a new row", {"lead_id": "x"}, False),
+    ("Booked", "Resolved: calls only", {"lead_id": "x"}, True),
     ("Call later", "", {}, None),
 ])
 def test_which_rows_need_processing(action, status, extra, expected):

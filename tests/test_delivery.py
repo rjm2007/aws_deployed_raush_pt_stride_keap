@@ -107,7 +107,7 @@ def _settle_with(monkeypatch, structured, turns=None):
             return self
 
         def fetchone(self):
-            return {"outcome": applied.get("status")}
+            return {"outcome": applied.get("status"), "id": 1}
 
         def fetchall(self):
             return []

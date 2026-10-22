@@ -16,6 +16,19 @@ from ..parsing import parse_flexible_date
 from ..security import DashboardActor, require_dashboard_auth
 from ..services import appointment_views
 from ..services.keap_sync_status import keap_sync_status
+from ..services.lead_review import (
+    CHOICE_LABELS,
+    FRONT_DESK_REASON,
+    OPEN_REVIEW_DETAIL,
+    TITLES,
+    ReviewError,
+    close_open_reviews,
+    closed_for_good,
+    describe,
+    lead_review_summary,
+    options_preview,
+    resolve_review,
+)
 from ..services.lead_stage import stage_of as _stage
 from ..services.number_block import (
     NumberBlockError,
@@ -29,6 +42,7 @@ from ..services.review import (
     REPLACED_REASON,
     flag_lead_for_review,
     hand_over_number,
+    record_review,
     restore_pause_skipped,
     skip_remaining_planned,
 )
@@ -59,7 +73,15 @@ class StageMove(BaseModel):
 
 
 class ReviewAction(BaseModel):
-    resolution: str = Field(min_length=2, max_length=500)
+    """One staff choice for a flagged lead (services/lead_review.py CHOICE_LABELS).
+
+    `resolution` is the old field name (free text from the first review queue); a value that is a
+    choice still works, anything else is refused: a resolve must say what happens next.
+    """
+
+    choice: str | None = Field(default=None, min_length=2, max_length=40)
+    resolution: str | None = Field(default=None, min_length=2, max_length=500)
+    note: str | None = Field(default=None, max_length=500)
 
 
 class OutreachUpdate(BaseModel):
@@ -203,6 +225,39 @@ CLOSED_REASON = {
 }
 
 
+def _closed_reason(row: dict) -> str:
+    """What a finished lead's card says. A review can close a lead for a reason its status
+    alone does not tell (front desk, phone changed, different person)."""
+    reason = str(row.get("status_reason") or "")
+    if reason == REPLACED_REASON:
+        return "Replaced by newer referral"
+    if reason == FRONT_DESK_REASON:
+        return FRONT_DESK_REASON
+    if row["status"] == "invalid_phone" and row.get("cadence_state") == "terminated":
+        if reason.startswith("Phone number changed"):
+            return "Phone changed: add a new row"
+        if reason.startswith("Different person"):
+            return "Different person: add a new row"
+        if reason.startswith("Wrong number"):
+            return "Wrong number"
+    return CLOSED_REASON.get(row["status"], "Outreach complete")
+
+
+def _review_from_row(row: dict) -> dict | None:
+    """The snapshot's review card, from the open review the snapshot query joined in."""
+    if not row.get("needs_review"):
+        return None
+    review = {
+        "id": row.get("review_id"), "lead_id": row["id"], "code": row.get("review_code") or "other",
+        "message": row.get("review_message") or row.get("review_reason") or "Needs review",
+        "details": row.get("review_details") or {}, "source": row.get("review_source") or "legacy",
+        "flagged_at": row.get("review_flagged_at") or row.get("lead_review_flagged_at"),
+    }
+    summary = describe(review, row, has_calls=bool(row.get("has_calls")))
+    summary["open_count"] = int(row.get("open_reviews") or 1)
+    return summary
+
+
 def _lead(row: dict) -> dict:
     stage = _stage(row)
     next_status = row.get("next_event_status")
@@ -211,9 +266,7 @@ def _lead(row: dict) -> dict:
         next_step = f"Awaiting result: {next_step or row.get('next_channel', 'outreach')}"
     if stage in {"closed", "booked"}:
         # Outreach has stopped, so never advertise a next action that will not run.
-        next_step = CLOSED_REASON.get(row["status"], "Outreach complete")
-        if row.get("status_reason") == REPLACED_REASON:
-            next_step = "Replaced by newer referral"
+        next_step = _closed_reason(row)
         next_status = None
     return {
         "id": str(row["id"]),
@@ -246,6 +299,8 @@ def _lead(row: dict) -> dict:
         "is_test": bool(row.get("is_test")),
         "timezone": row.get("timezone"),
         "number_block": _number_block(row),
+        "review": _review_from_row(row),
+        "texts_off": bool(row.get("sms_disabled")),
     }
 
 
@@ -320,8 +375,39 @@ def _activity_entry(
     }
 
 
-def _build_activity(audits, events, status_history, appointments) -> list[dict]:
+def _build_activity(audits, events, status_history, appointments, reviews=()) -> list[dict]:
     entries: list[dict] = []
+    for review in reviews:
+        title = TITLES.get(review["code"], TITLES["other"])
+        entries.append(_activity_entry(
+            entry_id=f"review-{review['id']}-flagged",
+            action="review.flagged",
+            occurred_at=review["flagged_at"],
+            actor_type="employee" if review["source"] == "dashboard" else "automation",
+            actor_name=(review.get("details") or {}).get("by") or "Automation",
+            category="review",
+            title=f"Flagged: {title}",
+        ))
+        if review.get("resolved_at"):
+            label = CHOICE_LABELS.get(review.get("resolution") or "") or {
+                "booked": "Marked Booked", "do_not_contact": "Do Not Contact", "restarted": "Restarted",
+                "replaced": "Replaced by a newer referral", "unblocked": "Number unblocked",
+                "closed": "Closed", "board_closed": "Moved to Closed on the board",
+                "board_booked": "Moved to Booked on the board",
+                "board_new": "Restarted from the board",
+                "confirmed_in_stride": "Booking confirmed in Stride",
+            }.get(review.get("resolution") or "", "Review cleared")
+            note = f" Note: {review['note']}" if review.get("note") else ""
+            by = review.get("resolved_by_name") or "System"
+            entries.append(_activity_entry(
+                entry_id=f"review-{review['id']}-resolved",
+                action="review.resolved",
+                occurred_at=review["resolved_at"],
+                actor_type="automation" if review.get("resolved_by") in {None, "system"} else "employee",
+                actor_name=by,
+                category="review",
+                title=f"Resolved by {by}: {label}.{note}",
+            ))
     titles = {
         "lead.created": "Lead created",
         "lead.updated": "Lead details updated",
@@ -346,6 +432,8 @@ def _build_activity(audits, events, status_history, appointments) -> list[dict]:
     }
     for row in audits:
         action = row["action"]
+        if action == "review.resolved":
+            continue  # shown from lead_reviews above, with the choice and the note
         category = (
             "messages" if action.startswith(("sms.", "message."))
             else "calls" if action.startswith("call.")
@@ -497,6 +585,13 @@ def dashboard_snapshot(actor: Actor):
             "select l.id,l.full_name,l.phone_e164,l.email,l.source_system,l.status,l.cadence_state,"
             "l.needs_review,l.review_reason,l.created_at,l.last_contacted_at,l.date_of_birth,"
             "l.referred_by,l.lead_type,l.location,l.owner,l.owner_user_id,l.is_test,l.timezone,l.status_reason,"
+            "l.sms_disabled,l.review_flagged_at as lead_review_flagged_at,"
+            "open_review.id as review_id,open_review.code as review_code,"
+            "open_review.message as review_message,open_review.details as review_details,"
+            "open_review.source as review_source,open_review.flagged_at as review_flagged_at,"
+            "open_review.open_reviews,"
+            "case when l.needs_review then exists(select 1 from call_logs cl where cl.lead_id=l.id) "
+            "else false end as has_calls,"
             "blocked.reason as blocked_reason,blocked.source as blocked_source,"
             "blocked.created_at as blocked_at,"
             "current_version.name as cadence_version_name,"
@@ -523,7 +618,13 @@ def dashboard_snapshot(actor: Actor):
             "left join cadence_steps cs on cs.id=oe.cadence_step_id where oe.lead_id=l.id "
             "and oe.status in ('planned','in_flight','attempted') order by "
             "case when oe.status='planned' then 0 else 1 end,oe.scheduled_for nulls last,oe.id limit 1"
-            ") next_event on true "
+            ") next_event on true left join lateral ("
+            # The oldest open review is the card (they are settled in order); the rest are counted.
+            "select r.id,r.code,r.message,r.details,r.source,r.flagged_at,"
+            "count(*) over() as open_reviews from lead_reviews r "
+            "where l.needs_review and r.lead_id=l.id and r.resolved_at is null "
+            "order by r.flagged_at,r.id limit 1"
+            ") open_review on true "
             # A blocked number stops every call and text, whatever the lead's status.
             "left join suppressed_numbers blocked on blocked.phone_e164=l.phone_e164 "
             "order by l.created_at desc limit 250"
@@ -787,8 +888,9 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
         row = conn.execute(
             "select id,practice_id,full_name,first_name,last_name,phone_e164,email,date_of_birth,"
             "source_system,status,status_reason,cadence_state,call_opt_out,sms_opt_out,needs_review,"
-            "review_reason,created_at,updated_at,last_contacted_at,callback_requested_at,referred_by,"
-            "lead_type,location,owner,owner_user_id,is_test,timezone from leads where id=%s",
+            "review_reason,review_flagged_at,created_at,updated_at,last_contacted_at,callback_requested_at,"
+            "referred_by,lead_type,location,owner,owner_user_id,is_test,timezone,sms_disabled,"
+            "sms_disabled_at,sms_disabled_reason from leads where id=%s",
             (lead_id,),
         ).fetchone()
         if not row:
@@ -873,7 +975,16 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
             (lead_id, str(lead_id)),
         ).fetchall()
         version_payload = _version_payload(conn, current_version) if current_version else None
+        reviews = conn.execute(
+            "select id,code,message,details,source,flagged_at,resolved_at,resolved_by,"
+            "resolved_by_name,resolution,note from lead_reviews where lead_id=%s "
+            "order by flagged_at desc,id desc limit 50",
+            (lead_id,),
+        ).fetchall()
+        review = lead_review_summary(conn, row) if row["needs_review"] else None
     detail = dict(row)
+    detail["review"] = review
+    detail["texts_off"] = bool(row.get("sms_disabled"))
     detail["id"] = str(detail["id"])
     detail["display_id"] = f"RPT-{str(row['id']).split('-')[0].upper()}"
     detail["phone"] = detail.get("phone_e164")
@@ -912,7 +1023,7 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
         detail["next_step"] = f"Awaiting result: {detail['next_step'] or detail['next_channel']}"
     if detail["stage"] in {"closed", "booked"}:
         # Same rule as the board: a finished lead has an outcome, not a next action.
-        detail["next_step"] = CLOSED_REASON.get(row["status"], "Outreach complete")
+        detail["next_step"] = _closed_reason(row)
         detail["next_event_id"] = None
         detail["next_event_status"] = None
         detail["next_channel"] = None
@@ -926,7 +1037,7 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
         "booking": booking,
         "history": status_history,
         "cadence_actions": cadence_actions,
-        "activity": _build_activity(audits, events, status_history, appointments),
+        "activity": _build_activity(audits, events, status_history, appointments, reviews),
         "cadence_version": version_payload,
     }
 
@@ -942,12 +1053,30 @@ RESUME_REFUSED = {
 def update_lead_cadence(lead_id: UUID, payload: CadenceAction, actor: Actor):
     with transaction() as conn:
         lead = conn.execute(
-            "select id,practice_id,status,cadence_state from leads where id=%s for update", (lead_id,)
+            "select id,practice_id,status,cadence_state,needs_review,status_reason from leads "
+            "where id=%s for update",
+            (lead_id,),
         ).fetchone()
         if not lead:
             raise HTTPException(status_code=404, detail="lead not found")
         if payload.action == "resume" and lead["status"] in RESUME_REFUSED:
             raise HTTPException(status_code=409, detail=RESUME_REFUSED[lead["status"]])
+        # 2026-10-21: Resume on a flagged lead restored its steps and set it active, but the review
+        # stayed open, so the worker (which skips needs_review) sent nothing while the page said
+        # "Pause cadence". A flagged lead goes through Resolve review, which records the choice.
+        if payload.action == "resume" and lead.get("needs_review"):
+            raise HTTPException(status_code=409, detail=OPEN_REVIEW_DETAIL)
+        if payload.action == "resume" and (closed := closed_for_good(conn, lead)):
+            raise HTTPException(status_code=409, detail=closed)
+        # A closed lead has nothing left to resume (QA 2026-10-22: a "Handled by front desk" lead
+        # went back to active with nothing planned), and nothing to pause either: Pause then Resume
+        # reopened it (QA round 2). Restart is the way to start again.
+        if lead["cadence_state"] in {"completed", "terminated"} or lead["status"] in {
+                "booked", "declined", "do_not_contact", "closed_no_response"}:
+            raise HTTPException(status_code=409, detail=(
+                "This lead was closed: handled by front desk." if lead.get("status_reason") == FRONT_DESK_REASON
+                else "This lead's cadence has ended."
+            ) + " To start outreach again, restart it (Sheet: Restart cadence, or move it to New on the board).")
         new_state = "paused" if payload.action == "pause" else "active"
         if payload.action == "resume" and lead["status"] == "invalid_phone":
             # "Wrong number" pauses the lead for review. Resuming it is staff saying the number
@@ -1169,6 +1298,18 @@ def move_lead_stage(lead_id: UUID, payload: StageMove, actor: Actor):
             raise HTTPException(
                 status_code=409, detail="a do-not-contact lead cannot be returned to outreach"
             )
+        if payload.stage in {"new", "cadence"} and (closed := closed_for_good(conn, lead)):
+            raise HTTPException(status_code=409, detail=closed)
+        # Dragging a flagged card to In cadence used to clear the review without restoring its
+        # steps or saying why. The choices (and their record) live on Resolve review.
+        if payload.stage == "cadence" and lead["needs_review"]:
+            raise HTTPException(status_code=409, detail=OPEN_REVIEW_DETAIL)
+        staff_name = actor.display_name or actor.employee_id or actor.user_id
+        if payload.stage in {"new", "closed", "booked"} and lead["needs_review"]:
+            # Restart, close and Booked settle the review; the record names who did it.
+            close_open_reviews(
+                conn, str(lead_id), f"board_{payload.stage}", by=actor.user_id, by_name=staff_name,
+            )
 
         restarted = 0
         if payload.stage == "new":
@@ -1211,6 +1352,10 @@ def move_lead_stage(lead_id: UUID, payload: StageMove, actor: Actor):
                 ("moved to review from the board", lead_id),
             )
             skip_remaining_planned(conn, str(lead_id))
+            record_review(
+                conn, str(lead_id), "moved_by_staff", "moved to review from the board",
+                source="dashboard", details={"by": staff_name},
+            )
         elif payload.stage == "closed":
             conn.execute(
                 "update leads set status='declined',cadence_state='terminated',needs_review=false,"
@@ -1308,23 +1453,45 @@ def unblock_blocked_number(payload: UnblockNumber, actor: Actor):
     return result
 
 
-@router.post("/review/{lead_id}/resolve")
-def resolve_review(lead_id: UUID, payload: ReviewAction, actor: Actor):
+@router.get("/review/{lead_id}")
+def review_options(lead_id: UUID, actor: Actor):
+    """The open review and, per choice, what will happen and the next step (confirm pop-up)."""
+    del actor
     with transaction() as conn:
         lead = conn.execute(
-            "select id,practice_id,needs_review from leads where id=%s for update", (lead_id,)
+            "select id,practice_id,full_name,phone_e164,status,status_reason,cadence_state,"
+            "needs_review,review_reason,review_flagged_at,call_opt_out,sms_opt_out,sms_disabled,"
+            "is_test from leads where id=%s",
+            (lead_id,),
         ).fetchone()
         if not lead:
             raise HTTPException(status_code=404, detail="lead not found")
-        conn.execute(
-            "update leads set needs_review=false,review_resolved_at=now(),review_reason=null where id=%s",
-            (lead_id,),
-        )
+        preview = options_preview(conn, lead)
+    return {"lead_id": str(lead_id), "full_name": lead["full_name"], **preview}
+
+
+@router.post("/review/{lead_id}/resolve")
+def resolve_review_route(lead_id: UUID, payload: ReviewAction, actor: Actor):
+    """Apply one choice. Any staff member or admin may resolve a review."""
+    choice = payload.choice or payload.resolution
+    if not choice or choice not in CHOICE_LABELS:
+        raise HTTPException(status_code=422, detail="choose what happens next for this lead")
+    staff_name = actor.display_name or actor.employee_id or actor.user_id
+    with transaction() as conn:
+        try:
+            result = resolve_review(
+                conn, str(lead_id), choice, note=payload.note, actor_id=actor.user_id,
+                actor_name=staff_name,
+            )
+        except ReviewError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+        practice = conn.execute("select practice_id from leads where id=%s", (lead_id,)).fetchone()
         _audit(
-            conn, actor, lead["practice_id"], "review.resolved", "lead", str(lead_id),
-            {"resolution": payload.resolution},
+            conn, actor, practice["practice_id"] if practice else None, "review.resolved", "lead",
+            str(lead_id), {"choice": choice, "resolution": CHOICE_LABELS[choice],
+                           **({"note": payload.note.strip()[:500]} if payload.note and payload.note.strip() else {})},
         )
-    return {"status": "resolved"}
+    return result
 
 
 @router.get("/cadence-versions")
@@ -1877,7 +2044,8 @@ def send_manual_sms(
             )
             if status == "unknown":
                 flag_lead_for_review(
-                    conn, str(lead_id), "manual SMS result requires provider reconciliation"
+                    conn, str(lead_id), "manual SMS result requires provider reconciliation",
+                    code="manual_sms_unconfirmed", source="dashboard",
                 )
             _audit(
                 conn, actor, lead["practice_id"], f"sms.manual_{status}", "lead", str(lead_id),

@@ -5,7 +5,7 @@ client).
 
 | Path | Purpose |
 | --- | --- |
-| `migrations/NNN_name.sql` | Ordered, idempotent schema changes (001 … 032). `rpt migrate` applies any file not yet recorded in `public.schema_migrations`, in filename order. |
+| `migrations/NNN_name.sql` | Ordered, idempotent schema changes (001 … 049). 048 (`lead_reviews`) is byte-identical to production's; demo-only review codes come from Python. 046, 047 and 049 (`appointments.stride_patient_id`, booking engine) are demo-only. `rpt migrate` applies any file not yet recorded in `public.schema_migrations`, in filename order. |
 | `seed.sql` | Fresh-sandbox seed (`rpt seed`): the `rausch-pt` practice, settings, default cadence. Leaves `stride_booking_enabled=false`. |
 | `dev/reset_test_lead_by_name.sql` | Dev/test only. Used by `rpt test-lead` to reset synthetic leads; can only match `is_test` dashboard leads. Remove before a real production release (see `docs/FUTURE_DEPLOYMENT.md`). |
 
@@ -37,4 +37,9 @@ client).
   historical reasons; ordering is by full filename.
 - Write migrations to be re-runnable (`if not exists`, `drop constraint if exists`, guarded updates).
 - Some invariants are enforced by triggers/constraints (for example migration 025's worker claim protocol and
-  028–030 review-pause fallback); read the migration before changing related Python.
+  028–030 review-pause fallback, 048 review rows and close-on-clear); read the migration before changing related Python.
+- `lead_reviews` (048) — one row per review flag (code, message, details, source) and its resolution
+  (who, choice, note). `leads.sms_disabled` = calls only; `leads.sheet_name_accepted` = Sheet name staff kept;
+  `sheet_row_state.sheet_name` = the Name the Sheet worker last read (fills pre-048 name reviews).
+- The live demo DB stores `lead_action_requests.request_id` / `lead_id` / `practice_id` as text (migrations: uuid /
+  uuid / bigint). Compare them as text in SQL; `tests/test_live_column_types_integration.py` covers it.

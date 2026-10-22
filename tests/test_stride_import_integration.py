@@ -602,8 +602,12 @@ def test_flagged_lead_that_rebooks_is_booked_again(env):
     events = env.db.execute("select event_type from integration_outbox where aggregate_id=%s "
                             "and event_type<>'sheet.stage_changed' order by id",  # migration 045
                             (str(lead),)).fetchall()
+    # review_flagged: the review record (migration 048) names the reason in the Sheet too.
     assert [e["event_type"] for e in events] == [
-        "sheet.lead_booked", "sheet.stride_booking_cancelled", "sheet.lead_booked"]
+        "sheet.lead_booked", "sheet.review_flagged", "sheet.stride_booking_cancelled",
+        "sheet.lead_booked"]
+    review = env.one("select code,resolved_at,resolution from lead_reviews where lead_id=%s", lead)
+    assert review["code"] == "appointment_cancelled" and review["resolution"] == "booked"
 
 
 def _book_then_change(env, name, **change):
@@ -672,8 +676,8 @@ def test_staff_rebooking_after_a_cancel_is_not_flagged_again(env):
         _sheet_marks_booked(env, lead)
         assert env.tick().get("leads_flagged") == 0
         assert env.one("select status from leads where id=%s", lead)["status"] == "booked"
-    flags = env.one("select count(*) n from lead_status_history where lead_id=%s and to_status='needs_attention'",
-                    lead)
+    flags = env.one("select count(*) n from lead_status_history where lead_id=%s and to_status='needs_attention' "
+                    "and reason not like 'Flagged for review:%%'", lead)  # 048's history line
     assert flags["n"] == 1
 
 

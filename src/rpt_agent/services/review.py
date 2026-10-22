@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from psycopg.types.json import Jsonb
+
+from .sheet_sync import enqueue_sheet_update
+
 # Skipped by pause/review so Resume can restore only these rows, not DNC/closed skips.
 PAUSE_SKIP_REASON = "paused_for_review"
 
@@ -24,15 +28,92 @@ def restore_pause_skipped(conn, lead_id: str) -> int:
     return len(rows)
 
 
-def flag_lead_for_review(conn, lead_id: str, reason: str) -> None:
+# A lead whose outcome is final is never pulled back into review. A terminated or completed
+# cadence (replaced by a newer referral, closed after a review) has nothing left to resume either.
+_FINAL_STATUSES = "('booked','declined','do_not_contact','closed_no_response')"
+
+
+def record_review(
+    conn,
+    lead_id: str,
+    code: str,
+    message: str,
+    *,
+    details: dict | None = None,
+    source: str = "system",
+    outreach_event_id: int | None = None,
+) -> int | None:
+    """Write (or refresh) the lead_reviews row for one flag; returns its id.
+
+    One open row per thing that went wrong: a step's own row is refreshed rather than duplicated
+    (migration 048's fail-safe may already have written a plain one for the same failed step), and
+    the same code with the same words is the same flag seen again (a Sheet name re-read).
+    """
+    # Keys with no value are dropped, so a refresh never blanks what the first writer knew.
+    payload = Jsonb({key: value for key, value in (details or {}).items() if value is not None})
+    row = None
+    first_words = False
+    if outreach_event_id is not None:
+        row = conn.execute(
+            "with old as (select id,source from lead_reviews where lead_id=%s and resolved_at is null "
+            "and outreach_event_id=%s order by id desc limit 1 for update) "
+            "update lead_reviews r set code=%s,message=%s,details=r.details||%s,source=%s,"
+            "updated_at=now() from old where r.id=old.id returning r.id,old.source as old_source",
+            (lead_id, outreach_event_id, code, message[:500], payload, source),
+        ).fetchone()
+        # A row the 048 fail-safe wrote moments ago (source 'db') has no history line yet; the
+        # application's words become that line.
+        first_words = bool(row and row.get("old_source") == "db")
+    if not row:
+        row = conn.execute(
+            "update lead_reviews set details=details||%s,updated_at=now() "
+            "where id=(select id from lead_reviews where lead_id=%s and resolved_at is null "
+            "and code=%s and message=%s order by id desc limit 1) returning id",
+            (payload, lead_id, code, message[:500]),
+        ).fetchone()
+    if not row:
+        row = conn.execute(
+            "insert into lead_reviews(lead_id,code,message,details,source,outreach_event_id) "
+            "values(%s,%s,%s,%s,%s,%s) returning id",
+            (lead_id, code, message[:500], payload, source, outreach_event_id),
+        ).fetchone()
+        first_words = bool(row)
+    if not row:
+        return None
+    if first_words:
+        conn.execute(
+            "insert into lead_status_history(lead_id,from_status,to_status,source,reason) "
+            "select id,status,status,'system',%s from leads where id=%s",
+            (f"Flagged for review: {message}"[:500], lead_id),
+        )
+    # The Sheet's Outcome Status names the reason ("Needs review: text failed (landline)").
+    enqueue_sheet_update(
+        conn, lead_id=str(lead_id), event_type="review_flagged", source_key=f"{row['id']}:{code}"
+    )
+    return row["id"]
+
+
+def flag_lead_for_review(
+    conn,
+    lead_id: str,
+    reason: str,
+    *,
+    code: str = "other",
+    details: dict | None = None,
+    source: str = "system",
+    outreach_event_id: int | None = None,
+) -> bool:
     """Pause non-terminal outreach whenever staff attention is required.
 
-    This owns the outcome staff see: the lead's status and the reason. Migration
-    030's trigger is the fail-safe for paths that never get here (a stale worker,
-    a manual SQL fix) and deliberately does less - it flags, pauses and stops the
-    schedule, but never sets leads.status. Change one, check the other.
+    This owns the outcome staff see: the lead's status, the reason, and the review row (code,
+    details, source) the dashboard turns into a card with choices. Migration 030's trigger
+    (replaced in 048) is the fail-safe for paths that never get here (a stale worker, a manual SQL
+    fix) and deliberately does less - it flags, pauses, stops the schedule and writes a plain review
+    row, but never sets leads.status. Change one, check the other.
+
+    Returns whether the lead is now flagged (False for a finished lead, which is left alone).
     """
-    conn.execute(
+    flagged = conn.execute(
         "update leads set needs_review=true,review_reason=%s,review_flagged_at=now(),"
         "status=case when status in ('booked','declined','do_not_contact','closed_no_response',"
         "'invalid_phone') then status else 'needs_attention' end,"
@@ -40,10 +121,18 @@ def flag_lead_for_review(conn, lead_id: str, reason: str) -> None:
         "'closed_no_response') then cadence_state else 'paused' end,"
         "status_changed_at=case when status in ('booked','declined','do_not_contact',"
         "'closed_no_response') then status_changed_at else now() end where id=%s "
-        "and status not in ('booked','declined','do_not_contact','closed_no_response')",
+        f"and status not in {_FINAL_STATUSES} and cadence_state not in ('completed','terminated') "
+        "returning id",
         (reason[:500], lead_id),
-    )
+    ).fetchone()
     skip_remaining_planned(conn, lead_id)
+    if not flagged:
+        return False
+    record_review(
+        conn, lead_id, code, reason, details=details, source=source,
+        outreach_event_id=outreach_event_id,
+    )
+    return True
 
 
 REPLACED_REASON = "replaced by a newer referral on this number"

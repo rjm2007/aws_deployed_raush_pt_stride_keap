@@ -65,10 +65,12 @@ RESULT_LABELS = {
     "number_blocked_needs_review": ("Number blocked; needs review", "Needs Review"),
 }
 REVIEW_LABELS = {
-    "phone_changed_needs_review": "Phone number changed; needs review",
-    "name_changed_needs_review": "Name changed; needs review",
-    "name_and_phone_changed_needs_review": "Name and phone number changed; needs review",
+    "name_changed_needs_review": "Needs review: name changed",
 }
+# A changed phone number closes the lead at once (owner, 2026-10-22): Outcome Status, Lead Status.
+# Action is set to "Start cadence" with it, as for a dashboard resume (sheet_sync.DASHBOARD_OUTCOMES):
+# a stale "Restart cadence" or "Booked" next to a status that is not final would run again.
+PHONE_CHANGED_LABELS = {"phone_changed_closed": ("Phone changed: add a new row", "Closed")}
 FINAL_STATUSES = {"booked", "already booked", "do not contact applied", "completed",
                   "lead already exists"}
 RETRYING = re.compile(r"^retrying ([12])/3: ", re.IGNORECASE)
@@ -322,7 +324,8 @@ class PollResult:
     handled: set[int] = field(default_factory=set)  # row numbers a command touched this poll
     # Profile fingerprints to store once this poll's writes are in the Sheet (lead id ->
     # (fingerprint, row)); a write that fails or is deferred leaves the change to the next poll.
-    baselines: dict[str, tuple[str, int]] = field(default_factory=dict)
+    # lead id -> (fingerprint, row, the row's Name): the name is what a pre-048 name review lacks.
+    baselines: dict[str, tuple[str, int, str]] = field(default_factory=dict)
 
     def save_baselines(self, deferred_rows: set[int]) -> None:
         _save_baseline({lead_id: item for lead_id, item in self.baselines.items()
@@ -413,7 +416,8 @@ def _start_row_already_done(row: SheetRow, request) -> Outcome | None:
     with transaction() as conn:
         stored = conn.execute(
             "select r.lead_id,r.request_hash from lead_action_requests r "
-            "join leads l on l.id=r.lead_id "
+            # As text: the live lead_action_requests.lead_id is text, the migrated one uuid.
+            "join leads l on l.id::text=r.lead_id::text "
             "where r.request_id=%s and r.status='completed' and r.action='start_cadence'",
             (old,),
         ).fetchone()
@@ -516,7 +520,7 @@ def _write_outcome(grid: SheetGrid, row: SheetRow, outcome: Outcome,
     # commands leave the fingerprint alone, so a profile edit made with them still syncs.
     if result is not None and lead_id and _is_uuid(lead_id) and not outcome.status.startswith(
             ("Retrying", "Error")):
-        result.baselines[lead_id] = (profile_hash(row), row.number)
+        result.baselines[lead_id] = (profile_hash(row), row.number, _sheet_name(row))
 
 
 def sync_profiles(grid: SheetGrid, result: PollResult, trace: WorkflowTrace,
@@ -546,14 +550,22 @@ def sync_profiles(grid: SheetGrid, result: PollResult, trace: WorkflowTrace,
                 (list(first),),
             )
         }
+        no_name = {
+            str(r["lead_id"]) for r in conn.execute(
+                "select lead_id from sheet_row_state where lead_id=any(%s) and sheet_name is null",
+                (list(first),),
+            )
+        }
     baselines = result.baselines
     for lead_id, row in first.items():
         fingerprint = profile_hash(row)
         if lead_id not in stored:
-            baselines[lead_id] = (fingerprint, row.number)  # first sight: remember, don't act
+            baselines[lead_id] = (fingerprint, row.number, _sheet_name(row))  # first sight: remember
             result.counts["baselines"] += 1
             continue
         if stored[lead_id] == fingerprint:
+            if lead_id in no_name:  # rows seen before 048: record the Name the row holds
+                baselines[lead_id] = (fingerprint, row.number, _sheet_name(row))
             continue
         if previous is not None and previous.get(lead_id) != fingerprint:
             continue  # changed since the last full read: wait until it holds still
@@ -586,25 +598,49 @@ def sync_profiles(grid: SheetGrid, result: PollResult, trace: WorkflowTrace,
             if code in REVIEW_LABELS:
                 grid.set(row, "lead_status", "Needs Review")
                 grid.set(row, "outcome_status", REVIEW_LABELS[code])
+            elif code in PHONE_CHANGED_LABELS:
+                outcome_status, lead_status = PHONE_CHANGED_LABELS[code]
+                grid.set(row, "lead_status", lead_status)
+                if not _command_pending(row):  # a command staff just typed runs (and is refused)
+                    grid.set(row, "outcome_status", outcome_status)
+                    grid.set(row, "action", "Start cadence")
             elif synced.status_code >= 400:
                 detail = synced.body.get("detail") if isinstance(synced.body.get("detail"), str) \
                     else synced.body.get("code")
                 grid.set(row, "outcome_status", "Error: " + str(detail or "request rejected")[:180])
-        baselines[lead_id] = (fingerprint, row.number)
+        baselines[lead_id] = (fingerprint, row.number, _sheet_name(row))
         result.counts["profiles"] += 1
     return seen_now
 
 
-def _save_baseline(items: dict[str, tuple[str, int]]) -> None:
+def _sheet_name(row: SheetRow) -> str:
+    return " ".join(row.get("name").split())
+
+
+def _save_baseline(items: dict[str, tuple[str, int, str]]) -> None:
     if not items:
         return
     with transaction() as conn, conn.cursor() as cursor:
         cursor.executemany(
-            "insert into sheet_row_state(lead_id,practice_id,profile_hash,row_number) "
-            "select id,practice_id,%s,%s from leads where id=%s "
+            "insert into sheet_row_state(lead_id,practice_id,profile_hash,row_number,sheet_name) "
+            "select id,practice_id,%s,%s,%s from leads where id=%s "
             "on conflict(lead_id) do update set profile_hash=excluded.profile_hash,"
-            "row_number=excluded.row_number,seen_at=now(),updated_at=now()",
-            [(fingerprint, number, lead_id) for lead_id, (fingerprint, number) in items.items()],
+            "row_number=excluded.row_number,sheet_name=excluded.sheet_name,seen_at=now(),"
+            "updated_at=now()",
+            [(fingerprint, number, name or None, lead_id)
+             for lead_id, (fingerprint, number, name) in items.items()],
+        )
+        # A name review flagged before 2026-10-22 never recorded the new name (the D. S. lead).
+        # The row's Name read now fills it in, so the card shows old -> new and the normal choices
+        # apply with real values. Nothing is resolved or flagged by this.
+        cursor.execute(
+            "update lead_reviews r set details=r.details||jsonb_build_object("
+            "'old_name',l.full_name,'new_name',s.sheet_name),updated_at=now() "
+            "from leads l join sheet_row_state s on s.lead_id=l.id "
+            "where r.lead_id=l.id and l.id=any(%s) and r.code='name_changed' and r.resolved_at is null "
+            "and not (r.details ? 'new_name') and s.sheet_name is not null "
+            "and lower(s.sheet_name)<>lower(regexp_replace(trim(l.full_name),'\\s+',' ','g'))",
+            ([lead_id for lead_id in items],),
         )
 
 
@@ -626,11 +662,29 @@ def apply_snapshot(grid: SheetGrid, snapshot: dict[str, Any]) -> bool:
             grid.set(row, key, sheet[key] or "")
     if "action_status" in sheet:
         grid.set(row, "outcome_status", sheet["action_status"] or "")
+    # Review flagged / resolved (services/lead_review.py). Never over a command staff typed and the
+    # Sheet worker has not run yet (still settling, or waiting) or one still running: QA 2026-10-22,
+    # "Start cadence" overwrote a Booked typed seconds earlier, and a new "Needs review" text would
+    # block it. The command's own result is written when it runs.
+    if sheet.get("review_status") and not _command_pending(row):
+        grid.set(row, "outcome_status", sheet["review_status"])
+        if sheet.get("review_action"):
+            grid.set(row, "action", sheet["review_action"])
     # n8n never wrote this (spec F.3); the backend sends it to stop a stale command re-running.
     if "action" in sheet:
         grid.set(row, "action", sheet["action"] or "")
     grid.set(row, "lead_status", _lead_status(row, sheet))
     return True
+
+
+def _in_progress(status: str) -> bool:
+    return status.casefold().startswith("processing: ") or bool(RETRYING.match(status))
+
+
+def _command_pending(row: SheetRow) -> bool:
+    """A command in the row that has not finished: typed (waiting or settling) or running."""
+    command = command_of(row)
+    return _in_progress(row.get("outcome_status")) or bool(command and needs_processing(row, command))
 
 
 def _lead_status(row: SheetRow, sheet: dict[str, Any]) -> str:

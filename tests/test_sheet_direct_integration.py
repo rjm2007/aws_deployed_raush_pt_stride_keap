@@ -198,7 +198,7 @@ def test_profile_edits_sync_and_a_name_change_goes_to_review(env):
     env.sheet.set(number, "name", "Asha Kumar")
     env.tick()
     env.tick()
-    assert env.cell(number, "outcome_status") == "Name changed; needs review"
+    assert env.cell(number, "outcome_status") == "Needs review: name changed"
     assert env.cell(number, "lead_status") == "Needs Review"
     assert env.lead(lead_id)["needs_review"] is True
     assert env.lead(lead_id)["full_name"] == "Asha Rao"  # identity is never overwritten

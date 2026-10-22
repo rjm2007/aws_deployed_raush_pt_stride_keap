@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .review import record_review
 from .sheet_sync import enqueue_sheet_update
 from .stride_import import CANCELLED_STATUSES, LATE_CANCEL_STATUSES, NO_SHOW_STATUSES
 
@@ -30,6 +31,15 @@ REASON_LATE_CANCEL = "Late cancel in Stride"
 REASON_NO_SHOW = "No show in Stride"
 REASON_REMOVED = "Appointment removed in Stride"
 REASON_UNCLEAR = "Unclear change in Stride"
+# Review codes for the dashboard's "Appointment" group (services/lead_review.py, demo only).
+REVIEW_CODES = {
+    REASON_CANCELLED: "appointment_cancelled",
+    REASON_LATE_CANCEL: "appointment_late_cancel",
+    REASON_NO_SHOW: "appointment_no_show",
+    REASON_REMOVED: "appointment_removed",
+    REASON_UNCLEAR: "appointment_unclear",
+}
+MISSED_REASONS = tuple(REVIEW_CODES)
 
 # Same person: the names agree AND (same date of birth, or - only when either side
 # has no DOB - the lead's phone is one of the patient's phones). Names agree when the
@@ -159,10 +169,16 @@ def mark_leads_booked_from_stride(conn, practice_id: int) -> int:
         " and a.start_utc>now() and lower(coalesce(a.status,'')) <> all(%s) "
         # A lead flagged for a Stride problem is booked again only by a visit that changed after
         # the flag (a real rebook), never by one it already had (e.g. the twin of an unclear delete).
-        " and (l.status<>'needs_attention' or coalesce(l.review_reason,'') not like '%% in Stride' "
-        "  or a.updated_at>l.status_changed_at) "
+        # The flag time comes from the open flag or from its review record, so it still holds after
+        # staff settle the review (Front desk closes the lead; 2026-10-22). Only the appointment
+        # reasons count: a booking the agent could not confirm ("...; confirm in Stride") is booked
+        # by the visit it made, which Stride stamps before the flag.
+        " and a.updated_at>coalesce(greatest("
+        "  case when l.status='needs_attention' and l.review_reason=any(%s) then l.status_changed_at end,"
+        "  (select max(r.flagged_at) from lead_reviews r where r.lead_id=l.id and r.message=any(%s))"
+        " ),'-infinity'::timestamptz) "
         "where l.practice_id=%s and l.status<>'booked' order by l.id,a.start_utc",
-        (list(_MISSED), practice_id),
+        (list(_MISSED), list(MISSED_REASONS), list(MISSED_REASONS), practice_id),
     ).fetchall()
     booked = 0
     for row in rows:
@@ -245,6 +261,9 @@ def flag_cancelled_bookings(conn, practice_id: int) -> int:
             "values(%s,'booked','needs_attention','stride',%s)",
             (row["id"], reason),
         )
+        record_review(conn, str(row["id"]), REVIEW_CODES[reason], reason, source="stride",
+                      details={"stride_status": row["appt_status"] or None,
+                               "removed": bool(row["removed"]) or None})
         enqueue_sheet_update(
             conn,
             lead_id=str(row["id"]),
@@ -291,6 +310,8 @@ def flag_unclear_deletes(conn, practice_id: int, patient_ids: set[int]) -> int:
             "values(%s,'booked','needs_attention','stride',%s)",
             (row["id"], REASON_UNCLEAR),
         )
+        record_review(conn, str(row["id"]), REVIEW_CODES[REASON_UNCLEAR], REASON_UNCLEAR,
+                      source="stride")
         enqueue_sheet_update(
             conn, lead_id=str(row["id"]), event_type="stride_booking_cancelled",
             source_key=f"stride:unclear:{row['id']}:{row['status_changed_at']}",

@@ -255,7 +255,7 @@ class DetailConnection:
         if any(table in sql for table in (
             "from sms_messages", "from call_logs", "from appointments",
             "from lead_status_history", "from lead_message_overrides",
-            "from dashboard_audit_log",
+            "from dashboard_audit_log", "from lead_reviews",
         )):
             return Result([])
         raise AssertionError(sql)
@@ -1578,7 +1578,7 @@ class ResumeConnection:
         del params
         normal = " ".join(sql.split())
         self.statements.append(normal)
-        if normal.startswith("select id,practice_id,status,cadence_state from leads"):
+        if normal.startswith("select id,practice_id,status,cadence_state,needs_review,status_reason from leads"):
             return Result([dict(self.lead)])
         return Result([])
 

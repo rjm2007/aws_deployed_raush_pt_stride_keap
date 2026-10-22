@@ -191,3 +191,17 @@ def test_long_retry_after_is_deferred_to_durable_worker():
     assert raised.value.retryable is True
     assert raised.value.retry_after_seconds == 120
     assert attempts == 1
+
+
+def test_a_refused_text_carries_twilios_own_error_code():
+    """21614 = not a mobile number. The review card turns the code into plain words."""
+    settings = Settings(
+        provider_mode="mock", twilio_mode="real", twilio_account_sid="AC-test",
+        twilio_auth_token="token", twilio_from_number="+15005550006",
+    )
+    clients = ProviderClients(settings, httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(400, json={"code": 21614, "message": "not a mobile"}))))
+    with pytest.raises(ProviderError) as error:
+        clients.send_sms(WorkflowTrace("provider", "test", "t"), "+15555550123", "hi")
+    assert "Twilio error 21614" in str(error.value)
+    assert error.value.code == "400" and not error.value.retryable

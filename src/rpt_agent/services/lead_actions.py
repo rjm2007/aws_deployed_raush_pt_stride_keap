@@ -12,6 +12,11 @@ from psycopg.types.json import Jsonb
 from ..config import get_settings
 from ..db import transaction
 from ..worker import format_phone, materialize_cadence
+from .lead_review import (
+    close_for_phone_change,
+    close_open_reviews,
+    closed_for_good,
+)
 from .review import flag_lead_for_review, hand_over_number
 from .sheet_sync import enqueue_sheet_update
 
@@ -45,7 +50,7 @@ def _hold_if_number_blocked(conn, lead_id: str, phone: str | None) -> bool:
         "select 1 from suppressed_numbers where phone_e164=%s", (phone,)
     ).fetchone():
         return False
-    flag_lead_for_review(conn, lead_id, NUMBER_BLOCKED_REASON)
+    flag_lead_for_review(conn, lead_id, NUMBER_BLOCKED_REASON, code="number_blocked", source="sheet")
     return True
 
 
@@ -380,6 +385,10 @@ def _restart_cadence(
     lead_data: dict[str, Any] | None = None,
 ) -> ActionExecution:
     lead = _locked_lead(conn, practice["id"], lead_id, phone)
+    # A lead whose phone changed in the Sheet is never restarted on its old number (even if staff
+    # put the old number back in the row, or the lead was Booked).
+    if closed := closed_for_good(conn, lead):
+        raise LeadActionError(409, "restart_not_allowed", closed, lead_id=str(lead_id))
     if lead["status"] in {"do_not_contact", "invalid_phone"}:
         raise LeadActionError(
             409,
@@ -434,6 +443,8 @@ def _restart_cadence(
         "delete from outreach_events where lead_id=%s and status in ('planned','skipped')",
         (lead_id,),
     )
+    # A restart settles an open review; the record says who decided it.
+    close_open_reviews(conn, str(lead_id), "restarted", by="sheet", by_name="Google Sheet")
     conn.execute(
         "update leads set status='new',cadence_state='pending',needs_review=false,"
         "review_reason=null,review_flagged_at=null,last_call_outcome=null,status_reason=null,"
@@ -492,6 +503,7 @@ def _do_not_contact(
 ) -> ActionExecution:
     lead = _locked_lead(conn, practice["id"], lead_id, phone)
     if lead["status"] != "do_not_contact":
+        close_open_reviews(conn, str(lead_id), "do_not_contact", by="sheet", by_name="Google Sheet")
         conn.execute(
             "update leads set call_opt_out=true,sms_opt_out=true,status='do_not_contact',"
             "needs_review=false,review_reason=null,review_resolved_at=case when needs_review then now() else review_resolved_at end,"
@@ -542,6 +554,7 @@ def _mark_booked(
     """Accept the Sheet team's manual booking decision without inventing an appointment."""
     lead = _locked_lead(conn, practice["id"], lead_id, phone)
     if lead["status"] != "booked":
+        close_open_reviews(conn, str(lead_id), "booked", by="sheet", by_name="Google Sheet")
         conn.execute(
             "update leads set status='booked',cadence_state='completed',needs_review=false,"
             "review_reason=null,review_resolved_at=case when needs_review then now() "
@@ -713,10 +726,20 @@ def execute_lead_action(
         return result
 
 
+def _same_name(left: Any, right: Any) -> bool:
+    return " ".join(str(left or "").split()).casefold() == " ".join(str(right or "").split()).casefold()
+
+
 def sync_sheet_lead(
     *, request_id: UUID, lead_id: UUID, lead: dict[str, Any]
 ) -> ActionExecution:
-    """Update one linked Sheet lead; identity changes require staff review."""
+    """Update one linked Sheet lead; a changed name needs review, a changed phone closes it.
+
+    2026-10-21: a Name edited in the Sheet flagged the lead "needs review" with nothing saying
+    what changed. Now the review records the old and new name, and staff choose: use the new
+    name, keep the old one (that Sheet value is then accepted and never flags again), or close.
+    A new phone number is a new lead: this one closes at once (owner, 2026-10-22).
+    """
     phone = format_phone(lead.get("phone"))
     if not phone:
         return ActionExecution(422, {"code": "invalid_phone", "detail": "Phone is invalid"})
@@ -729,47 +752,48 @@ def sync_sheet_lead(
         if not practice:
             return ActionExecution(503, {"detail": "Configured practice is not available"})
         current = conn.execute(
-            "select id,full_name,phone_e164 from leads "
+            "select id,full_name,phone_e164,status,cadence_state,sheet_name_accepted from leads "
             "where id=%s and practice_id=%s for update",
             (lead_id, practice["id"]),
         ).fetchone()
         if not current:
             return ActionExecution(404, {"code": "lead_not_found", "detail": "Lead was not found"})
-        incoming_name = str(lead.get("full_name") or "").strip()
+        incoming_name = " ".join(str(lead.get("full_name") or "").split())
         stored_name = str(current["full_name"] or "").strip()
-        name_changed = bool(incoming_name and incoming_name != stored_name)
+        # The Sheet is back to the name on file: the earlier "keep old name" no longer applies.
+        if current.get("sheet_name_accepted") and incoming_name and _same_name(incoming_name, stored_name):
+            conn.execute("update leads set sheet_name_accepted=null where id=%s", (lead_id,))
+        # Staff already looked at this exact Sheet name and kept the stored one.
+        accepted = bool(incoming_name and current.get("sheet_name_accepted")
+                        and _same_name(incoming_name, current["sheet_name_accepted"]))
+        name_changed = bool(incoming_name and not _same_name(incoming_name, stored_name)
+                            and not accepted)
         phone_changed = current["phone_e164"] != phone
-        if not name_changed and not phone_changed:
-            _update_lead_profile(conn, lead_id, lead)
-            return ActionExecution(
-                200,
-                {
-                    "request_id": str(request_id),
-                    "lead_id": str(lead_id),
-                    "previous_lead_id": str(lead_id),
-                    "result": "profile_updated",
-                    "created": False,
-                },
+        base = {
+            "request_id": str(request_id),
+            "lead_id": str(lead_id),
+            "previous_lead_id": str(lead_id),
+            "created": False,
+        }
+        if phone_changed:
+            close_for_phone_change(conn, current, new_phone=phone, new_name=incoming_name or None)
+            code = "phone_changed_closed"
+            return ActionExecution(409, {
+                **base, "result": code, "code": code,
+                "detail": "Phone number changed; the lead is closed. Add the new number as a new row",
+            })
+        if name_changed:
+            flagged = flag_lead_for_review(
+                conn, str(lead_id), "Name changed; needs review", code="name_changed",
+                source="sheet", details={"old_name": stored_name, "new_name": incoming_name},
             )
-        if name_changed and phone_changed:
-            code = "name_and_phone_changed_needs_review"
-            detail = "Name and phone number changed; needs review"
-        elif name_changed:
-            code = "name_changed_needs_review"
-            detail = "Name changed; needs review"
-        else:
-            code = "phone_changed_needs_review"
-            detail = "Phone number changed; needs review"
-        flag_lead_for_review(conn, str(lead_id), detail)
-        return ActionExecution(
-            409,
-            {
-                "request_id": str(request_id),
-                "lead_id": str(lead_id),
-                "previous_lead_id": str(lead_id),
-                "result": code,
-                "code": code,
-                "detail": detail,
-                "created": False,
-            },
-        )
+            if flagged:
+                code = "name_changed_needs_review"
+                return ActionExecution(409, {
+                    **base, "result": code, "code": code, "detail": "Name changed; needs review",
+                })
+            # A finished lead (booked, closed) has no outreach left to protect: nothing to review,
+            # and the stored name stays as it was.
+        keep_name = name_changed or accepted
+        _update_lead_profile(conn, lead_id, {**lead, "full_name": None} if keep_name else lead)
+        return ActionExecution(200, {**base, "result": "profile_updated"})

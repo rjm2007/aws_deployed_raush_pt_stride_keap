@@ -28,7 +28,20 @@ class TwilioService(ProviderService):
             else (account_sid, auth_token),
         )
         if response.status_code not in (200, 201):
-            raise self._response_error("twilio", response, idempotent=False)
+            error = self._response_error("twilio", response, idempotent=False)
+            # Twilio's own code says why (21614: not a mobile number). The review card turns it
+            # into plain words, so it travels in the message; the error's code stays the HTTP status.
+            try:
+                twilio_code = response.json().get("code")
+            except (ValueError, AttributeError):
+                twilio_code = None
+            if twilio_code:
+                error = ProviderError(
+                    "twilio", error.code, f"{error} (Twilio error {twilio_code})",
+                    ambiguous=error.ambiguous, retryable=error.retryable,
+                    retry_after_seconds=error.retry_after_seconds,
+                )
+            raise error
         sid = self._json_object(
             "twilio", response, operation="Twilio message", ambiguous=True
         ).get("sid")

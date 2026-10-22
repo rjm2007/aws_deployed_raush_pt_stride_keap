@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from ..db import transaction
 from ..observability import WorkflowTrace
-from .review import skip_remaining_planned
+from .review import record_review, skip_remaining_planned
 from .sheet_sync import enqueue_sheet_update
 
 CALLBACK_MIN_MINUTES = 5
@@ -129,9 +129,13 @@ def mark_booked(conn, lead_id: str, source: str) -> None:
         "where lead_id=%s and status='planned'",
         (lead_id,),
     )
+    # A confirmed booking settles any open review, as the Sheet's Booked does (migration 048's
+    # trigger records it as "booked"): a booked lead left flagged showed in Needs Review, where
+    # "Continue" would have put it back into calls.
     conn.execute(
         "update leads set status='booked',cadence_state='completed',last_call_outcome='booked',"
-        "status_changed_at=now() where id=%s",
+        "needs_review=false,review_reason=null,review_resolved_at=case when needs_review then now() "
+        "else review_resolved_at end,status_changed_at=now() where id=%s",
         (lead_id,),
     )
     if lead["status"] != "booked":
@@ -429,6 +433,11 @@ def report_lead_status(
             )
             skip_remaining_planned(conn, lead_id)
             record_status(conn, lead_id, lead["status"], "invalid_phone", source, reason)
+            record_review(
+                conn, lead_id, "wrong_person", reason, source="call",
+                outreach_event_id=event["id"] if event else None,
+                details={"note": note or None, "call_id": stable_call_id},
+            )
         elif normalized == "call_opt_out":
             conn.execute(
                 "update leads set call_opt_out=true,last_call_outcome='call_opt_out',"
@@ -476,6 +485,11 @@ def report_lead_status(
             )
             skip_remaining_planned(conn, lead_id)
             record_status(conn, lead_id, lead["status"], "needs_attention", source, reason)
+            record_review(
+                conn, lead_id, "unrecognized_status", reason, source="call",
+                outreach_event_id=event["id"] if event else None,
+                details={"reported_status": normalized, "note": note or None, "call_id": stable_call_id},
+            )
         conn.execute("update provider_events set processed_at=now() where id=%s", (receipt["id"],))
         enqueue_sheet_update(
             conn,
@@ -621,6 +635,10 @@ def apply_call_outcome(
             )
             skip_remaining_planned(conn, lead_id)
             record_status(conn, lead_id, lead["status"], "needs_attention", source, outcome)
+            record_review(
+                conn, lead_id, "unrecognized_status", f"call outcome: {outcome}", source="call",
+                outreach_event_id=event_id, details={"reported_status": outcome},
+            )
         if event["vapi_call_id"]:
             conn.execute(
                 "update test_usage_ledger set outcome=%s where provider='vapi' and provider_ref=%s",
