@@ -39,6 +39,11 @@ otherwise the default case type is used.
 - The lead comes from the call (`variableValues.lead_id`), never from the model.
 - Reply starts with a code the prompt can branch on: `OPENINGS`, `NOTHING_IN_RANGE`,
   `NO_SUCH_THERAPIST`, `NO_OPENINGS_FOR_THERAPIST`, `NO_OPENINGS`, `UNKNOWN_LOCATION`, `PAST_DATE`, `BAD_*`.
+- A day past the horizon (`BOOKING_HORIZON_DAYS` from the booking calendar's today, so 31 days; with
+  `BOOKING_TODAY_OVERRIDE` the asked day is first moved onto the pinned calendar) answers
+  `NOTHING_IN_RANGE: <day> is too far ahead to book yet; we can only book up to <last day>. ...` with the
+  nearest openings from today (time of day kept if possible). `book-appointment` on such a day says the
+  same before its other openings. Before 2026-10-22 it answered `NO_OPENINGS` although times were open.
 
 **`/api/v1/tools/book-appointment`** — creates real Stride records.
 - `date` (YYYY-MM-DD) and `time` the caller chose, `first_name`, `last_name`, `date_of_birth`

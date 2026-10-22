@@ -2234,3 +2234,11 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   258). Migration 049 adds the column for fresh databases; the live demo DB already has it (no-op there).
   Demo-only (production has no booking engine).
 - The BOOKED tool reply says "more than 10 minutes late", matching the booking prompt.
+
+### 2026-10-22 — Booking engine: a day past the 31-day horizon
+- `find_slots` searched only the asked day and the days after it, both past the horizon, so a caller asking for
+  Nov 26 (35 days out) heard "no openings" although there were many (local QA). It now replies
+  `NOTHING_IN_RANGE: <day> is too far ahead to book yet; we can only book up to <last day>. ...` with the
+  nearest openings from today; `book_slot` on such a day prefixes its other openings the same way. The code
+  stays NOTHING_IN_RANGE, which the booking prompt already handles (no prompt change). Days inside the window
+  (holidays included) are unchanged. On the demo (pinned June 15) Nov 26 is moved to Thu July 23, past July 15.

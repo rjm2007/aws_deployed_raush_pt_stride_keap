@@ -709,3 +709,66 @@ def test_a_booking_saves_the_stride_patient_on_the_appointment_and_says_ten_minu
     row = env.one("select a.stride_patient_id,l.stride_patient_id as lead_patient from appointments a "
                   "join leads l on l.id=a.lead_id where a.lead_id=%s", lead)
     assert row["stride_patient_id"] and row["stride_patient_id"] == row["lead_patient"]
+
+
+def test_a_day_past_the_horizon_is_too_far_and_gets_the_nearest_times(env):
+    """QA 2026-10-22: Nov 26 (35 days out) got NO_OPENINGS although there were many openings."""
+    open_days(env, c5981={DAY1: ["09:00:00", "14:00:00"], DAY2: ["10:00:00"]})
+    env.sync()
+    lead = env.lead()
+    # On the pinned calendar (June 15) Nov 26 lands on Thursday July 23, past the last day (July 15).
+    reply = env.find(lead, when="specific_date", specific_date=date(2026, 11, 26))
+    assert reply.startswith("NOTHING_IN_RANGE: Thursday, November 26 is too far ahead to book yet; "
+                            "we can only book up to Wednesday, July 15.")
+    assert "Tuesday, June 16 (2026-06-16) at 9:00 AM" in reply and "June 17" in reply
+    assert "Calendar today: Monday, June 15, 2026." in reply
+    # Time of day is kept when it can be; otherwise any time.
+    afternoon = env.find(lead, call_id="call-2", when="specific_date",
+                         specific_date=date(2026, 11, 26), time_of_day="afternoon")
+    assert "2:00 PM" in afternoon and "9:00 AM" not in afternoon
+    evening = env.find(lead, call_id="call-3", when="specific_date",
+                       specific_date=date(2026, 11, 26), time_of_day="evening")
+    assert evening.startswith("NOTHING_IN_RANGE") and "9:00 AM" in evening
+    # The offered times are remembered, so one can be booked.
+    assert env.book(lead, date=DAY1, time="9:00 AM").startswith("BOOKED")
+
+
+def test_a_day_past_the_horizon_with_nothing_open_says_both(env):
+    lead = env.lead()
+    open_days(env)
+    env.sync()
+    reply = env.find(lead, when="specific_date", specific_date=date(2026, 7, 20))
+    assert reply.startswith("NO_OPENINGS: Monday, July 20 is too far ahead to book yet")
+    assert "in the next 31 days" in reply
+
+
+def test_booking_a_day_past_the_horizon_offers_the_nearest_times(env):
+    open_days(env, c5981={DAY1: ["09:00:00"]})
+    env.sync()
+    lead = env.lead()
+    reply = env.book(lead, date="2026-07-20", time="9:00 AM")
+    assert reply.startswith("NOT_AVAILABLE") and "too far ahead to book yet" in reply
+    assert "June 16 (2026-06-16) at 9:00 AM" in reply
+
+
+def test_too_far_without_a_pinned_day_uses_the_real_calendar(env):
+    """Production has no BOOKING_TODAY_OVERRIDE: the asked day and the horizon are real dates."""
+    settings = env.settings(booking_today_override=None)
+    today = slot_booking.booking_now(settings, "America/New_York").date()
+    soon = (today + timedelta(days=2)).isoformat()
+    open_days(env, c5981={soon: ["09:00:00"]})
+    env.sync(booking_today_override=None)
+    lead = env.lead()
+
+    def find(**kwargs):
+        return slot_booking.find_slots(env.trace, lead_id=lead, call_id="call-real",
+                                       providers=env.stride, settings=settings, **kwargs)
+
+    asked = today + timedelta(days=35)
+    reply = find(when="specific_date", specific_date=asked)
+    last = today + timedelta(days=30)
+    assert reply.startswith(f"NOTHING_IN_RANGE: {slot_booking._spoken_date(asked)} is too far ahead")
+    assert f"up to {slot_booking._spoken_date(last)}." in reply and f"({soon}) at 9:00 AM" in reply
+    # The last day is still inside the window: the usual reply, not "too far".
+    inside = find(when="specific_date", specific_date=last)
+    assert inside.startswith("NO_OPENINGS: no ") and "too far" not in inside
