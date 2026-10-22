@@ -72,6 +72,9 @@ def enqueue_sheet_update(
     )
 
 
+SHEET_REPLACED = "Closed: a newer row has this phone number"
+
+
 def _action_label(lead: dict[str, Any]) -> str | None:
     """Action Status for Sheet sync — only system outcomes, never intake command results.
 
@@ -80,8 +83,14 @@ def _action_label(lead: dict[str, Any]) -> str | None:
     like the status webhook owned start/Lead ID. Only emit labels that outreach can
     set after the fact (completed cadence, voice/tool DNC).
     """
+    from .review import REPLACED_REASON  # review imports this module
+
     if lead["status"] == "booked":
         return "Booked"
+    if lead["cadence_state"] == "terminated" and lead.get("status_reason") == REPLACED_REASON:
+        # One lead per phone number: a newer row on the same number took over. Without this the cell
+        # kept its last words ("Resolved: old name kept") under "Closed" (demo test 2026-10-22).
+        return SHEET_REPLACED
     if lead["status"] == "do_not_contact":
         return "Do Not Contact applied"  # same words as the Sheet command's own result
     if _stride_problem(lead):
@@ -232,7 +241,7 @@ def build_sheet_snapshot(
     """Build the current Sheet view from committed database truth."""
     lead = conn.execute(
         "select l.id,l.status,l.cadence_state,l.needs_review,l.review_reason,l.callback_requested_at,"
-        "l.sms_disabled,"
+        "l.sms_disabled,l.status_reason,"
         "coalesce(l.timezone,p.timezone,'America/Los_Angeles') as timezone,"
         # For the board column (Lead Status): is the cadence spent?
         "(select count(*) from outreach_events t where t.lead_id=l.id) as cadence_total,"

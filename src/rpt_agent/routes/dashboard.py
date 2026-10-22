@@ -230,7 +230,7 @@ def _closed_reason(row: dict) -> str:
     alone does not tell (front desk, phone changed, different person)."""
     reason = str(row.get("status_reason") or "")
     if reason == REPLACED_REASON:
-        return "Replaced by newer referral"
+        return "Replaced: a newer Sheet row has this phone number"
     if reason == FRONT_DESK_REASON:
         return FRONT_DESK_REASON
     if row["status"] == "invalid_phone" and row.get("cadence_state") == "terminated":

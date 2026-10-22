@@ -682,3 +682,18 @@ def test_pause_is_refused_on_a_closed_lead(review_env):
     pause = _post(f"leads/{lead_id}/cadence", {"action": "pause"})
     assert pause.status_code == 409 and "handled by front desk" in pause.json()["detail"]
     assert senv.lead(lead_id)["cadence_state"] == "terminated"
+
+
+def test_a_lead_replaced_by_a_newer_row_on_the_same_phone_says_so_in_the_sheet(env):  # noqa: F811
+    # Demo test 2026-10-22: a name-change test lead was resumed ("keep old name"), then the next test
+    # row used the same phone. One lead per number: the old one stopped, but its row still read
+    # "Resolved: old name kept" under Lead Status "Closed", which looked like Continue had failed.
+    phone = _phone()
+    first = env.start_row(phone=phone, name="Ana First")
+    env.tick()
+    second = env.start_row(phone=phone, name="Ana Second")
+    env.tick()
+    env.tick()
+    assert env.cell(first, "outcome_status") == "Closed: a newer row has this phone number"
+    assert env.cell(first, "lead_status") == "Closed"
+    assert env.cell(second, "outcome_status") == "Cadence started"
