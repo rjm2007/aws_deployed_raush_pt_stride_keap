@@ -270,7 +270,9 @@ def pinned_calendar_date(asked: date | None, now_local: datetime, pinned: date |
         return asked
     real_today = real_today or datetime.now(now_local.tzinfo).date()
     if asked < real_today:
-        return asked  # a real past day stays past (PAST_DATE)
+        # A real past day is past, even if it is after the pinned day (Oct 1 with June 15 pinned
+        # was called "too far ahead").
+        raise ValueError(f"PAST_DATE: {_spoken_date(asked)} has already passed. Ask for another day.")
     moved = pinned + timedelta(days=(asked - real_today).days)
     return moved + timedelta(days=(asked.weekday() - moved.weekday()) % 7)
 
@@ -434,6 +436,7 @@ def find_slots(
     if time_of_day and time_of_day not in TIME_OF_DAY:
         raise ValueError("BAD_TIME_OF_DAY: time_of_day must be morning, afternoon or evening.")
     call_key = call_id or f"direct:{lead_id}"
+    asked_date = specific_date  # as the caller said it, for the too-far reply
     # Normal case (fresh cache): load, search and remember offers in one transaction.
     with transaction() as conn:
         context = load_context(conn, lead_id, location_name=location_name,
@@ -456,49 +459,96 @@ def find_slots(
                 )
         if cache_is_fresh(context):
             return _offer(trace, conn, context, call_key, start, end, pool, time_of_day,
-                          clinician_name, when)
+                          clinician_name, when, asked=asked_date)
     refresh_cache(trace, context, providers)
     with transaction() as conn:
         return _offer(trace, conn, context, call_key, start, end, pool, time_of_day,
-                      clinician_name, when)
+                      clinician_name, when, asked=asked_date)
+
+
+def _horizon_end(context: BookingContext) -> date:
+    """The last day we cache and book (booking_horizon_days from the booking calendar's today)."""
+    return context.now_local.date() + timedelta(days=context.settings.booking_horizon_days - 1)
+
+
+def _too_far_note(asked: date, horizon_end: date) -> str:
+    return (
+        f"{_spoken_date(asked)} is too far ahead to book yet; we can only book up to "
+        f"{_spoken_date(horizon_end)}."
+    )
 
 
 def _offer(
     trace: WorkflowTrace, conn, context: BookingContext, call_key: str, start: date, end: date,
     pool: list[dict[str, Any]], time_of_day: str | None, clinician_name: str | None, when: str,
+    *, asked: date | None = None,
 ) -> str:
-    settings = context.settings
     ids = [clinician["id"] for clinician in pool]
     where = f"{context.case_type['name']} at {context.location['name']}"
     who = f" with {pool[0]['display_name']}" if clinician_name and len(pool) == 1 else ""
-    slots = search_slots(conn, context, start=start, end=end, clinician_ids=ids,
-                         time_of_day=time_of_day)
-    if slots:
-        _remember_offers(conn, call_key, context, slots)
-        trace.log("slots_offered", count=len(slots), when=when)
-        return f"OPENINGS for {where}{who}: {_offer_text(slots)}. {BOOK_HINT} {_today_note(context)}"
-    # Nothing in the wished-for range: offer the next times after it.
-    horizon_end = context.now_local.date() + timedelta(days=settings.booking_horizon_days - 1)
-    later = search_slots(conn, context, start=end + timedelta(days=1), end=horizon_end,
-                         clinician_ids=ids, time_of_day=time_of_day)
-    if not later and time_of_day:
-        later = search_slots(conn, context, start=start, end=horizon_end, clinician_ids=ids)
-    if later:
-        _remember_offers(conn, call_key, context, later)
-        trace.log("slots_offered", count=len(later), when=when, fallback=True)
+    today, horizon_end = context.now_local.date(), _horizon_end(context)
+    too_far = start > horizon_end
+    if not too_far:
+        slots = search_slots(conn, context, start=start, end=min(end, horizon_end),
+                             clinician_ids=ids, time_of_day=time_of_day)
+        if slots:
+            _remember_offers(conn, call_key, context, slots)
+            trace.log("slots_offered", count=len(slots), when=when)
+            return (f"OPENINGS for {where}{who}: {_offer_text(slots)}. {BOOK_HINT} "
+                    f"{_today_note(context)}")
+    # Nothing in the wished-for range: the next times after it (the time of day first), else the
+    # nearest times from today. Searching only after it said NO_OPENINGS when the asked day was
+    # late in the window, or past it, although earlier days were open (QA 2026-10-22: Nov 26
+    # asked, 35 days out; Thanksgiving, the last day).
+    tries = [] if too_far else [(end + timedelta(days=1), time_of_day, "Next")]
+    if time_of_day and not too_far:
+        tries.append((start, None, "Next"))
+    tries.append((today, time_of_day, "Nearest"))
+    if time_of_day:
+        tries.append((today, None, "Nearest"))
+    later: list[dict[str, Any]] = []
+    for since, wanted_time, label in tries:
+        if since <= horizon_end:
+            later = search_slots(conn, context, start=since, end=horizon_end, clinician_ids=ids,
+                                 time_of_day=wanted_time)
+        if later:
+            break
+    note = _too_far_note(asked or start, horizon_end) + " " if too_far else ""
+    if not later:
+        return _no_openings(context, pool, clinician_name, note)
+    _remember_offers(conn, call_key, context, later)
+    trace.log("slots_offered", count=len(later), when=when, fallback=True, too_far=too_far)
+    if too_far:
+        # NOTHING_IN_RANGE is a code the prompt already offers the listed times for.
         return (
-            f"NOTHING_IN_RANGE: no {where}{who} openings for that time. "
-            f"Next openings: {_offer_text(later)}. {BOOK_HINT} {_today_note(context)}"
+            f"NOTHING_IN_RANGE: {note}Tell the caller that, then offer the nearest openings for "
+            f"{where}{who}: {_offer_text(later)}. {BOOK_HINT} {_today_note(context)}"
         )
-    if clinician_name and len(ids) < len(context.clinicians):
+    if label == "Nearest":
         return (
-            f"NO_OPENINGS_FOR_THERAPIST: {pool[0]['display_name']} has no openings in the next "
-            f"{settings.booking_horizon_days} days. Ask if any other therapist is fine, then search "
-            "again without a therapist name."
+            f"NOTHING_IN_RANGE: no {where}{who} openings for that time or later. "
+            f"Nearest openings: {_offer_text(later)}. {BOOK_HINT} {_today_note(context)}"
         )
     return (
-        f"NO_OPENINGS: no {where} openings in the next {settings.booking_horizon_days} days. "
-        "Offer to text the booking link or transfer to the team."
+        f"NOTHING_IN_RANGE: no {where}{who} openings for that time. "
+        f"Next openings: {_offer_text(later)}. {BOOK_HINT} {_today_note(context)}"
+    )
+
+
+def _no_openings(context: BookingContext, pool: list[dict[str, Any]], clinician_name: str | None,
+                 note: str = "") -> str:
+    days = context.settings.booking_horizon_days
+    if clinician_name and len(pool) < len(context.clinicians):
+        return (
+            f"NO_OPENINGS_FOR_THERAPIST: {note}{pool[0]['display_name']} has no openings in the "
+            f"next {days} days. Ask if any other therapist is fine, then search again without a "
+            "therapist name."
+        )
+    # After the too-far note the sentence starts again, so "No".
+    return (
+        f"NO_OPENINGS: {note}{'No' if note else 'no'} {context.case_type['name']} at "
+        f"{context.location['name']} openings in the next {days} days. Offer to text the booking "
+        "link or transfer to the team."
     )
 
 
@@ -626,17 +676,23 @@ def _find_slot_for_booking(
 
 
 def _alternatives(trace: WorkflowTrace, context: BookingContext, call_key: str, day: date) -> str:
-    horizon_end = context.now_local.date() + timedelta(days=context.settings.booking_horizon_days - 1)
-    start = max(day, context.now_local.date())
+    horizon_end = _horizon_end(context)
+    too_far = _too_far_note(day, horizon_end) + " " if day > horizon_end else ""
+    today = context.now_local.date()
+    ids = [c["id"] for c in context.clinicians]
     with transaction() as conn:
-        slots = search_slots(conn, context, start=start, end=horizon_end,
-                             clinician_ids=[c["id"] for c in context.clinicians])
+        slots = [] if too_far else search_slots(conn, context, start=max(day, today),
+                                                end=horizon_end, clinician_ids=ids)
+        if not slots and day > today:
+            # Nothing on or after that day: the nearest times from today (it said "no other
+            # openings soon" while earlier days were open, QA 2026-10-22).
+            slots = search_slots(conn, context, start=today, end=horizon_end, clinician_ids=ids)
         if slots:
             _remember_offers(conn, call_key, context, slots)
     if not slots:
         return "There are no other openings soon. Offer to text the booking link or transfer."
     trace.log("slots_offered", count=len(slots), alternatives=True)
-    return f"Other openings: {_offer_text(slots)}. {BOOK_HINT}"
+    return f"{too_far}Other openings: {_offer_text(slots)}. {BOOK_HINT}"
 
 
 def _existing_booking(conn, lead_id: str) -> dict[str, Any] | None:

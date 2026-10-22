@@ -2256,3 +2256,15 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   Stride cancel) is never written over a command staff typed that has not run, nor over a parked Restart.
 - Production `main` has the same rule (`sheet_direct.needs_processing`, unconditional Action write in
   `apply_snapshot`); not ported. Tests: `test_sheet_direct.py`, `test_lead_review_integration.py`.
+
+### 2026-10-22 — Booking engine: a day past the 31-day horizon
+- `find_slots` searched only the asked day and the days after it, both past the horizon, so a caller asking for
+  Nov 26 (35 days out) heard "no openings" although there were many (local QA). It now replies
+  `NOTHING_IN_RANGE: <day> is too far ahead to book yet; we can only book up to <last day>. ...` with the
+  nearest openings from today; `book_slot` on such a day prefixes its other openings the same way. The code
+  stays NOTHING_IN_RANGE, which the booking prompt already handles (no prompt change). Days inside the window
+  (holidays included) are unchanged. On the demo (pinned June 15) Nov 26 is moved to Thu July 23, past July 15.
+- Follow-up (tester): when the asked day and every later day are empty (Thanksgiving, the last day), the reply
+  now offers the nearest earlier times from today ("for that time or later. Nearest openings: ...") instead of
+  NO_OPENINGS; `book_slot`'s other openings do the same. With a pinned day a real past date (Oct 1) is
+  PAST_DATE, no longer "too far ahead". "No" is capitalised after the too-far note.
