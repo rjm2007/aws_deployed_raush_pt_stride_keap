@@ -717,7 +717,10 @@ def test_a_restart_typed_next_to_booked_is_recorded_and_never_parked_by_a_stride
     lead_id = _command(env, number, "Booked")
     env.sheet.set(number, "action", "Restart cadence")  # next to "Booked": turned down, as before
     env.tick()
-    assert env.cell(number, "outcome_status") == "Booked"
+    # No longer silent (tester 2026-10-23); Lead Status still Booked.
+    assert env.cell(number, "outcome_status") == (
+        "Booked; Restart cadence in Action not run (clear this cell to run it)")
+    assert env.cell(number, "lead_status") == "Booked"
     _stride_cancel(env, lead_id)
     for _ in range(3):
         env.tick()
@@ -725,6 +728,20 @@ def test_a_restart_typed_next_to_booked_is_recorded_and_never_parked_by_a_stride
     assert status.startswith("Needs review: appointment cancelled in Stride")
     assert not status.endswith(sheet_direct.REVIEW_FIRST)
     assert _requests(env, lead_id, "restart_cadence") == 0
+
+
+def test_no_run_it_again_note_next_to_a_newer_row_on_the_same_phone(env):
+    # Tester 2026-10-23: clearing "Closed: a newer row has this phone number; ... clear this cell"
+    # restarted the old lead and took the number back. That text no longer invites it.
+    phone = _phone()
+    first = env.start_row(phone=phone)
+    env.tick()
+    _command(env, first, "Restart cadence")
+    second = env.start_row(phone=phone, name="Asha Rao")
+    env.tick()
+    env.tick()
+    assert env.cell(second, "outcome_status") == "Cadence started"
+    assert env.cell(first, "outcome_status") == "Closed: a newer row has this phone number"
 
 
 def _action_writes(env):

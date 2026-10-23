@@ -93,6 +93,11 @@ NOT_RUN = "; the Restart in Action was not run"
 # next to a command that row already handled (`spent_rows`), the text says the command is old and how
 # to run it again: a blank Outcome Status always runs the command in Action.
 OLD_COMMAND = "; {label} in Action already ran (clear this cell to run it again)"
+# A command its Outcome Status turned down (`refused`) used to be ignored without a word (tester
+# 2026-10-23): the row now says so. RERUN only where running it again makes sense (`_rerun_ok`).
+NOT_RUN_TYPED = "; {label} in Action not run"
+RERUN = " (clear this cell to run it)"
+_NOT_RUN_TYPED = re.compile(r"; [^;]+ in action not run( \(clear this cell to run it\))?$", re.IGNORECASE)
 ENDED_LEAD_STATUSES = {"Closed", "Booked", "Do not outreach"}
 RETRYING = re.compile(r"^retrying ([12])/3: ", re.IGNORECASE)
 PROFILE = ("name", "phone", "email", "date_of_birth", "location", "case")
@@ -193,22 +198,33 @@ def open_review_text(status: str) -> bool:
     return text.startswith(("needs review", "number blocked; needs review"))
 
 
-def _ran_actions(rows) -> dict[int, str]:
-    """Row -> the action of the request its Action Request ID names (what this row last handled)."""
+def _ran_actions(rows) -> dict[int, tuple[str, bool]]:
+    """Row -> (action, it ran) of the request its Action Request ID names (what this row last handled).
+
+    "It ran": the request completed. A refused or dropped command (`_record_handled`) did not.
+    """
     ids = {row.number: row.get("action_request_id") for row in rows}
     wanted = [rid for rid in ids.values() if _is_uuid(rid)]
     if not wanted:
         return {}
     with transaction() as conn:
-        actions = {r["request_id"]: r["action"] for r in conn.execute(
+        actions = {r["request_id"]: (r["action"], r["status"] == "completed") for r in conn.execute(
             # Compared as text: the live databases store request_id as text, the migrations as
             # uuid; a uuid comparison failed every Sheet poll on the demo (2026-10-21).
-            "select request_id::text as request_id,action from lead_action_requests "
+            "select request_id::text as request_id,action,status from lead_action_requests "
             "where request_id::text=any(%s::text[])", (wanted,))}
     return {number: actions[rid] for number, rid in ids.items() if rid in actions}
 
 
-def spent_rows(rows) -> set[int]:
+class Spent(set):
+    """`spent_rows`: the row numbers, plus `ran` (those whose old command really ran)."""
+
+    def __init__(self, numbers=(), ran=()):
+        super().__init__(numbers)
+        self.ran = set(ran)
+
+
+def spent_rows(rows) -> Spent:
     """Rows whose Action is a command this row has already handled: an old command, never run again.
 
     Owner decision 2026-10-23: only staff write the Action column. The backend used to overwrite an
@@ -222,9 +238,24 @@ def spent_rows(rows) -> set[int]:
     """
     candidates = [row for row in rows if command_of(row) and _is_uuid(row.get("action_request_id"))]
     if not candidates:
-        return set()
-    ran = _ran_actions(candidates)
-    return {row.number for row in candidates if ran.get(row.number) == command_of(row)[1]}
+        return Spent()
+    found = _ran_actions(candidates)
+    same = [row.number for row in candidates
+            if (found.get(row.number) or ("", False))[0] == command_of(row)[1]]
+    return Spent(same, [number for number in same if found[number][1]])
+
+
+def _rerun_ok(status: str, action: str) -> bool:
+    """May the row invite staff to clear Outcome Status and run the command in Action?
+
+    Not on a closed lead ("Closed: ...", "Phone changed: add a new row"): tester 2026-10-23, clearing
+    "Closed: a newer row has this phone number" restarted the old lead and took the number back.
+    Not for a Restart on a row in review: it would wait anyway (`_review_waiting`).
+    """
+    folded = status.strip().casefold()
+    if folded.startswith(("closed", "phone changed")):
+        return False
+    return not (action == "restart_cadence" and open_review_text(status))
 
 
 def parked(row: SheetRow, spent: set[int] | frozenset[int] = frozenset()) -> bool:
@@ -267,7 +298,8 @@ def _with_note(status: str, row: SheetRow, spent: set[int] | frozenset[int]) -> 
     on a linked row is never a command, so it gets no note either.
     """
     command = command_of(row)
-    if not status or not command or row.number not in spent or command[1] == "start_cadence":
+    if (not status or not command or row.number not in getattr(spent, "ran", spent)
+            or command[1] == "start_cadence" or not _rerun_ok(status, command[1])):
         return status
     folded = status.strip().casefold()
     if folded in FINAL_STATUSES or (command[1] == "restart_cadence"
@@ -291,7 +323,7 @@ def needs_processing(row: SheetRow, command: tuple[str, str],
     (owner 2026-10-20): it runs unless the cadence that ended was started by this same Restart.
     """
     _, action = command
-    status = row.get("outcome_status").casefold()
+    status = _base_status(row.get("outcome_status")).casefold()
     if action == "start_cadence" and (row.get("lead_id") or (status and row.get("action_request_id"))):
         return False
     if not status:
@@ -310,6 +342,35 @@ def needs_processing(row: SheetRow, command: tuple[str, str],
                                                 "cadence completed"}:
         return False
     return not (action == "restart_cadence" and status.startswith("cadence restarted"))
+
+
+def _base_status(status: str) -> str:
+    """Outcome Status without the "<command> in Action not run" words a refusal added."""
+    return _NOT_RUN_TYPED.sub("", status)
+
+
+def _refusal_text(status: str, command: tuple[str, str]) -> str:
+    label, action = command
+    return status + NOT_RUN_TYPED.format(label=label) + (RERUN if _rerun_ok(status, action) else "")
+
+
+def _review_waiting(lead_id: str) -> str | None:
+    """The lead's open review as the Sheet words it ("Needs review: ..."), or None.
+
+    Read from the database, not the row: staff who clear Outcome Status on a row in review must not
+    start a Restart past the review (tester 2026-10-23: the Restart ran at once and closed the
+    review as "restarted" by Google Sheet, accepting a new name nobody chose).
+    """
+    from .lead_review import sheet_open_status  # local: lead_review imports lead_actions
+
+    with transaction() as conn:
+        found = conn.execute(
+            "select l.needs_review,r.code,r.details from leads l left join lateral ("
+            "select code,details from lead_reviews where lead_id=l.id and resolved_at is null "
+            "order by flagged_at,id limit 1) r on true where l.id::text=%s", (lead_id,)).fetchone()
+    if not found or not (found["needs_review"] or found["code"]):
+        return None
+    return sheet_open_status(found["code"], found["details"]) if found["code"] else "Needs review"
 
 
 def refused(row: SheetRow, command: tuple[str, str],
@@ -539,8 +600,9 @@ def claim_commands(grid: SheetGrid, trace: WorkflowTrace, *, settle: Settle | No
             continue
         if refused(row, command, spent):
             # Turned down by its Outcome Status (as before), and now recorded as handled, so a later
-            # system text cannot set it off (only staff write Action since 2026-10-23).
+            # system text cannot set it off (only staff write Action since 2026-10-23). The row says so.
             if _mark_handled(grid, row, spent, "refused_by_outcome_status"):
+                grid.set(row, "outcome_status", _refusal_text(row.get("outcome_status"), command))
                 trace.log("sheet_command_refused", row=row.number, action=command[1])
             continue
         hint = _hint_due(row, spent)
@@ -558,6 +620,18 @@ def claim_commands(grid: SheetGrid, trace: WorkflowTrace, *, settle: Settle | No
         if limit is not None and len(claims) >= limit:
             continue
         label, action = command
+        if action == "restart_cadence" and _is_uuid(row.get("lead_id")) and (
+                review := _review_waiting(row.get("lead_id"))):
+            # Outcome Status cleared on a row in review: the Restart still waits for the review
+            # (Booked / Do Not Contact do run). An old Restart staff cleared the cell for becomes a
+            # waiting one: its Action Request ID is emptied, so it is no longer taken as spent.
+            grid.set(row, "outcome_status", review + REVIEW_FIRST)
+            if row.number in spent:
+                grid.set(row, "action_request_id", "")
+                spent.discard(row.number)
+                getattr(spent, "ran", set()).discard(row.number)
+            trace.log("sheet_command_waits_for_review", row=row.number, action=action)
+            continue
         request, error = build_action(row, action)
         if error:
             grid.set(row, "outcome_status", "Error: " + error[:180])
@@ -871,8 +945,9 @@ def apply_snapshot(grid: SheetGrid, snapshot: dict[str, Any],
     # What staff typed is judged on the row as it is now, before this snapshot writes into it.
     spent = spent_rows([row])
     command = command_of(row)
-    if command and refused(row, command, spent):
-        _mark_handled(grid, row, spent, "refused_by_outcome_status")
+    if command and refused(row, command, spent) and _mark_handled(
+            grid, row, spent, "refused_by_outcome_status"):
+        grid.set(row, "outcome_status", _refusal_text(row.get("outcome_status"), command))
     pending = _command_pending(row, spent)
     waits = not pending and parked(row, spent)
     for key in ALWAYS_WRITTEN:
@@ -955,7 +1030,7 @@ def _lead_status(row: SheetRow, sheet: dict[str, Any]) -> str:
         return explicit  # the backend sends the board column (lead_stage.sheet_lead_status)
     ex = explicit.lower()
     review = str(sheet.get("needs_review") or "").strip().lower()
-    outcome = row.get("outcome_status").lower()
+    outcome = _base_status(row.get("outcome_status")).lower()
     if outcome == "booked" or ex == "booked":
         return "Booked"
     if outcome in {"do not contact applied", "do not contact", "do not outreach"} or ex in {

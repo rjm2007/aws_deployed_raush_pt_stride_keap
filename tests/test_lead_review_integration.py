@@ -596,8 +596,7 @@ def test_a_restart_that_ran_is_old_on_the_next_review_and_clearing_outcome_runs_
     _wrong_person(senv, lead_id)
     senv.tick()
     assert senv.cell(number, "action") == "Restart cadence"
-    assert senv.cell(number, "outcome_status") == "Needs review: wrong number" + OLD.format(
-        "Restart cadence")
+    assert senv.cell(number, "outcome_status") == "Needs review: wrong number"  # no "clear" note
     assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 200
     _no_cooldown(senv, lead_id)
     for _ in range(3):
@@ -654,6 +653,78 @@ def test_a_waiting_restart_is_dropped_when_the_board_books_the_lead(review_env):
     assert (senv.cell(number, "outcome_status"), senv.cell(number, "action")) == (
         "Booked", "Restart cadence")  # case 1 / 8: Action is not written
     assert senv.lead(lead_id)["status"] == "booked" and _restarts(senv, lead_id) == 0
+
+
+def _name_review(senv):
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "name", "Asha Kumar")
+    senv.tick()
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == "Needs review: name changed"
+    return number, lead_id
+
+
+def _review_still_open(senv, lead_id):
+    lead = senv.lead(lead_id)
+    assert (lead["needs_review"], lead["full_name"]) == (True, "Asha Rao")
+    [review] = _reviews(senv, lead_id)
+    assert review["resolved_at"] is None
+
+
+def test_clearing_outcome_status_on_a_row_in_review_keeps_the_restart_waiting(review_env):
+    # Tester 2026-10-23: staff cleared Outcome Status next to a waiting Restart; it ran at once,
+    # closed the name review as "restarted" by Google Sheet and accepted the new name.
+    senv = review_env
+    number, lead_id = _name_review(senv)
+    senv.sheet.set(number, "action", "Restart cadence")
+    senv.tick()
+    assert senv.cell(number, "outcome_status").endswith(REVIEW_FIRST)
+    senv.sheet.set(number, "outcome_status", "")
+    senv.tick()
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == "Needs review: name changed" + REVIEW_FIRST
+    _review_still_open(senv, lead_id)
+    assert _restarts(senv, lead_id) == 0
+    assert _post(f"review/{lead_id}/resolve", {"choice": "keep_old_name"}).status_code == 200
+    _no_cooldown(senv, lead_id)
+    for _ in range(3):
+        senv.tick()
+    assert senv.cell(number, "outcome_status") == "Cadence restarted"
+    assert _restarts(senv, lead_id) == 1
+
+
+def test_an_old_restart_cleared_on_a_row_in_review_waits_then_runs_once(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "action", "Restart cadence")
+    senv.sheet.set(number, "outcome_status", "")
+    senv.tick()
+    assert _restarts(senv, lead_id) == 1
+    senv.sheet.set(number, "name", "Asha Kumar")
+    senv.tick()
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == "Needs review: name changed"
+    senv.sheet.set(number, "outcome_status", "")  # staff want that Restart again
+    senv.tick()
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == "Needs review: name changed" + REVIEW_FIRST
+    _review_still_open(senv, lead_id)
+    assert _restarts(senv, lead_id) == 1
+    assert _post(f"review/{lead_id}/resolve", {"choice": "keep_old_name"}).status_code == 200
+    _no_cooldown(senv, lead_id)
+    for _ in range(3):
+        senv.tick()
+    assert _restarts(senv, lead_id) == 2
+
+
+def test_booked_cleared_on_a_row_in_review_still_runs(review_env):
+    senv = review_env
+    number, lead_id = _name_review(senv)
+    senv.sheet.set(number, "action", "Booked")
+    senv.sheet.set(number, "outcome_status", "")
+    senv.tick()
+    assert senv.lead(lead_id)["status"] == "booked"
+    assert senv.cell(number, "outcome_status") == "Booked"
 
 
 def test_a_waiting_restart_is_dropped_when_the_phone_changes(review_env):

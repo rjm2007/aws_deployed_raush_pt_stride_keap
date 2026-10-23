@@ -2355,3 +2355,18 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   DNC, Stride cancel next to the old Booked, Restart next to Booked not parked by a Stride cancel, booked outside
   the Sheet, no Action write at all), `test_lead_review_integration.py` (old Restart on the next review, dropped
   Restart on close / board Booked / phone change), `test_live_column_types_integration.py` (live text columns).
+- Follow-up (independent tester, same day):
+  - Bug: clearing Outcome Status on a row in review ran a Restart at once and closed the review ("restarted" by
+    Google Sheet; a name review's new name was accepted with nobody choosing). Before a Restart is claimed the
+    lead's open review is read from the database (`_review_waiting`: `needs_review` or an open `lead_reviews`
+    row). If one is open the Restart waits: the row gets "<review text>; resolve it on the dashboard first, then
+    the restart runs", and an old Restart's Action Request ID is emptied so it counts as the waiting one. It
+    runs after the resolution. Booked / Do Not Contact still run on a row in review.
+  - The "already ran (clear this cell to run it again)" note is no longer added to open-review texts for a
+    Restart, to closed texts ("Closed: ...", incl. "Closed: a newer row has this phone number": clearing it
+    restarted the old lead and took the number back) or to "Phone changed: add a new row"; and only after a
+    command that really ran (a completed request), not one only recorded as turned down.
+  - A turned-down command is no longer silent: "<text>; <command> in Action not run (clear this cell to run
+    it)" (the invitation left out on the texts above). The rules read Outcome Status without these words
+    (`_base_status`), so "Booked; Restart cadence in Action not run ..." is still final and Lead Status Booked.
+  - Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`, `test_lead_review_integration.py`.

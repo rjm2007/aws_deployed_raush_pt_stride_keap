@@ -267,12 +267,16 @@ states and inbound replies. These endpoints update Supabase first; they never ca
    row last handled: the row's Action Request ID names that request (`lead_action_requests.action`), and a
    command equal to it never runs again while Outcome Status is not blank. A command the Outcome Status turns
    down (Restart next to "Booked", Do Not Contact next to "Unblocked in dashboard", ...) is recorded as
-   handled the same way, so it cannot go off when a later text replaces that one. When the backend writes a
-   new non-final Outcome Status next to an old command it adds "; <command> in Action already ran (clear
-   this cell to run it again)".
+   handled the same way, so it cannot go off when a later text replaces that one, and the row says so:
+   "<text>; <command> in Action not run (clear this cell to run it)". When the backend writes a new non-final
+   Outcome Status next to a command that really ran it adds "; <command> in Action already ran (clear this
+   cell to run it again)". Neither invitation is added on a closed lead ("Closed: ...", "Phone changed: add a
+   new row"), nor for a Restart next to an open review text.
    **How staff run the same command again: clear the Outcome Status cell.** The command in Action then runs
-   on the next poll (on a row still in review a Restart then runs at once and closes the review). A different
-   command picked in Action runs as usual.
+   on the next poll. A Restart on a lead whose review is still open (checked in the database, not the row)
+   does not run: the row gets "<review text>; resolve it on the dashboard first, then the restart runs" and
+   it runs after the resolution. Booked and Do Not Contact run at once. A different command picked in Action
+   runs as usual.
    n8n mode still has the backend write Action (`sheet.action`: "Booked" once booked, "" after a Stride
    cancel; dashboard unblock / resolution values): the n8n intake has no memory of the last command.
 3. Normalize phone and DOB. Accept a one-word Name and any non-empty Case.
