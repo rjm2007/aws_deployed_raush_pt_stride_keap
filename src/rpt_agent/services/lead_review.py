@@ -167,8 +167,8 @@ SHEET_RESOLVED = {
     "send_booking_link": "Resolved: booking link texted",
     "front_desk": "Closed: handled by front desk",
 }
-# The Action set with the resolution (default "Start cadence"). A restart is shown as the Sheet's
-# own restart is: "Cadence restarted" next to "Restart cadence", which the intake never re-runs.
+# The Action set with the resolution (default "Start cadence"), n8n mode only: direct mode never
+# writes Action (owner, 2026-10-23). A restart is shown as the Sheet's own restart is.
 SHEET_RESOLVED_ACTION = {"restart_cadence": "Restart cadence"}
 SHEET_TEXTS_OFF = "Calls only (texts off)"
 
