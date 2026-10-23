@@ -164,11 +164,11 @@ def format_cadence_columns(
 # still reads Do Not Contact, so an unblocked patient is not blocked again by
 # the stale cell. Listed strongest first; Lead Status is set where it changes.
 #
-# A dashboard unblock also replaces the stale "Do Not Contact" in the Action
-# cell, so the row stops reading as blocked. A restart is written as the
-# plain "Cadence restarted" the Sheet's own restart produces: next to Action
-# "Restart cadence" that is a status the intake workflow already skips, where
-# "... in dashboard" would let it restart the patient a second time.
+# The third value is the Action cell for n8n mode only: there a dashboard unblock replaces the stale
+# "Do Not Contact", and a restart is written as the plain "Cadence restarted" (next to Action
+# "Restart cadence" a status the n8n intake skips). Direct mode never writes Action (owner,
+# 2026-10-23: only staff do); it keeps an old command from running again by the row's Action
+# Request ID (sheet_direct.spent_rows).
 DASHBOARD_OUTCOMES = {
     "cadence_restarted_after_unblock": ("Cadence restarted", "In cadence", "Restart cadence"),
     "cadence_resumed_after_unblock": ("Cadence resumed in dashboard", "In cadence", "Start cadence"),
@@ -183,9 +183,9 @@ def _review_status(conn, lead, reasons: set[str]) -> tuple[str | None, str | Non
     """Outcome Status for a review that was just flagged or resolved, and the Action to set.
 
     Sent only with the review's own update, like DASHBOARD_OUTCOMES: a later snapshot leaves the
-    cell alone, so a staff member who cleared it to run a command is not overwritten. A resolution
-    also sets Action to "Start cadence": "Resolved: …" is not a final status, so a stale
-    "Restart cadence" or "Booked" next to it would otherwise run again.
+    cell alone, so a staff member who cleared it to run a command is not overwritten. The Action
+    returned with a resolution ("Start cadence", or "Restart cadence") is for n8n mode only, whose
+    intake has no memory of the last command; direct mode ignores it (sheet_direct.spent_rows).
     """
     from .lead_review import (  # lead_review imports this module
         SHEET_RESOLVED,
@@ -380,17 +380,12 @@ def build_sheet_snapshot(
     # Lead Status always mirrors the dashboard column (client decision 2026-10-15), so a pause, a
     # resolved review or a board move shows in the Sheet too, and "Needs Review" never sticks.
     sheet["lead_status"] = sheet_lead_status(lead)
-    # Booked ends the lead however it happened (board, Sheet or call), so the
-    # Action cell must stop showing the last command staff picked - "Restart
-    # cadence" next to "Booked" reads as a pending instruction. Other states
-    # omit the key so n8n leaves the cell as staff set it. Direct mode never
-    # writes this over a command staff typed that has not run yet
-    # (sheet_direct.apply_snapshot).
+    # n8n mode only (`action`): its intake re-sends any command whose Outcome Status is not final,
+    # so the cell is overwritten once booked, and cleared after a Stride cancel (it re-booked the
+    # lead every two minutes, 2026-10-13). Direct mode ignores the key: only staff write Action
+    # there (owner, 2026-10-23) and an old command is recognised by its Action Request ID.
     if lead["status"] == "booked":
         sheet["action"] = "Booked"
-    # The booking fell through in Stride, so a "Booked" left in the Action cell is
-    # stale. The n8n intake re-sends any row whose Action is "Booked" and whose
-    # Outcome Status is not final, which re-booked the lead every two minutes.
     elif _stride_problem(lead):
         sheet["action"] = ""
 

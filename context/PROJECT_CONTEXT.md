@@ -2314,3 +2314,59 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
 - Tests: `test_slot_booking_integration.py` (chunks, near/far timing, gone in a far chunk, day 45 / 80, months,
   beyond 90, defaults unchanged, far booking re-check, holiday in month 2, with and without the pin, HTTP
   `month`), `test_pinned_calendar.py` (month windows, pinned months, tool schema).
+
+### 2026-10-23 — Sheet: only staff write the Action column (owner decision)
+- Direct mode never writes the Action cell any more. Removed: "Booked" once a lead is booked, "Start cadence" /
+  "Restart cadence" after a dashboard unblock, "" after a Stride cancel, "Start cadence" / "Restart cadence" with
+  a resolved review, "Start cadence" over a Restart left from before a new review (incl. a Restart that ended in
+  "Number blocked; needs review"), the reset of a dropped parked Restart, and "Start cadence" with a phone change.
+  Results show only in Outcome Status and Lead Status. The Name write-back ("keep old name") is unchanged.
+- Those writes existed so an old command could not run again next to a new Outcome Status. The rule now: the row's
+  Action Request ID names the request that last handled the row (`lead_action_requests.action`); a command equal
+  to it is old and never runs again while Outcome Status is not blank (`sheet_direct.spent_rows`, checked in
+  `needs_processing` right after the in-progress/error check). This replaces `restart_reruns` (a Restart on
+  "Cadence completed" runs unless that Restart started the cadence) and is the same lookup, one per poll.
+- To run the same command again staff clear the Outcome Status cell (a blank Outcome Status always ran, as under
+  n8n). New text when the backend writes a new non-final Outcome Status next to an old command:
+  "<text>; <command> in Action already ran (clear this cell to run it again)", e.g. "Unblocked in dashboard; Do
+  Not Contact in Action already ran (clear this cell to run it again)". Not on final texts ("Booked", "Do Not
+  Contact applied"), not on "Cadence restarted" next to a Restart, never for Start cadence.
+- Every command is handled once, so none waits to go off later: a command its Outcome Status turns down (Restart
+  next to "Booked", Do Not Contact next to "Unblocked in dashboard", "Cadence restarted" next to Restart, old n8n
+  review texts) is recorded as handled (`refused`): a `lead_action_requests` row (status `failed`, no
+  `completed_at`, response code `refused_by_outcome_status`) whose id goes into the row's Action Request ID. The
+  same for a parked Restart the dashboard ends (`dropped_lead_ended`), a phone change ends
+  (`dropped_phone_changed`), or a review resolved with "Restart cadence" already did (`done_by_review_restart`).
+  This also covers the Booked / Restart values the backend wrote into Action before this change: they sit next to
+  a text that turns them down and are recorded on the first poll. Only rows with a real Lead ID; Start cadence is
+  never recorded (never a command on a linked row). No migration.
+- Unchanged: Start / Restart / Booked / DNC typed by staff run once; Booked / DNC on a review row run; a Restart
+  typed on a review row waits ("...; resolve it on the dashboard first, then the restart runs") and runs after
+  the resolution, or is dropped with "; the Restart in Action was not run"; 10-minute restart cooldown; phone
+  change closes; one lead per phone; Stride cancel review; Outcome Status / Lead Status texts.
+- Changed behaviour staff may notice: after a Restart ran, a later review leaves "Restart cadence" in Action; it is
+  old, does not wait and does not run after the resolution (the row says so). To restart again, clear Outcome
+  Status (on a row still in review that restarts at once and closes the review).
+- n8n mode keeps writing Action (`sheet.action`, `review_action`, `DASHBOARD_OUTCOMES`): the n8n intake has no
+  memory of the last command, so those writes are its only guard (re-booked every two minutes, 2026-10-13). Direct
+  mode ignores the keys. Production `main` still writes Action; not ported.
+- Tests (fail without the change): `test_sheet_direct.py` (each case, old-command rule, refusal recorded once,
+  re-run by clearing Outcome Status), `test_sheet_direct_integration.py` (unblock continue/restart next to the old
+  DNC, Stride cancel next to the old Booked, Restart next to Booked not parked by a Stride cancel, booked outside
+  the Sheet, no Action write at all), `test_lead_review_integration.py` (old Restart on the next review, dropped
+  Restart on close / board Booked / phone change), `test_live_column_types_integration.py` (live text columns).
+- Follow-up (independent tester, same day):
+  - Bug: clearing Outcome Status on a row in review ran a Restart at once and closed the review ("restarted" by
+    Google Sheet; a name review's new name was accepted with nobody choosing). Before a Restart is claimed the
+    lead's open review is read from the database (`_review_waiting`: `needs_review` or an open `lead_reviews`
+    row). If one is open the Restart waits: the row gets "<review text>; resolve it on the dashboard first, then
+    the restart runs", and an old Restart's Action Request ID is emptied so it counts as the waiting one. It
+    runs after the resolution. Booked / Do Not Contact still run on a row in review.
+  - The "already ran (clear this cell to run it again)" note is no longer added to open-review texts for a
+    Restart, to closed texts ("Closed: ...", incl. "Closed: a newer row has this phone number": clearing it
+    restarted the old lead and took the number back) or to "Phone changed: add a new row"; and only after a
+    command that really ran (a completed request), not one only recorded as turned down.
+  - A turned-down command is no longer silent: "<text>; <command> in Action not run (clear this cell to run
+    it)" (the invitation left out on the texts above). The rules read Outcome Status without these words
+    (`_base_status`), so "Booked; Restart cadence in Action not run ..." is still final and Lead Status Booked.
+  - Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`, `test_lead_review_integration.py`.

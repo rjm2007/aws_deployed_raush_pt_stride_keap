@@ -78,3 +78,20 @@ def test_a_start_row_rerun_links_the_lead_on_live_types(live):
     live.tick()
     assert live.cell(number, "lead_id") == lead_id and len(live.leads()) == 1
     assert live.cell(number, "action_request_id") == request_id
+
+
+def test_an_old_command_is_recorded_and_found_on_live_types(live):
+    """sheet_direct._record_handled / _ran_actions (2026-10-23) on the live text columns."""
+    number, lead_id = _started(live)
+    live.sheet.set(number, "action", "Booked")
+    live.sheet.set(number, "outcome_status", "")
+    live.tick()
+    assert live.cell(number, "outcome_status") == "Booked"
+    live.sheet.set(number, "action", "Restart cadence")  # turned down next to "Booked": recorded
+    live.tick()
+    request_id = live.cell(number, "action_request_id")
+    stored = live.db.execute("select action,lead_id,status from lead_action_requests where request_id=%s",
+                             (request_id,)).fetchone()
+    assert (stored["action"], stored["lead_id"], stored["status"]) == ("restart_cadence", lead_id, "failed")
+    live.tick()
+    assert live.cell(number, "action_request_id") == request_id  # found again, not recorded twice

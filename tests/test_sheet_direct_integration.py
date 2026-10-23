@@ -5,6 +5,7 @@ Each test builds its own practice and cadence, uses synthetic 555 numbers, and r
 """
 
 import os
+import re
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -620,3 +621,166 @@ def test_a_booked_patient_is_skipped_only_for_the_same_case(env, cases, first, a
     if expected == "Cadence started":
         assert leads[-1]["status"] == "in_progress" and leads[-1]["lead_type"] == again
         assert env.lead(leads[0]["id"])["status"] == "booked"  # the first booking is untouched
+
+
+# --- only staff write Action (owner, 2026-10-23); an old command never runs again --------------
+
+OLD = sheet_direct.OLD_COMMAND.replace("{label}", "{}")
+
+
+def _requests(env, lead_id, action):
+    return env.db.execute(
+        "select count(*) as n from lead_action_requests where lead_id::text=%s and action=%s "
+        "and status='completed'", (lead_id, action)).fetchone()["n"]
+
+
+def _command(env, number, action):
+    env.sheet.set(number, "action", action)
+    env.sheet.set(number, "outcome_status", "")
+    env.tick()
+    return env.cell(number, "lead_id")
+
+
+@pytest.mark.parametrize("after", ["continue", "restart"])
+def test_an_unblock_next_to_the_old_do_not_contact_never_blocks_again(env, after):
+    from rpt_agent.services.number_block import unblock_number
+
+    number = env.start_row()
+    env.tick()
+    lead_id = _command(env, number, "Do Not Contact")
+    assert env.lead(lead_id)["status"] == "do_not_contact"
+    with env.db.transaction():
+        lead = env.db.execute("select * from leads where id=%s for update", (lead_id,)).fetchone()
+        unblock_number(env.db, lead, after, "Admin")
+    for _ in range(3):
+        env.tick()
+    text = "Cadence resumed in dashboard" if after == "continue" else "Cadence restarted"
+    assert env.cell(number, "action") == "Do Not Contact"  # cases 2 and 3: not rewritten
+    assert env.cell(number, "outcome_status") == text + OLD.format("Do Not Contact")
+    assert env.lead(lead_id)["status"] != "do_not_contact"
+    assert _requests(env, lead_id, "do_not_contact") == 1
+    # The cadence ends later: still not blocked again.
+    env.db.execute("update leads set cadence_state='completed' where id=%s", (lead_id,))
+    enqueue_sheet_update(env.db, lead_id=lead_id, event_type="cadence_completed", source_key="t")
+    env.tick()
+    env.tick()
+    assert env.cell(number, "outcome_status") == "Cadence completed" + OLD.format("Do Not Contact")
+    assert env.lead(lead_id)["status"] != "do_not_contact"
+    # Staff block it again: clear Outcome Status.
+    env.sheet.set(number, "outcome_status", "")
+    env.tick()
+    assert env.cell(number, "outcome_status") == "Do Not Contact applied"
+    assert env.lead(lead_id)["status"] == "do_not_contact"
+    assert _requests(env, lead_id, "do_not_contact") == 2
+
+
+def _stride_cancel(env, lead_id):
+    """What stride_leads does when the booked visit is cancelled in Stride."""
+    from rpt_agent.services.review import record_review
+    from rpt_agent.services.stride_leads import REASON_CANCELLED, REVIEW_CODES
+
+    reason = REASON_CANCELLED
+    with env.db.transaction():
+        env.db.execute("update leads set status='needs_attention',needs_review=true,review_reason=%s,"
+                       "review_flagged_at=now(),status_changed_at=now() where id=%s", (reason, lead_id))
+        record_review(env.db, lead_id, REVIEW_CODES[reason], reason, source="stride")
+        enqueue_sheet_update(env.db, lead_id=lead_id, event_type="stride_booking_cancelled",
+                             source_key=uuid4().hex)
+
+
+def test_a_stride_cancel_next_to_the_old_booked_does_not_book_again(env):
+    number = env.start_row()
+    env.tick()
+    lead_id = _command(env, number, "Booked")
+    assert env.cell(number, "outcome_status") == "Booked"
+    _stride_cancel(env, lead_id)
+    for _ in range(3):
+        env.tick()
+    assert env.cell(number, "action") == "Booked"  # case 4: no longer cleared
+    assert env.cell(number, "outcome_status") == (
+        "Needs review: appointment cancelled in Stride" + OLD.format("Booked"))
+    lead = env.lead(lead_id)
+    assert (lead["status"], lead["needs_review"]) == ("needs_attention", True)
+    assert _requests(env, lead_id, "booked") == 1
+    # Staff mark it booked again: clear Outcome Status.
+    env.sheet.set(number, "outcome_status", "")
+    env.tick()
+    assert env.lead(lead_id)["status"] == "booked" and _requests(env, lead_id, "booked") == 2
+    assert env.cell(number, "outcome_status") == "Booked"
+
+
+def test_a_restart_typed_next_to_booked_is_recorded_and_never_parked_by_a_stride_cancel(env):
+    # A command its Outcome Status turned down used to be cleared by the next system write; it is
+    # recorded as handled now, so the Stride cancel's review text does not make it a waiting Restart.
+    number = env.start_row()
+    env.tick()
+    lead_id = _command(env, number, "Booked")
+    env.sheet.set(number, "action", "Restart cadence")  # next to "Booked": turned down, as before
+    env.tick()
+    # No longer silent (tester 2026-10-23); Lead Status still Booked.
+    assert env.cell(number, "outcome_status") == (
+        "Booked; Restart cadence in Action not run (clear this cell to run it)")
+    assert env.cell(number, "lead_status") == "Booked"
+    _stride_cancel(env, lead_id)
+    for _ in range(3):
+        env.tick()
+    status = env.cell(number, "outcome_status")
+    assert status.startswith("Needs review: appointment cancelled in Stride")
+    assert not status.endswith(sheet_direct.REVIEW_FIRST)
+    assert _requests(env, lead_id, "restart_cadence") == 0
+
+
+def test_no_run_it_again_note_next_to_a_newer_row_on_the_same_phone(env):
+    # Tester 2026-10-23: clearing "Closed: a newer row has this phone number; ... clear this cell"
+    # restarted the old lead and took the number back. That text no longer invites it.
+    phone = _phone()
+    first = env.start_row(phone=phone)
+    env.tick()
+    _command(env, first, "Restart cadence")
+    second = env.start_row(phone=phone, name="Asha Rao")
+    env.tick()
+    env.tick()
+    assert env.cell(second, "outcome_status") == "Cadence started"
+    assert env.cell(first, "outcome_status") == "Closed: a newer row has this phone number"
+
+
+def _action_writes(env):
+    """Cells the worker wrote into the Action column (none since 2026-10-23)."""
+    from fake_sheet import HEADERS
+
+    from rpt_agent.services.google_sheet import column_letter
+
+    letter = column_letter(HEADERS.index("Action"))
+    return [(cell, text) for batch in env.sheet.writes for cell, text in batch
+            if re.fullmatch(letter + r"\d+", cell)]
+
+
+def test_a_lead_booked_outside_the_sheet_keeps_the_action_staff_left(env):
+    number = env.start_row()
+    env.tick()
+    lead_id = _command(env, number, "Restart cadence")
+    assert env.cell(number, "outcome_status") == "Cadence restarted"
+    env.db.execute("update leads set status='booked',cadence_state='completed',status_changed_at=now() "
+                   "where id=%s", (lead_id,))
+    enqueue_sheet_update(env.db, lead_id=lead_id, event_type="lead_booked", source_key=uuid4().hex)
+    env.tick()
+    assert (env.cell(number, "outcome_status"), env.cell(number, "action")) == (
+        "Booked", "Restart cadence")  # case 1: Action is not set to "Booked"
+    assert _action_writes(env) == []
+
+
+def test_the_worker_never_writes_the_action_column(env):
+    from rpt_agent.services.number_block import unblock_number
+
+    number = env.start_row()
+    env.tick()
+    lead_id = _command(env, number, "Do Not Contact")
+    with env.db.transaction():
+        lead = env.db.execute("select * from leads where id=%s for update", (lead_id,)).fetchone()
+        unblock_number(env.db, lead, "restart", "Admin")
+    env.tick()
+    _command(env, number, "Booked")
+    _stride_cancel(env, lead_id)
+    env.tick()
+    env.tick()
+    assert env.sheet.writes and _action_writes(env) == []

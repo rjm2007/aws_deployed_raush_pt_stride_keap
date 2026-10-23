@@ -44,7 +44,7 @@ Action Request ID | Action Started At
 | Date Of Birth | Staff enters `MM/DD/YYYY` (US, month first, since 2026-10-21); stored as a date | Staff |
 | Location | Location text | Staff |
 | Case | Any non-empty case/lead type | Staff |
-| Action | `Start cadence`, `Restart cadence`, `Do not contact`, or `Booked` | Staff |
+| Action | `Start cadence`, `Restart cadence`, `Do not contact`, or `Booked` | Staff only (direct mode never writes it, 2026-10-23) |
 | Action Status | Processing, success, duplicate, review, or error result | n8n |
 | Cadence Day | Most recently completed cadence day, for example `Day 5` | AWS status sync |
 | Cadence events | `Call`, `SMS`, or `Call + SMS` | AWS status sync |
@@ -257,12 +257,28 @@ states and inbound replies. These endpoints update Supabase first; they never ca
    Restart cadence does not run past the review: the row gets "<review text>; resolve it on the dashboard
    first, then the restart runs", the Action cell is kept, and the Restart runs once the review is resolved.
    If the dashboard ends the lead instead (close, front desk, booking link, Booked, Do not contact, or Stride
-   books it), that newer decision wins: the Restart is dropped, Action is reset, and Outcome Status says
-   "<result>; the Restart in Action was not run" (a final "Booked" / "Do Not Contact applied" stays as is).
-   Clearing Action removes the "resolve it on the dashboard first" words on the next poll.
-   Start cadence on a linked row is never a command (as before). The backend never writes Action
-   (resolution "Start cadence", "Booked", "" after a Stride cancel) over a command staff typed that has
-   not run yet. Old n8n texts ("Phone number changed; needs review") still block every command.
+   books it), that newer decision wins: the Restart is dropped (recorded as handled, Action left as is), and
+   Outcome Status says "<result>; the Restart in Action was not run" (a final "Booked" / "Do Not Contact
+   applied" stays as is). Clearing Action removes the "resolve it on the dashboard first" words on the next poll.
+   Start cadence on a linked row is never a command (as before). Old n8n texts ("Phone number changed; needs
+   review") still block every command.
+   Action column rule (direct mode, owner 2026-10-23): only staff write Action; the backend never does.
+   Results show in Outcome Status and Lead Status. A command is new only when it differs from the one the
+   row last handled: the row's Action Request ID names that request (`lead_action_requests.action`), and a
+   command equal to it never runs again while Outcome Status is not blank. A command the Outcome Status turns
+   down (Restart next to "Booked", Do Not Contact next to "Unblocked in dashboard", ...) is recorded as
+   handled the same way, so it cannot go off when a later text replaces that one, and the row says so:
+   "<text>; <command> in Action not run (clear this cell to run it)". When the backend writes a new non-final
+   Outcome Status next to a command that really ran it adds "; <command> in Action already ran (clear this
+   cell to run it again)". Neither invitation is added on a closed lead ("Closed: ...", "Phone changed: add a
+   new row"), nor for a Restart next to an open review text.
+   **How staff run the same command again: clear the Outcome Status cell.** The command in Action then runs
+   on the next poll. A Restart on a lead whose review is still open (checked in the database, not the row)
+   does not run: the row gets "<review text>; resolve it on the dashboard first, then the restart runs" and
+   it runs after the resolution. Booked and Do Not Contact run at once. A different command picked in Action
+   runs as usual.
+   n8n mode still has the backend write Action (`sheet.action`: "Booked" once booked, "" after a Stride
+   cancel; dashboard unblock / resolution values): the n8n intake has no memory of the last command.
 3. Normalize phone and DOB. Accept a one-word Name and any non-empty Case.
 4. Generate one Action Request ID.
 5. Using the trigger `row_number`, write `Processing: <Action>`, Action Request ID, and Action Started At to
