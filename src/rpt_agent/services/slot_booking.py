@@ -493,6 +493,11 @@ def _long_date(value: date) -> str:
     return value.strftime("%A, %B %d, %Y").replace(" 0", " ")
 
 
+# Searches for a day or month the caller named; their replies leave out the last-bookable-day note
+# unless the day is too far ahead.
+NAMED_WHEN = ("specific_date", "specific_month", "next_month")
+
+
 def _today_note(context: BookingContext) -> str:
     """The booking calendar's today, which the agent must use for dates the caller says, and how far
     ahead we book, so it can answer "how far out can I book?" (chat simulation, 2026-10-23)."""
@@ -531,6 +536,7 @@ def find_slots(
     # As the caller said it, for the too-far reply.
     asked = (_spoken_date(specific_date) if specific_date
              else _spoken_month(month) if month else None)
+    asked_date, asked_month = specific_date, month
     # Normal case (fresh cache): load, search and remember offers in one transaction.
     with transaction() as conn:
         context = load_context(conn, lead_id, location_name=location_name,
@@ -540,6 +546,11 @@ def find_slots(
                                              settings.booking_cache_days)
         month = pinned_calendar_month(month, context.now_local, settings.booking_today_override,
                                       settings.booking_cache_days)
+        # The demo pin moved the asked day or month: the reply says it is the answer to it.
+        moved = (f" for the day asked (on the booking calendar: {_spoken_date(specific_date)})"
+                 if specific_date and specific_date != asked_date
+                 else f" for the month asked (on the booking calendar: {_spoken_month(month)})"
+                 if month and month != asked_month else "")
         start, end = date_window(when, context.now_local, settings.booking_horizon_days,
                                  specific_date, month)
         pool = context.clinicians
@@ -559,11 +570,11 @@ def find_slots(
         stale = stale_chunks(context, needed)
         if not stale:
             return _offer(trace, conn, context, call_key, start, end, pool, time_of_day,
-                          clinician_name, when, asked=asked)
+                          clinician_name, when, asked=asked, moved=moved)
     refresh_cache(trace, context, providers, stale)
     with transaction() as conn:
         return _offer(trace, conn, context, call_key, start, end, pool, time_of_day,
-                      clinician_name, when, asked=asked)
+                      clinician_name, when, asked=asked, moved=moved)
 
 
 def _horizon_end(context: BookingContext) -> date:
@@ -592,21 +603,26 @@ def _too_far_note(asked: str, booking_end: date) -> str:
 def _offer(
     trace: WorkflowTrace, conn, context: BookingContext, call_key: str, start: date, end: date,
     pool: list[dict[str, Any]], time_of_day: str | None, clinician_name: str | None, when: str,
-    *, asked: date | None = None,
+    *, asked: date | None = None, moved: str = "",
 ) -> str:
     ids = [clinician["id"] for clinician in pool]
     where = f"{context.case_type['name']} at {context.location['name']}"
     who = f" with {pool[0]['display_name']}" if clinician_name and len(pool) == 1 else ""
     today, horizon_end = context.now_local.date(), _search_limit(context, end)
     too_far = start > _booking_end(context)
+    # The calendar and last-bookable-day note only where it is needed: a too-far reply, and a search
+    # without a named day or month. On a named day inside the window it made the agent compare the
+    # real date with the pinned last day and say "too far ahead" although times were found (chat
+    # sims 2026-10-23: November 30, Thanksgiving, December 2 with June 15 pinned).
+    named = when in NAMED_WHEN
+    limits = f" {_today_note(context)}" if too_far or not named else ""
     if not too_far:
         slots = search_slots(conn, context, start=start, end=min(end, horizon_end),
                              clinician_ids=ids, time_of_day=time_of_day)
         if slots:
             _remember_offers(conn, call_key, context, slots)
             trace.log("slots_offered", count=len(slots), when=when)
-            return (f"OPENINGS for {where}{who}: {_offer_text(slots)}. {BOOK_HINT} "
-                    f"{_today_note(context)}")
+            return f"OPENINGS for {where}{who}{moved}: {_offer_text(slots)}. {BOOK_HINT}{limits}"
     # Nothing in the wished-for range: the next times after it (the time of day first), else the
     # nearest times from today. Searching only after it said NO_OPENINGS when the asked day was
     # late in the window, or past it, although earlier days were open (QA 2026-10-22: Nov 26
@@ -634,16 +650,16 @@ def _offer(
         # NOTHING_IN_RANGE is a code the prompt already offers the listed times for.
         return (
             f"NOTHING_IN_RANGE: {note}Tell the caller that, then offer the nearest openings for "
-            f"{where}{who}: {_offer_text(later)}. {BOOK_HINT} {_today_note(context)}"
+            f"{where}{who}: {_offer_text(later)}. {BOOK_HINT}{limits}"
         )
     if label == "Nearest":
         return (
-            f"NOTHING_IN_RANGE: no {where}{who} openings for that time or later. "
-            f"Nearest openings: {_offer_text(later)}. {BOOK_HINT} {_today_note(context)}"
+            f"NOTHING_IN_RANGE: no {where}{who} openings{moved} for that time or later. "
+            f"Nearest openings: {_offer_text(later)}. {BOOK_HINT}{limits}"
         )
     return (
-        f"NOTHING_IN_RANGE: no {where}{who} openings for that time. "
-        f"Next openings: {_offer_text(later)}. {BOOK_HINT} {_today_note(context)}"
+        f"NOTHING_IN_RANGE: no {where}{who} openings{moved} for that time. "
+        f"Next openings: {_offer_text(later)}. {BOOK_HINT}{limits}"
     )
 
 

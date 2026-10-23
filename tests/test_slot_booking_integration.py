@@ -890,7 +890,8 @@ def test_find_a_date_45_and_80_days_out(env):
     lead = env.lead()
     day45 = env.find(lead, when="specific_date", specific_date=date(2026, 7, 30))
     assert day45.startswith("OPENINGS") and "Thursday, July 30 (2026-07-30) at 9:00 AM" in day45
-    assert "2:00 PM" in day45 and "June 16" not in day45 and LIMITS in day45
+    assert "2:00 PM" in day45 and "June 16" not in day45
+    assert "Last bookable day" not in day45  # a named day inside the window: no limits note
     day80 = env.find(lead, call_id="call-2", when="specific_date", specific_date=date(2026, 9, 3))
     assert day80.startswith("OPENINGS") and "Thursday, September 3 (2026-09-03) at 10:00 AM" in day80
     # A far day with nothing open gets the next times after it, also far.
@@ -1040,3 +1041,84 @@ def test_http_find_slots_takes_a_month(env, monkeypatch):
     assert "August 10" in result({"when": "specific_month", "month": "2026-08"})
     assert result({"when": "specific_month", "month": "August"}).startswith("BAD_MONTH")
     assert result({"when": "specific_month", "month": "2026-13"}).startswith("BAD_MONTH")
+
+
+# ------------------------------------------- last-bookable-day note placement (2026-10-23 sims)
+# The agent compared the real date asked (November 30) with the pinned "Last bookable day" (Sep 12)
+# and said "too far ahead" although the tool had found times. The note is now only on a too-far reply
+# and on searches without a named day or month; a moved day says which day it found times for.
+
+def test_a_named_real_day_moved_by_the_pin_says_it_is_the_day_asked_and_has_no_limits(env):
+    asked = real_today() + timedelta(days=38)
+    asked += timedelta(days=(3 - asked.weekday()) % 7)  # a Thursday, about 5-6 weeks out
+    moved = slot_booking.pinned_calendar_date(asked, datetime.now(UTC), TODAY, 90,
+                                              real_today=real_today())
+    assert moved != asked and moved.weekday() == 3
+    open_days(env, c5981={DAY1: ["09:00:00"], moved.isoformat(): ["09:00:00", "10:00:00"]})
+    env.sync()
+    lead = env.lead()
+    reply = env.find(lead, when="specific_date", specific_date=asked)
+    spoken = slot_booking._spoken_date(moved)
+    assert reply.startswith("OPENINGS for Physical Therapy at Laguna Niguel for the day asked (on "
+                            f"the booking calendar: {spoken}): (1) {spoken} ({moved}) at 9:00 AM")
+    assert reply.endswith(slot_booking.BOOK_HINT)
+    assert "Last bookable day" not in reply and "Calendar today" not in reply
+    assert "too far" not in reply
+    # Nothing open on it: the next times, still named as the day asked, still no limits.
+    env.db.execute("update availability_slots set status='gone' where booking_location_id=%s "
+                   "and local_date=%s", (env.location_id, moved))
+    empty = env.find(lead, call_id="call-2", when="specific_date", specific_date=asked)
+    assert empty.startswith("NOTHING_IN_RANGE: no Physical Therapy at Laguna Niguel openings for "
+                            f"the day asked (on the booking calendar: {spoken}) for that time")
+    assert "Last bookable day" not in empty and "too far" not in empty
+    # A real month moved by the pin, the same.
+    month = slot_booking._add_months(real_today().replace(day=1), 1)
+    moved_month = env.find(lead, call_id="call-3", when="specific_month", month=month)
+    pinned_month = slot_booking._spoken_month(slot_booking._add_months(TODAY.replace(day=1), 1))
+    assert f"for the month asked (on the booking calendar: {pinned_month})" in moved_month
+    assert "Last bookable day" not in moved_month
+
+
+def test_a_pinned_calendar_day_is_kept_and_named_plainly(env):
+    open_days(env, c5981={DAY45: ["09:00:00"]})
+    env.sync()
+    reply = env.find(env.lead(), when="specific_date", specific_date=date(2026, 7, 30))
+    assert reply == ("OPENINGS for Physical Therapy at Laguna Niguel: (1) Thursday, July 30 "
+                     f"(2026-07-30) at 9:00 AM with Thao Nguyen. {slot_booking.BOOK_HINT}")
+
+
+def test_the_limits_note_stays_on_default_searches_and_too_far(env):
+    open_days(env, c5981={DAY1: ["09:00:00"], DAY2: ["10:00:00"]})
+    env.sync()
+    lead = env.lead()
+    for when in ("earliest", "today", "tomorrow", "this_week", "next_week", "in_two_weeks"):
+        reply = env.find(lead, call_id=f"call-{when}", when=when)
+        assert reply.endswith(f"Calendar today: Monday, June 15, 2026. {LIMITS}"), when
+    morning = env.find(lead, call_id="call-am", when="earliest", time_of_day="morning")
+    assert morning.startswith("OPENINGS for Physical Therapy at Laguna Niguel: ") and LIMITS in morning
+    far = env.find(lead, call_id="call-far", when="specific_date",
+                   specific_date=real_today() + timedelta(days=120))
+    assert "is too far ahead to book yet" in far and LIMITS in far
+
+
+def test_without_a_pinned_day_only_the_limits_note_moves(env):
+    """Production (no BOOKING_TODAY_OVERRIDE): a named day reads as before, minus the note."""
+    settings = env.settings(booking_today_override=None)
+    today = slot_booking.booking_now(settings, "America/New_York").date()
+    soon = today + timedelta(days=3)
+    open_days(env, c5981={soon.isoformat(): ["09:00:00"]})
+    env.sync(booking_today_override=None)
+    lead = env.lead()
+
+    def find(call_id, **kwargs):
+        return slot_booking.find_slots(env.trace, lead_id=lead, call_id=call_id,
+                                       providers=env.stride, settings=settings, **kwargs)
+
+    named = find("a", when="specific_date", specific_date=soon)
+    assert named == (f"OPENINGS for Physical Therapy at Laguna Niguel: (1) "
+                     f"{slot_booking._spoken_date(soon)} ({soon}) at 9:00 AM with Thao Nguyen. "
+                     f"{slot_booking.BOOK_HINT}")
+    earliest = find("b", when="earliest")
+    assert earliest.startswith(named) and "Last bookable day: " in earliest
+    far = find("c", when="specific_date", specific_date=today + timedelta(days=95))
+    assert "too far ahead" in far and "Last bookable day: " in far

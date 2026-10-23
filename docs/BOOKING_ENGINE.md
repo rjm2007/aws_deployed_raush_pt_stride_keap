@@ -41,7 +41,13 @@ otherwise the default case type is used.
   first `BOOKING_HORIZON_DAYS` (31). A named date or month looks up to `BOOKING_CACHE_DAYS` (90) (2026-10-23).
   A month with the pinned calendar moves like a day ("December" said in October -> August).
 - OPENINGS / NOTHING_IN_RANGE end with `Calendar today: ... Last bookable day: <day 90>; searches without a
-  named date or month look up to <day 31>.`
+  named date or month look up to <day 31>.` only on a too-far reply and on searches without a named day or
+  month (`earliest` ... `in_two_weeks`). A named day or month inside the window (`specific_date`,
+  `specific_month`, `next_month`) leaves it out: the agent compared the real day asked with the pinned last
+  day and said "too far ahead" although times were found (chat sims 2026-10-23).
+- When the pin moved the asked day or month, the reply names it as the answer:
+  `OPENINGS for <service> at <clinic> for the day asked (on the booking calendar: Monday, July 27): ...`
+  (`for the month asked (on the booking calendar: July 2026)`; NOTHING_IN_RANGE the same before `for that time`).
 - The lead comes from the call (`variableValues.lead_id`), never from the model.
 - Reply starts with a code the prompt can branch on: `OPENINGS`, `NOTHING_IN_RANGE`,
   `NO_SUCH_THERAPIST`, `NO_OPENINGS_FOR_THERAPIST`, `NO_OPENINGS`, `UNKNOWN_LOCATION`, `PAST_DATE`, `BAD_*`.
