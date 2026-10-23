@@ -1190,8 +1190,8 @@ def book_slot(
     return (
         f"BOOKED: {_spoken_date(slot['local_date'])} at {_spoken_time(slot['local_time'])} with "
         f"{slot['display_name']} at our {context.location['name']} clinic, {duration} minutes. "
-        "Confirm this to the caller, say a confirmation text is on its way, and remind them "
-        "to call if they will be more than 10 minutes late."
+        "Confirm it to the caller with the short closing from your instructions; a text with "
+        "the details is on its way."
     )
 
 

@@ -707,7 +707,7 @@ def test_a_clinic_holiday_is_never_offered_or_booked(env):
 def test_a_booking_saves_the_stride_patient_on_the_appointment_and_says_ten_minutes(env):
     lead = booked_setup(env)
     message = env.book(lead, date=DAY1, time="9:00 AM")
-    assert message.startswith("BOOKED") and "more than 10 minutes late" in message
+    assert message.startswith("BOOKED") and "short closing" in message and "10 minutes" not in message
     row = env.one("select a.stride_patient_id,l.stride_patient_id as lead_patient from appointments a "
                   "join leads l on l.id=a.lead_id where a.lead_id=%s", lead)
     assert row["stride_patient_id"] and row["stride_patient_id"] == row["lead_patient"]

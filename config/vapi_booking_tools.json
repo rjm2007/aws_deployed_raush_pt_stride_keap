@@ -49,11 +49,11 @@
               ]
             },
             "specific_date": {
-              "description": "Only with when=specific_date: the day as YYYY-MM-DD, worked out from the 'Calendar today' line in this tool's last reply.",
+              "description": "Only with when=specific_date: the day the patient named, as YYYY-MM-DD, as you understand it. The tool places it on its own calendar.",
               "type": "string"
             },
             "month": {
-              "description": "Only with when=specific_month: the month as YYYY-MM, for example 2026-12, worked out from the 'Calendar today' line in this tool's last reply.",
+              "description": "Only with when=specific_month: the month the patient named, as YYYY-MM (for example 2026-12), as you understand it. The tool places it on its own calendar.",
               "type": "string"
             },
             "clinician_name": {
