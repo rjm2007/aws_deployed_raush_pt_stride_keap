@@ -3,7 +3,7 @@ from functools import cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -107,9 +107,15 @@ class Settings(BaseSettings):
     # Stride demo slots only exist in the past, so testing pins "today" here.
     # Never set in production.
     booking_today_override: date | None = None
+    # Default searches ("earliest", "next week", ...) stay inside the first BOOKING_HORIZON_DAYS.
     booking_horizon_days: int = Field(default=31, ge=1, le=31)
+    # Days of openings cached and bookable when the caller names a later date or month (owner,
+    # 2026-10-23). Stride allows 31 days per availability request, so this is fetched in chunks.
+    booking_cache_days: int = Field(default=90, ge=1, le=186)
     booking_min_notice_minutes: int = Field(default=120, ge=0, le=10080)
     booking_sync_seconds: int = Field(default=300, ge=30, le=3600)
+    # Chunks after the first 31 days change less often; they refresh at this interval (and on a new day).
+    booking_far_sync_seconds: int = Field(default=1800, ge=60, le=86400)
     # A search refreshes a location's cache itself when it is older than this.
     booking_cache_max_age_seconds: int = Field(default=900, ge=60, le=86400)
     booking_hold_seconds: int = Field(default=300, ge=30, le=1800)
@@ -185,6 +191,12 @@ class Settings(BaseSettings):
     @classmethod
     def _blank_override_is_unset(cls, value):
         return None if isinstance(value, str) and not value.strip() else value
+
+    @model_validator(mode="after")
+    def _cache_covers_the_default_window(self):
+        if self.booking_cache_days < self.booking_horizon_days:
+            raise ValueError("BOOKING_CACHE_DAYS must be at least BOOKING_HORIZON_DAYS")
+        return self
 
     @staticmethod
     def is_us_phone(phone: str | None) -> bool:

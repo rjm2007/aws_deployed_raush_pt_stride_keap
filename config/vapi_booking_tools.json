@@ -12,12 +12,12 @@
       "async": false,
       "function": {
         "name": "find_slots",
-        "description": "Find the nearest open appointment times for this patient's initial evaluation. Call it after the patient has confirmed the clinic, therapist preference, last-name spelling and date of birth, and again whenever they ask for another day, week, time of day, therapist or clinic. Only offer times this tool returns. The reply starts with a code such as OPENINGS, NOTHING_IN_RANGE or NO_SUCH_THERAPIST.",
+        "description": "Find the nearest open appointment times for this patient's initial evaluation. Call it after the patient has confirmed the clinic, therapist preference, last-name spelling and date of birth, and again whenever they ask for another day, week, month, time of day, therapist or clinic. Only offer times this tool returns. The reply starts with a code such as OPENINGS, NOTHING_IN_RANGE or NO_SUCH_THERAPIST.",
         "parameters": {
           "type": "object",
           "properties": {
             "when": {
-              "description": "When the patient wants to come in. earliest when they have no preference. specific_date for one named day.",
+              "description": "When the patient wants to come in. earliest when they have no preference. specific_date for one named day. next_month or specific_month (with month) when they name a month. A later date or month is a search like any other; the reply says the last bookable day.",
               "type": "string",
               "enum": [
                 "earliest",
@@ -26,7 +26,9 @@
                 "this_week",
                 "next_week",
                 "in_two_weeks",
-                "specific_date"
+                "specific_date",
+                "next_month",
+                "specific_month"
               ]
             },
             "location": {
@@ -48,6 +50,10 @@
             },
             "specific_date": {
               "description": "Only with when=specific_date: the day as YYYY-MM-DD, worked out from the 'Calendar today' line in this tool's last reply.",
+              "type": "string"
+            },
+            "month": {
+              "description": "Only with when=specific_month: the month as YYYY-MM, for example 2026-12, worked out from the 'Calendar today' line in this tool's last reply.",
               "type": "string"
             },
             "clinician_name": {

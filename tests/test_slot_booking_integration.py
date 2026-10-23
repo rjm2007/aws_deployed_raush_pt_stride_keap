@@ -19,7 +19,7 @@ from rpt_agent.config import get_settings
 from rpt_agent.db import get_pool
 from rpt_agent.observability import WorkflowTrace
 from rpt_agent.providers import ProviderError, Slot
-from rpt_agent.services import slot_booking
+from rpt_agent.services import availability_sync, slot_booking
 from rpt_agent.services.availability_sync import run_sync
 
 pytestmark = pytest.mark.integration
@@ -85,6 +85,8 @@ def env(monkeypatch):
         "SHEET_SYNC_ENABLED": "false",
     }.items():
         monkeypatch.setenv(key, value)
+    # A sync makes one Stride request per 31-day chunk; skip the rate-limit pause between them.
+    monkeypatch.setattr(availability_sync, "STRIDE_REQUEST_GAP_SECONDS", 0)
     get_settings.cache_clear()
     get_pool.cache_clear()
     conn = psycopg.connect(url, row_factory=dict_row, autocommit=True)
@@ -197,7 +199,7 @@ def test_sync_failure_is_recorded_and_does_not_wipe_cache(env):
     env.stride.availability_error = stride_error("503", "stride returned HTTP 503")
     assert env.sync()["errors"] == 1
     state = env.one("select last_error,slot_count from availability_sync_state "
-                    "where booking_location_id=%s", env.location_id)
+                    "where booking_location_id=%s and chunk=0", env.location_id)
     assert state["last_error"] and state["slot_count"] == 1
     assert env.one("select count(*) n from availability_slots where booking_location_id=%s "
                    "and status='open'", env.location_id)["n"] == 1
@@ -711,49 +713,57 @@ def test_a_booking_saves_the_stride_patient_on_the_appointment_and_says_ten_minu
     assert row["stride_patient_id"] and row["stride_patient_id"] == row["lead_patient"]
 
 
-def test_a_day_past_the_horizon_is_too_far_and_gets_the_nearest_times(env):
-    """QA 2026-10-22: Nov 26 (35 days out) got NO_OPENINGS although there were many openings."""
+def real_today():
+    """The real date at the clinic; a named real-calendar date is moved onto the pinned calendar."""
+    return datetime.now(slot_booking.ZoneInfo("America/New_York")).date()
+
+
+def test_a_day_past_the_cache_is_too_far_and_gets_the_nearest_times(env):
+    """QA 2026-10-22: a day past the window got NO_OPENINGS although there were many openings.
+    Since 2026-10-23 the window is 90 days (BOOKING_CACHE_DAYS): June 15 pinned -> September 12."""
     open_days(env, c5981={DAY1: ["09:00:00", "14:00:00"], DAY2: ["10:00:00"]})
     env.sync()
     lead = env.lead()
-    # On the pinned calendar (June 15) Nov 26 lands on Thursday July 23, past the last day (July 15).
-    reply = env.find(lead, when="specific_date", specific_date=date(2026, 11, 26))
-    assert reply.startswith("NOTHING_IN_RANGE: Thursday, November 26 is too far ahead to book yet; "
-                            "we can only book up to Wednesday, July 15.")
+    asked = real_today() + timedelta(days=120)  # lands past September 12 on the pinned calendar
+    reply = env.find(lead, when="specific_date", specific_date=asked)
+    assert reply.startswith(f"NOTHING_IN_RANGE: {slot_booking._spoken_date(asked)} is too far ahead "
+                            "to book yet; we can only book up to Saturday, September 12.")
     assert "Tuesday, June 16 (2026-06-16) at 9:00 AM" in reply and "June 17" in reply
     assert "Calendar today: Monday, June 15, 2026." in reply
     # Time of day is kept when it can be; otherwise any time.
-    afternoon = env.find(lead, call_id="call-2", when="specific_date",
-                         specific_date=date(2026, 11, 26), time_of_day="afternoon")
+    afternoon = env.find(lead, call_id="call-2", when="specific_date", specific_date=asked,
+                         time_of_day="afternoon")
     assert "2:00 PM" in afternoon and "9:00 AM" not in afternoon
-    evening = env.find(lead, call_id="call-3", when="specific_date",
-                       specific_date=date(2026, 11, 26), time_of_day="evening")
+    evening = env.find(lead, call_id="call-3", when="specific_date", specific_date=asked,
+                       time_of_day="evening")
     assert evening.startswith("NOTHING_IN_RANGE") and "9:00 AM" in evening
     # The offered times are remembered, so one can be booked.
     assert env.book(lead, date=DAY1, time="9:00 AM").startswith("BOOKED")
 
 
-def test_a_day_past_the_horizon_with_nothing_open_says_both(env):
+def test_a_day_past_the_cache_with_nothing_open_says_both(env):
     lead = env.lead()
     open_days(env)
     env.sync()
-    reply = env.find(lead, when="specific_date", specific_date=date(2026, 11, 26))
-    assert reply.startswith("NO_OPENINGS: Thursday, November 26 is too far ahead to book yet; we "
-                            "can only book up to Wednesday, July 15. No Physical Therapy at")
-    assert "in the next 31 days" in reply
+    asked = real_today() + timedelta(days=120)
+    reply = env.find(lead, when="specific_date", specific_date=asked)
+    assert reply.startswith(f"NO_OPENINGS: {slot_booking._spoken_date(asked)} is too far ahead to "
+                            "book yet; we can only book up to Saturday, September 12. No Physical "
+                            "Therapy at")
+    assert "in the next 90 days" in reply
 
 
-def test_booking_a_day_past_the_horizon_offers_the_nearest_times(env):
+def test_booking_a_day_past_the_cache_offers_the_nearest_times(env):
     open_days(env, c5981={DAY1: ["09:00:00"]})
     env.sync()
     lead = env.lead()
-    reply = env.book(lead, date="2026-07-20", time="9:00 AM")
+    reply = env.book(lead, date="2026-09-20", time="9:00 AM")
     assert reply.startswith("NOT_AVAILABLE") and "too far ahead to book yet" in reply
-    assert "June 16 (2026-06-16) at 9:00 AM" in reply
+    assert "up to Saturday, September 12" in reply and "June 16 (2026-06-16) at 9:00 AM" in reply
 
 
 def test_too_far_without_a_pinned_day_uses_the_real_calendar(env):
-    """Production has no BOOKING_TODAY_OVERRIDE: the asked day and the horizon are real dates."""
+    """Production has no BOOKING_TODAY_OVERRIDE: the asked day and the last day are real dates."""
     settings = env.settings(booking_today_override=None)
     today = slot_booking.booking_now(settings, "America/New_York").date()
     soon = (today + timedelta(days=2)).isoformat()
@@ -765,9 +775,9 @@ def test_too_far_without_a_pinned_day_uses_the_real_calendar(env):
         return slot_booking.find_slots(env.trace, lead_id=lead, call_id="call-real",
                                        providers=env.stride, settings=settings, **kwargs)
 
-    asked = today + timedelta(days=35)
+    asked = today + timedelta(days=95)
     reply = find(when="specific_date", specific_date=asked)
-    last = today + timedelta(days=30)
+    last = today + timedelta(days=89)
     assert reply.startswith(f"NOTHING_IN_RANGE: {slot_booking._spoken_date(asked)} is too far ahead")
     assert f"up to {slot_booking._spoken_date(last)}." in reply and f"({soon}) at 9:00 AM" in reply
     # The last day is still inside the window: not "too far", and the opening 2 days out is offered.
@@ -801,3 +811,232 @@ def test_a_late_day_with_nothing_after_it_offers_the_nearest_earlier_times(env):
 def test_a_real_past_day_on_the_pinned_calendar_is_past(env):
     with pytest.raises(ValueError, match="PAST_DATE"):
         env.find(env.lead(), when="specific_date", specific_date=date(2026, 10, 1))
+
+
+# --------------------------------------------------------------------------- 90 days (2026-10-23)
+# BOOKING_CACHE_DAYS=90 from the pinned June 15: chunk 0 = Jun 15-Jul 15 (the default search window),
+# chunk 1 = Jul 16-Aug 15, chunk 2 = Aug 16-Sep 12. Stride allows at most 31 days per request.
+DAY45, DAY80 = "2026-07-30", "2026-09-03"  # Thursday July 30, Thursday September 3
+LIMITS = ("Last bookable day: Saturday, September 12, 2026; searches without a named date or month "
+          "look up to Wednesday, July 15.")
+
+
+def availability_requests(env):
+    return [args for name, args in env.stride.calls if name == "availability"]
+
+
+def age_chunks(env, minutes, *, chunks=(1, 2)):
+    env.db.execute(
+        "update availability_sync_state set last_success_at=now()-make_interval(mins=>%s) "
+        "where booking_location_id=%s and chunk=any(%s)", (minutes, env.location_id, list(chunks)),
+    )
+
+
+def test_a_sync_asks_stride_for_90_days_in_three_chunks_of_at_most_31_days(env):
+    open_days(env)
+    result = env.sync()
+    requests = availability_requests(env)
+    assert result["requests"] == 3 and len(requests) == 3
+    windows = [(start, end) for *_, start, end in requests]
+    assert windows == [(date(2026, 6, 15), date(2026, 7, 15)), (date(2026, 7, 16), date(2026, 8, 15)),
+                       (date(2026, 8, 16), date(2026, 9, 12))]
+    assert all((end - start).days + 1 <= 31 for start, end in windows)
+    rows = env.db.execute("select chunk,window_start,window_end from availability_sync_state "
+                          "where booking_location_id=%s order by chunk", (env.location_id,)).fetchall()
+    assert [(r["chunk"], r["window_start"], r["window_end"]) for r in rows] == [
+        (index, start, end) for index, (start, end) in enumerate(windows)]
+    # Any cache length is cut the same way.
+    chunks = availability_sync.cache_chunks(TODAY, 100)
+    assert [c.end - c.start for c in chunks] == [timedelta(days=30)] * 3 + [timedelta(days=6)]
+
+
+def test_the_first_chunk_refreshes_every_cycle_and_later_chunks_every_30_minutes(env):
+    open_days(env)
+    env.sync()
+    env.stride.calls.clear()
+    assert env.sync()["requests"] == 1  # 5 minutes later: only the first 31 days
+    assert [args[3] for args in availability_requests(env)] == [TODAY]
+    age_chunks(env, 29)
+    assert env.sync()["requests"] == 1
+    age_chunks(env, 30)  # BOOKING_FAR_SYNC_SECONDS=1800
+    env.stride.calls.clear()
+    assert env.sync()["requests"] == 3
+    # A failed later chunk is tried again on the next cycle, not 30 minutes later.
+    env.stride.calls.clear()
+    env.db.execute("update availability_sync_state set last_error='HTTP 503' where "
+                   "booking_location_id=%s and chunk=2", (env.location_id,))
+    assert env.sync()["requests"] == 2
+    # A new day moves every window, so every chunk is fetched again.
+    assert env.sync(booking_today_override=TODAY + timedelta(days=1))["requests"] == 3
+
+
+def test_a_slot_that_disappears_from_a_later_chunk_becomes_gone(env):
+    open_days(env, c5981={DAY45: ["09:00:00"], DAY80: ["10:00:00"]})
+    env.sync()
+    open_days(env, c5981={DAY80: ["10:00:00"]})
+    env.sync()  # later chunks not due yet: the cache still has July 30
+    status = "select status from availability_slots where booking_location_id=%s and local_date=%s"
+    assert env.one(status, env.location_id, DAY45)["status"] == "open"
+    age_chunks(env, 31)
+    env.sync()
+    assert env.one(status, env.location_id, DAY45)["status"] == "gone"
+    assert env.one(status, env.location_id, DAY80)["status"] == "open"
+
+
+def test_find_a_date_45_and_80_days_out(env):
+    open_days(env, c5981={DAY1: ["09:00:00"], DAY45: ["09:00:00", "14:00:00"],
+                          DAY80: ["10:00:00"]})
+    env.sync()
+    lead = env.lead()
+    day45 = env.find(lead, when="specific_date", specific_date=date(2026, 7, 30))
+    assert day45.startswith("OPENINGS") and "Thursday, July 30 (2026-07-30) at 9:00 AM" in day45
+    assert "2:00 PM" in day45 and "June 16" not in day45 and LIMITS in day45
+    day80 = env.find(lead, call_id="call-2", when="specific_date", specific_date=date(2026, 9, 3))
+    assert day80.startswith("OPENINGS") and "Thursday, September 3 (2026-09-03) at 10:00 AM" in day80
+    # A far day with nothing open gets the next times after it, also far.
+    empty = env.find(lead, call_id="call-3", when="specific_date", specific_date=date(2026, 8, 20))
+    assert empty.startswith("NOTHING_IN_RANGE: no ") and "Next openings: (1) Thursday, September 3" in empty
+
+
+def test_default_searches_stay_inside_the_first_31_days(env):
+    open_days(env, c5981={DAY1: ["09:00:00"], DAY45: ["09:00:00"]}, c5982={DAY80: ["09:00:00"]})
+    env.sync()
+    lead = env.lead()
+    for when in ("earliest", "this_week", "tomorrow"):
+        reply = env.find(lead, call_id=f"call-{when}", when=when)
+        assert "June 16" in reply and "July 30" not in reply and "September" not in reply.split(
+            "Last bookable day")[0]
+    # Nothing in the first 31 days: the default search does not reach into later months.
+    env.db.execute("update availability_slots set status='gone' where booking_location_id=%s "
+                   "and local_date=%s", (env.location_id, DAY1))
+    nothing = env.find(lead, call_id="call-empty", when="earliest")
+    assert nothing.startswith("NO_OPENINGS") and "in the next 31 days" in nothing
+    therapist = env.find(lead, call_id="call-alan", clinician_name="Alan")
+    assert therapist.startswith("NO_OPENINGS_FOR_THERAPIST") and "next 31 days" in therapist
+    afternoon = env.find(lead, call_id="call-pm", when="next_week", time_of_day="afternoon")
+    assert afternoon.startswith("NO_OPENINGS")
+
+
+def test_next_month_and_a_named_month(env):
+    open_days(env, c5981={DAY1: ["09:00:00"], "2026-07-20": ["11:00:00"], "2026-08-10": ["09:00:00"]})
+    env.sync()
+    lead = env.lead()
+    july = env.find(lead, when="next_month")  # pinned June 15 -> July, across chunks 0 and 1
+    assert july.startswith("OPENINGS") and "Monday, July 20 (2026-07-20) at 11:00 AM" in july
+    assert "June 16" not in july and "August" not in july.split("Last bookable day")[0]
+    august = env.find(lead, call_id="call-2", when="specific_month", month=date(2026, 8, 1))
+    assert august.startswith("OPENINGS") and "Monday, August 10 (2026-08-10) at 9:00 AM" in august
+    # A real month (two months after the real one) lands two months after the pinned one: August.
+    real = real_today().replace(day=1)
+    two_on = slot_booking._add_months(real, 2)
+    moved = env.find(lead, call_id="call-3", when="specific_month", month=two_on)
+    assert "August 10 (2026-08-10)" in moved
+    # A month with nothing open gets the next times after it.
+    september = env.find(lead, call_id="call-4", when="specific_month", month=date(2026, 9, 1))
+    assert september.startswith("NOTHING_IN_RANGE") and "June 16" in september
+    # Past the last bookable day.
+    far = slot_booking._add_months(real, 5)
+    too_far = env.find(lead, call_id="call-5", when="specific_month", month=far)
+    assert too_far.startswith(f"NOTHING_IN_RANGE: {far.strftime('%B %Y')} is too far ahead to book "
+                              "yet; we can only book up to Saturday, September 12.")
+    with pytest.raises(ValueError, match="NEED_MONTH"):
+        env.find(lead, when="specific_month")
+
+
+def test_a_far_search_refreshes_only_the_chunks_it_needs(env):
+    open_days(env, c5981={DAY1: ["09:00:00"], DAY45: ["09:00:00"]})
+    lead = env.lead()  # nothing synced yet
+    assert env.find(lead, when="earliest").startswith("OPENINGS")
+    assert len(availability_requests(env)) == 1  # a default search: first chunk only, as before
+    env.stride.calls.clear()
+    assert env.find(lead, call_id="call-2", when="specific_date",
+                    specific_date=date(2026, 7, 30)).startswith("OPENINGS")
+    assert [args[3] for args in availability_requests(env)] == [date(2026, 7, 16)]
+    # A later chunk 40 minutes old is still fine (it refreshes every 30); 50 minutes is not.
+    env.stride.calls.clear()
+    age_chunks(env, 40, chunks=(1,))
+    env.find(lead, call_id="call-3", when="specific_date", specific_date=date(2026, 7, 30))
+    assert availability_requests(env) == []
+    age_chunks(env, 50, chunks=(1,))
+    env.find(lead, call_id="call-4", when="specific_date", specific_date=date(2026, 7, 30))
+    assert len(availability_requests(env)) == 1
+
+
+def test_booking_a_far_slot_rechecks_it_live(env):
+    open_days(env, c5981={DAY80: ["10:00:00"]})
+    env.sync()
+    lead = env.lead()
+    env.find(lead, when="specific_date", specific_date=date(2026, 9, 3))
+    env.stride.calls.clear()
+    booked = env.book(lead, date=DAY80, time="10:00 AM")
+    assert booked.startswith("BOOKED: Thursday, September 3 at 10:00 AM with Thao Nguyen")
+    live = availability_requests(env)
+    assert live == [(3170, 60, "5981", date(2026, 9, 3), date(2026, 9, 3))]
+    # Gone in Stride at the last moment: not booked, the slot is marked gone.
+    open_days(env, c5981={"2026-09-04": ["10:00:00"]})
+    env.sync()
+    age_chunks(env, 31)
+    other = env.lead()
+    open_days(env, c5981={"2026-09-04": ["10:00:00"], "2026-09-08": ["10:00:00"]})
+    env.sync()
+    env.find(other, call_id="call-9", when="specific_date", specific_date=date(2026, 9, 4))
+    open_days(env, c5981={"2026-09-08": ["10:00:00"]})
+    taken = env.book(other, call_id="call-9", date="2026-09-04", time="10:00 AM")
+    assert taken.startswith("TAKEN") and "September 8" in taken
+
+
+def test_a_holiday_in_the_second_month_is_never_offered_or_booked(env):
+    open_days(env, c5981={DAY45: ["09:00:00"], "2026-07-31": ["09:00:00"]})
+    env.sync()
+    env.db.execute("update practice_settings set holidays=%s::jsonb where practice_id=%s",
+                   (f'["{DAY45}"]', env.practice_id))
+    lead = env.lead()
+    reply = env.find(lead, when="specific_date", specific_date=date(2026, 7, 30))
+    assert reply.startswith("NOTHING_IN_RANGE") and "July 30" not in reply.split("openings:")[1]
+    assert "Friday, July 31 (2026-07-31) at 9:00 AM" in reply
+    assert not env.book(lead, date=DAY45, time="9:00 AM").startswith("BOOKED")
+
+
+def test_90_days_without_a_pinned_day(env):
+    settings = env.settings(booking_today_override=None)
+    today = slot_booking.booking_now(settings, "America/New_York").date()
+    day45, day80 = today + timedelta(days=45), today + timedelta(days=80)
+    open_days(env, c5981={day45.isoformat(): ["09:00:00"], day80.isoformat(): ["10:00:00"]})
+    result = env.sync(booking_today_override=None)
+    assert result["requests"] == 3
+    lead = env.lead()
+
+    def find(call_id, **kwargs):
+        return slot_booking.find_slots(env.trace, lead_id=lead, call_id=call_id,
+                                       providers=env.stride, settings=settings, **kwargs)
+
+    assert f"({day45.isoformat()}) at 9:00 AM" in find("a", when="specific_date", specific_date=day45)
+    assert f"({day80.isoformat()}) at 10:00 AM" in find("b", when="specific_date", specific_date=day80)
+    month = find("c", when="specific_month", month=day80.replace(day=1))
+    assert f"({day80.isoformat()}) at 10:00 AM" in month
+    assert find("d", when="earliest").startswith("NO_OPENINGS")  # both are past the first 31 days
+    booked = slot_booking.book_slot(env.trace, lead_id=lead, call_id="b",
+                                    arguments={**PATIENT, "date": day80.isoformat(),
+                                               "time": "10:00 AM"},
+                                    providers=env.stride, settings=settings)
+    assert booked.startswith("BOOKED")
+
+
+def test_http_find_slots_takes_a_month(env, monkeypatch):
+    from rpt_agent.api import app
+
+    open_days(env, c5981={"2026-08-10": ["09:00:00"]})
+    env.sync()
+    lead = env.lead()
+    monkeypatch.setattr(slot_booking, "_fast_providers", lambda settings: env.stride)
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer test-vapi-secret"}
+
+    def result(arguments):
+        reply = client.post("/api/v1/tools/find-slots", headers=headers,
+                            json=vapi_body(lead, "find_slots", arguments))
+        return reply.json()["results"][0]["result"]
+
+    assert "August 10" in result({"when": "specific_month", "month": "2026-08"})
+    assert result({"when": "specific_month", "month": "August"}).startswith("BAD_MONTH")
+    assert result({"when": "specific_month", "month": "2026-13"}).startswith("BAD_MONTH")

@@ -39,7 +39,13 @@ from ..config import Settings, get_settings
 from ..db import transaction
 from ..observability import WorkflowTrace
 from ..providers import ProviderClients, ProviderError
-from .availability_sync import booking_now, sync_target, sync_targets
+from .availability_sync import (
+    booking_now,
+    cache_chunks,
+    chunk_max_age,
+    sync_target,
+    sync_targets,
+)
 from .lead_review import demo_code_for_reason
 from .lead_status import mark_booked
 from .review import flag_lead_for_review
@@ -47,6 +53,7 @@ from .sheet_sync import enqueue_sheet_update
 
 WHEN_VALUES = (
     "earliest", "today", "tomorrow", "this_week", "next_week", "in_two_weeks", "specific_date",
+    "next_month", "specific_month",
 )
 TIME_OF_DAY = {
     "morning": (clock_time(0, 0), clock_time(12, 0)),
@@ -71,7 +78,7 @@ class BookingContext:
     clinicians: list[dict[str, Any]]
     now_local: datetime
     settings: Settings = field(repr=False)
-    sync_state: dict[str, Any] | None = None
+    sync_state: dict[int, dict[str, Any]] = field(default_factory=dict)
     booking_enabled: bool = False
 
     @property
@@ -125,7 +132,8 @@ select row_to_json(lead) as lead,
           from clinician_assignments ca join clinicians c on c.id=ca.clinician_id and c.is_active
          where ca.is_active and ca.booking_location_id=(select id from loc)
            and ca.case_type_id=(select id from kind)) as clinicians,
-       (select json_build_object('last_success_at',s.last_success_at,'window_start',s.window_start)
+       (select json_object_agg(s.chunk, json_build_object('last_success_at',s.last_success_at,
+                'window_start',s.window_start))
           from availability_sync_state s
          where s.booking_location_id=(select id from loc)
            and s.duration_minutes=(select duration_minutes from kind)) as sync_state,
@@ -176,14 +184,16 @@ def load_context(
             f"NO_CLINICIANS: no therapist is set up for {case_type['name']} at {location['name']}. "
             "Offer to text the booking link or transfer to the team."
         )
-    sync_state = row["sync_state"]
-    if sync_state:
-        sync_state = {
-            "last_success_at": datetime.fromisoformat(sync_state["last_success_at"])
-            if sync_state["last_success_at"] else None,
-            "window_start": date.fromisoformat(sync_state["window_start"])
-            if sync_state["window_start"] else None,
+    # One entry per cache chunk (availability_sync.cache_chunks): {0: {...}, 1: {...}}.
+    sync_state = {
+        int(chunk): {
+            "last_success_at": datetime.fromisoformat(state["last_success_at"])
+            if state["last_success_at"] else None,
+            "window_start": date.fromisoformat(state["window_start"])
+            if state["window_start"] else None,
         }
+        for chunk, state in (row["sync_state"] or {}).items()
+    }
     return BookingContext(
         lead=lead, location=location, case_type=case_type, clinicians=row["clinicians"],
         now_local=booking_now(settings, location["timezone"]), settings=settings,
@@ -225,9 +235,24 @@ def match_clinicians(clinicians: list[dict[str, Any]], name: str) -> list[dict[s
 # Date windows
 # ---------------------------------------------------------------------------
 
+def _month_end(first: date) -> date:
+    return _add_months(first, 1) - timedelta(days=1)
+
+
+def _add_months(first: date, months: int) -> date:
+    index = first.year * 12 + first.month - 1 + months
+    return date(index // 12, index % 12 + 1, 1)
+
+
+def _spoken_month(first: date) -> str:
+    return first.strftime("%B %Y")
+
+
 def date_window(
     when: str, now_local: datetime, horizon_days: int, specific: date | None = None,
+    month: date | None = None,
 ) -> tuple[date, date]:
+    """The days a search looks at. A window past the cache end is answered as too far by _offer."""
     today = now_local.date()
     last = today + timedelta(days=horizon_days - 1)
     monday = today - timedelta(days=today.weekday())
@@ -251,6 +276,17 @@ def date_window(
                 f"PAST_DATE: {_spoken_date(specific)} has already passed. Ask for another day."
             )
         return specific, specific
+    if when == "next_month":
+        first = _add_months(today.replace(day=1), 1)
+        return first, _month_end(first)
+    if when == "specific_month":
+        if month is None:
+            raise ValueError("NEED_MONTH: specific_month needs the month as YYYY-MM.")
+        if _month_end(month) < today:
+            raise ValueError(
+                f"PAST_DATE: {_spoken_month(month)} has already passed. Ask for another month."
+            )
+        return max(month, today), _month_end(month)
     raise ValueError(f"BAD_WHEN: when must be one of {', '.join(WHEN_VALUES)}.")
 
 
@@ -275,6 +311,27 @@ def pinned_calendar_date(asked: date | None, now_local: datetime, pinned: date |
         raise ValueError(f"PAST_DATE: {_spoken_date(asked)} has already passed. Ask for another day.")
     moved = pinned + timedelta(days=(asked - real_today).days)
     return moved + timedelta(days=(asked.weekday() - moved.weekday()) % 7)
+
+
+def pinned_calendar_month(asked: date | None, now_local: datetime, pinned: date | None,
+                          cache_days: int, real_today: date | None = None) -> date | None:
+    """A month the agent named (its first day), moved onto the pinned demo calendar.
+
+    Same rule as pinned_calendar_date: a month inside the pinned calendar is kept; a real-calendar
+    month keeps its distance from the real month ("December" said in October -> two months after
+    the pinned month). Without a pinned day nothing changes.
+    """
+    if asked is None or pinned is None:
+        return asked
+    if pinned.replace(day=1) <= asked <= pinned + timedelta(days=cache_days - 1):
+        return asked
+    real_month = (real_today or datetime.now(now_local.tzinfo).date()).replace(day=1)
+    if asked < real_month:
+        raise ValueError(
+            f"PAST_DATE: {_spoken_month(asked)} has already passed. Ask for another month."
+        )
+    months = (asked.year - real_month.year) * 12 + asked.month - real_month.month
+    return _add_months(pinned.replace(day=1), months)
 
 
 def _spoken_date(value: date) -> str:
@@ -304,21 +361,39 @@ def _fast_providers(settings: Settings) -> ProviderClients:
     }))
 
 
-def cache_is_fresh(context: BookingContext) -> bool:
-    state = context.sync_state
-    return bool(
-        state
-        and state["last_success_at"] is not None
-        and datetime.now(UTC) - state["last_success_at"]
-        < timedelta(seconds=context.settings.booking_cache_max_age_seconds)
-        and state["window_start"] == context.now_local.date()
-    )
+def chunks_for(context: BookingContext, start: date, end: date) -> list[int]:
+    """The cache chunks (availability_sync.cache_chunks) a search from start to end reads."""
+    chunks = cache_chunks(context.now_local.date(), context.settings.booking_cache_days)
+    return [chunk.index for chunk in chunks if chunk.start <= end and chunk.end >= start] or [0]
+
+
+def stale_chunks(context: BookingContext, chunks: list[int]) -> list[int]:
+    """Chunks too old to offer from: never synced, synced on another day, or past their max age."""
+    starts = {chunk.index: chunk.start
+              for chunk in cache_chunks(context.now_local.date(), context.settings.booking_cache_days)}
+    stale = []
+    for index in chunks:
+        state = context.sync_state.get(index)
+        if not (
+            state
+            and state["last_success_at"] is not None
+            and datetime.now(UTC) - state["last_success_at"] < chunk_max_age(context.settings, index)
+            and state["window_start"] == starts.get(index)
+        ):
+            stale.append(index)
+    return stale
+
+
+def cache_is_fresh(context: BookingContext, chunks: list[int] | None = None) -> bool:
+    return not stale_chunks(context, chunks if chunks is not None else [0])
 
 
 def refresh_cache(
     trace: WorkflowTrace, context: BookingContext, providers: ProviderClients,
+    chunks: list[int] | None = None,
 ) -> None:
-    """Refresh this location's cache inline when the background sync is late."""
+    """Refresh this location's stale chunks inline when the background sync is late."""
+    chunks = chunks if chunks is not None else [0]
     with transaction() as conn:
         targets = [
             target for target in sync_targets(conn, context.location["id"])
@@ -327,11 +402,13 @@ def refresh_cache(
     if not targets:
         return
     try:
-        sync_target(trace, targets[0], providers=providers, settings=context.settings)
+        sync_target(trace, targets[0], providers=providers, settings=context.settings,
+                    chunks=chunks)
     except ProviderError:
         # Offer from the older cache; the booking re-checks live anyway.
         trace.log("availability_inline_sync_failed", booking_location_id=context.location["id"])
-        if not context.sync_state or context.sync_state["last_success_at"] is None:
+        if any((context.sync_state.get(index) or {}).get("last_success_at") is None
+               for index in chunks):
             raise
 
 
@@ -412,9 +489,18 @@ BOOK_HINT = (
 )
 
 
+def _long_date(value: date) -> str:
+    return value.strftime("%A, %B %d, %Y").replace(" 0", " ")
+
+
 def _today_note(context: BookingContext) -> str:
-    """The booking calendar's today, which the agent must use for dates the caller says."""
-    return f"Calendar today: {context.now_local.strftime('%A, %B %d, %Y').replace(' 0', ' ')}."
+    """The booking calendar's today, which the agent must use for dates the caller says, and how far
+    ahead we book, so it can answer "how far out can I book?" (chat simulation, 2026-10-23)."""
+    return (
+        f"Calendar today: {_long_date(context.now_local.date())}. Last bookable day: "
+        f"{_long_date(_booking_end(context))}; searches without a named date or month look up to "
+        f"{_spoken_date(_horizon_end(context))}."
+    )
 
 
 def find_slots(
@@ -428,6 +514,7 @@ def find_slots(
     clinician_name: str | None = None,
     location_name: str | None = None,
     case_type_name: str | None = None,
+    month: date | None = None,
     settings: Settings | None = None,
     providers: ProviderClients | None = None,
 ) -> str:
@@ -436,16 +523,25 @@ def find_slots(
     if time_of_day and time_of_day not in TIME_OF_DAY:
         raise ValueError("BAD_TIME_OF_DAY: time_of_day must be morning, afternoon or evening.")
     call_key = call_id or f"direct:{lead_id}"
-    asked_date = specific_date  # as the caller said it, for the too-far reply
+    if when == "specific_month" and month is None and specific_date is not None:
+        month = specific_date.replace(day=1)  # the model sent a day of the month instead
+    if when != "specific_date":
+        specific_date = None
+    month = month.replace(day=1) if when == "specific_month" and month else None
+    # As the caller said it, for the too-far reply.
+    asked = (_spoken_date(specific_date) if specific_date
+             else _spoken_month(month) if month else None)
     # Normal case (fresh cache): load, search and remember offers in one transaction.
     with transaction() as conn:
         context = load_context(conn, lead_id, location_name=location_name,
                                case_type_name=case_type_name, settings=settings)
         specific_date = pinned_calendar_date(specific_date, context.now_local,
                                              settings.booking_today_override,
-                                             settings.booking_horizon_days)
+                                             settings.booking_cache_days)
+        month = pinned_calendar_month(month, context.now_local, settings.booking_today_override,
+                                      settings.booking_cache_days)
         start, end = date_window(when, context.now_local, settings.booking_horizon_days,
-                                 specific_date)
+                                 specific_date, month)
         pool = context.clinicians
         if clinician_name:
             pool = match_clinicians(context.clinicians, clinician_name)
@@ -457,24 +553,39 @@ def find_slots(
                     f"Therapists there: {names}. Ask if one of them is fine, or offer the earliest "
                     "time with any therapist."
                 )
-        if cache_is_fresh(context):
+        # A default search reads only the first chunk, as before; a later date or month also
+        # reads the chunk(s) it falls in (its fallbacks use whatever else is cached).
+        needed = sorted({0, *chunks_for(context, start, min(end, _search_limit(context, end)))})
+        stale = stale_chunks(context, needed)
+        if not stale:
             return _offer(trace, conn, context, call_key, start, end, pool, time_of_day,
-                          clinician_name, when, asked=asked_date)
-    refresh_cache(trace, context, providers)
+                          clinician_name, when, asked=asked)
+    refresh_cache(trace, context, providers, stale)
     with transaction() as conn:
         return _offer(trace, conn, context, call_key, start, end, pool, time_of_day,
-                      clinician_name, when, asked=asked_date)
+                      clinician_name, when, asked=asked)
 
 
 def _horizon_end(context: BookingContext) -> date:
-    """The last day we cache and book (booking_horizon_days from the booking calendar's today)."""
+    """The last day a default search looks at (booking_horizon_days from the calendar's today)."""
     return context.now_local.date() + timedelta(days=context.settings.booking_horizon_days - 1)
 
 
-def _too_far_note(asked: date, horizon_end: date) -> str:
+def _booking_end(context: BookingContext) -> date:
+    """The last day we cache and book (booking_cache_days from the booking calendar's today)."""
+    return context.now_local.date() + timedelta(days=context.settings.booking_cache_days - 1)
+
+
+def _search_limit(context: BookingContext, end: date) -> date:
+    """How far a search and its fallbacks look: the default window for a default search (exactly
+    as before 2026-10-23), the whole cache for a named later date or month."""
+    return _horizon_end(context) if end <= _horizon_end(context) else _booking_end(context)
+
+
+def _too_far_note(asked: str, booking_end: date) -> str:
     return (
-        f"{_spoken_date(asked)} is too far ahead to book yet; we can only book up to "
-        f"{_spoken_date(horizon_end)}."
+        f"{asked} is too far ahead to book yet; we can only book up to "
+        f"{_spoken_date(booking_end)}."
     )
 
 
@@ -486,8 +597,8 @@ def _offer(
     ids = [clinician["id"] for clinician in pool]
     where = f"{context.case_type['name']} at {context.location['name']}"
     who = f" with {pool[0]['display_name']}" if clinician_name and len(pool) == 1 else ""
-    today, horizon_end = context.now_local.date(), _horizon_end(context)
-    too_far = start > horizon_end
+    today, horizon_end = context.now_local.date(), _search_limit(context, end)
+    too_far = start > _booking_end(context)
     if not too_far:
         slots = search_slots(conn, context, start=start, end=min(end, horizon_end),
                              clinician_ids=ids, time_of_day=time_of_day)
@@ -513,9 +624,10 @@ def _offer(
                                  time_of_day=wanted_time)
         if later:
             break
-    note = _too_far_note(asked or start, horizon_end) + " " if too_far else ""
+    note = _too_far_note(asked or _spoken_date(start), horizon_end) + " " if too_far else ""
     if not later:
-        return _no_openings(context, pool, clinician_name, note)
+        return _no_openings(context, pool, clinician_name, note,
+                            days=(horizon_end - today).days + 1)
     _remember_offers(conn, call_key, context, later)
     trace.log("slots_offered", count=len(later), when=when, fallback=True, too_far=too_far)
     if too_far:
@@ -536,8 +648,7 @@ def _offer(
 
 
 def _no_openings(context: BookingContext, pool: list[dict[str, Any]], clinician_name: str | None,
-                 note: str = "") -> str:
-    days = context.settings.booking_horizon_days
+                 note: str = "", *, days: int) -> str:
     if clinician_name and len(pool) < len(context.clinicians):
         return (
             f"NO_OPENINGS_FOR_THERAPIST: {note}{pool[0]['display_name']} has no openings in the "
@@ -676,8 +787,9 @@ def _find_slot_for_booking(
 
 
 def _alternatives(trace: WorkflowTrace, context: BookingContext, call_key: str, day: date) -> str:
-    horizon_end = _horizon_end(context)
-    too_far = _too_far_note(day, horizon_end) + " " if day > horizon_end else ""
+    horizon_end = _search_limit(context, day)
+    too_far = (_too_far_note(_spoken_date(day), horizon_end) + " "
+               if day > _booking_end(context) else "")
     today = context.now_local.date()
     ids = [c["id"] for c in context.clinicians]
     with transaction() as conn:

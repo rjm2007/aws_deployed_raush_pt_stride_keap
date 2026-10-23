@@ -56,7 +56,8 @@ def _lead_id(arguments: dict[str, Any]) -> str:
         "Read-only. Uses the lead's location and case type to pick clinicians, then returns "
         "the three nearest open times from the slot cache and remembers them for the call. "
         "Arguments: `when` (required: " + ", ".join(WHEN_VALUES) + "), `specific_date` "
-        "(YYYY-MM-DD, with when=specific_date), `time_of_day` (morning/afternoon/evening), "
+        "(YYYY-MM-DD, with when=specific_date), `month` (YYYY-MM, with when=specific_month), "
+        "`time_of_day` (morning/afternoon/evening), "
         "`clinician_name`, `location`, `case_type` (only if the caller wants another service)."
     ),
     dependencies=[Depends(vapi_secret_scheme)],
@@ -74,6 +75,9 @@ async def find_slots_tool(request: Request):
         raw_date = str(arguments.get("specific_date") or arguments.get("date") or "").strip()
         if raw_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date):
             raise ValueError("BAD_DATE: send specific_date as YYYY-MM-DD.")
+        raw_month = str(arguments.get("month") or "").strip()
+        if raw_month and not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])(-\d{2})?", raw_month):
+            raise ValueError("BAD_MONTH: send month as YYYY-MM, for example 2026-12.")
         message = await run_in_threadpool(
             find_slots,
             trace,
@@ -81,6 +85,7 @@ async def find_slots_tool(request: Request):
             call_id=parsed.call_id,
             when=when,
             specific_date=date.fromisoformat(raw_date) if raw_date else None,
+            month=date.fromisoformat(f"{raw_month[:7]}-01") if raw_month else None,
             time_of_day=str(arguments.get("time_of_day") or "").strip().lower() or None,
             clinician_name=str(arguments.get("clinician_name") or "").strip() or None,
             location_name=str(arguments.get("location") or "").strip() or None,

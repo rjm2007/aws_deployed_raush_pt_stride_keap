@@ -2287,3 +2287,30 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   same new name retyped later was accepted silently and never opened a review). "Use new name" is unchanged. Production `main` does not have this; not ported.
 - Tests: `test_sheet_direct.py`, `test_google_sheet.py`, `test_lead_review_integration.py` (one legacy
   keep-old-name test now expects the Sheet back on the name on file and `sheet_name_accepted` cleared).
+
+### 2026-10-23 — Booking engine: 90 days of openings, a later date or month (owner-approved)
+- The slot cache holds `BOOKING_CACHE_DAYS=90` days (was 31). Stride answers at most 31 days per availability
+  request, so `availability_sync.cache_chunks` cuts it into chunks of 31 days (90 days = 3 requests: days 1-31,
+  32-62, 63-90). Chunk 0 refreshes every `BOOKING_SYNC_SECONDS` (300) as before; later chunks every
+  `BOOKING_FAR_SYNC_SECONDS` (1800), after a failure on the next cycle, and on a new day (their windows move).
+  Requests per location + visit length: before 1 per 5-min cycle; now 1, plus 2 every 30 min (average 1.33).
+- Migration `051_availability_sync_chunks.sql` (demo only): `availability_sync_state.chunk`, primary key
+  (location, minutes, chunk); old rows become chunk 0. Old code fails on the new key, so migrate and deploy together.
+- Default searches (`earliest`, `today` ... `in_two_weeks`, time of day, therapist) and their fallbacks stay inside
+  the first `BOOKING_HORIZON_DAYS` (31) exactly as before. A named later date (`specific_date`), `next_month` or
+  `specific_month` with `month` (YYYY-MM) searches up to day 90; past day 90 it is the "too far ahead to book
+  yet; we can only book up to <day 90>" reply with the nearest openings. With `BOOKING_TODAY_OVERRIDE` a real
+  month moves onto the pinned calendar like a day (`pinned_calendar_month`; "December" in October -> August);
+  the Stride demo has slots only until 2026-07-29, so later pinned months are empty there.
+- A search refreshes inline only the stale chunks it reads (chunk 0, plus the chunk(s) of a later date or month);
+  a later chunk is stale after `BOOKING_CACHE_MAX_AGE_SECONDS + BOOKING_FAR_SYNC_SECONDS`. `book-appointment`
+  accepts any cached day up to day 90; the live Stride re-check of the one slot stays.
+- Every OPENINGS / NOTHING_IN_RANGE reply now ends with `Last bookable day: <day 90>; searches without a named
+  date or month look up to <day 31>.` (chat simulations: the agent could not say how far out it books).
+- Booking prompt (repo only, not on Vapi yet): a month is a search like any other; a later/earlier time or another
+  time of day is always a new search; count rejected sets exactly, link / front desk only after the fourth;
+  after TAKEN / NOT_AVAILABLE book the new pick straight away with the name and birthday already collected;
+  "booking system isn't responding" only after a tool call really failed; "how far ahead" from the reply.
+- Tests: `test_slot_booking_integration.py` (chunks, near/far timing, gone in a far chunk, day 45 / 80, months,
+  beyond 90, defaults unchanged, far booking re-check, holiday in month 2, with and without the pin, HTTP
+  `month`), `test_pinned_calendar.py` (month windows, pinned months, tool schema).
