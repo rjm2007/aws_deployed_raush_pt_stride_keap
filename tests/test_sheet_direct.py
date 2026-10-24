@@ -23,8 +23,6 @@ from rpt_agent.services.sheet_direct import (
     profile_hash,
 )
 
-OLD = sheet_direct.OLD_COMMAND.replace("{label}", "{}")
-
 
 class _Stored(dict):
     reviews: dict[str, str]
@@ -32,19 +30,10 @@ class _Stored(dict):
 
 @pytest.fixture
 def old(monkeypatch):
-    """Stored requests by id -> action, in place of lead_action_requests (no database here)."""
+    """Finished requests by id -> action, in place of lead_action_requests (no database here)."""
     stored = _Stored()
-    handled: set[str] = set()  # recorded without running (refused / dropped)
-
-    def record(lead_id, action, code):
-        request_id = str(uuid4())
-        stored[request_id] = action
-        handled.add(request_id)
-        return request_id
-
-    monkeypatch.setattr(sheet_direct, "_record_handled", record)
-    monkeypatch.setattr(sheet_direct, "_ran_actions", lambda rows: {
-        r.number: (stored[r.get("action_request_id")], r.get("action_request_id") not in handled)
+    monkeypatch.setattr(sheet_direct, "_handled_actions", lambda rows: {
+        r.number: stored[r.get("action_request_id")]
         for r in rows if r.get("action_request_id") in stored})
     # No open review in the database unless a test says so (`reviews[lead id] = text`).
     stored_reviews: dict[str, str] = {}
@@ -102,38 +91,27 @@ def test_started_at_reads_our_iso_text_and_n8n_pacific_date_serials():
     ("Start cadence", "", {}, True),
     ("Start  cadence ", "", {}, True),                      # extra spaces forgiven
     ("booked", "", {"lead_id": "x"}, None),                  # exact text, as n8n: not a command
-    ("Start cadence", "", {"lead_id": "x"}, False),          # already linked
-    ("Start cadence", "Error: x", {"action_request_id": "r"}, False),
-    ("Start cadence", "", {"action_request_id": "r"}, True),  # staff cleared status to re-run
-    ("Start cadence", "Cadence started", {}, False),
-    ("Restart cadence", "", {"lead_id": "x"}, True),
-    ("Restart cadence", "Cadence restarted", {"lead_id": "x"}, False),
-    # Not this row's last command (spent_rows): a Restart on a finished cadence runs.
+    # Owner 2026-10-25: Action empties once a command is handled, so a command in it is new, whatever
+    # Outcome Status says (the same command picked again runs again).
+    ("Start cadence", "Error: x", {}, True),
+    ("Start cadence", "", {"lead_id": "x"}, True),           # turned down with a reason, not ignored
+    ("Restart cadence", "Cadence restarted", {"lead_id": "x"}, True),
     ("Restart cadence", "Cadence completed", {"lead_id": "x"}, True),
-    ("Restart cadence", "Cadence started", {"lead_id": "x"}, True),
+    ("Restart cadence", "Error: restarted less than 10 minutes ago", {"lead_id": "x"}, True),
+    ("Booked", "Booked", {"lead_id": "x"}, True),
+    ("Do Not Contact", "Unblocked in dashboard", {"lead_id": "x"}, True),
+    ("Restart cadence", "Booked", {"lead_id": "x"}, True),
+    # Running now: recovery's.
     ("Restart cadence", "Processing: Restart cadence", {"lead_id": "x"}, False),
     ("Restart cadence", "Retrying 1/3: Restart cadence", {"lead_id": "x"}, False),
-    ("Restart cadence", "Phone number changed; needs review", {"lead_id": "x"}, False),
-    ("Booked", "Booked", {"lead_id": "x"}, False),
-    ("Booked", "Cadence started", {"lead_id": "x"}, True),
-    ("Do Not Contact", "Do not contact applied", {"lead_id": "x"}, False),
-    ("Do Not Contact", "Unblocked in dashboard", {"lead_id": "x"}, False),
-    ("Restart cadence", "Unblocked in dashboard", {"lead_id": "x"}, True),
-    # Review texts (2026-10-22): an open review holds Start / Restart back, but Booked and Do Not
-    # Contact still run (QA: a Booked typed on a flagged row was ignored). After a resolution a
-    # command staff pick runs.
+    # Review texts (2026-10-22): an open review holds a Restart back (it waits), but Booked and Do
+    # Not Contact still run.
     ("Restart cadence", "Needs review: name changed", {"lead_id": "x"}, False),
+    ("Restart cadence", "Needs review: wrong number" + REVIEW_FIRST, {"lead_id": "x"}, False),
     ("Booked", "Needs review: text failed (landline)", {"lead_id": "x"}, True),
     ("Do Not Contact", "Needs review: wrong number", {"lead_id": "x"}, True),
     ("Booked", "Number blocked; needs review", {"lead_id": "x"}, True),
     ("Booked", "Needs review: wrong number" + REVIEW_FIRST, {"lead_id": "x"}, True),
-    ("Restart cadence", "Needs review: wrong number" + REVIEW_FIRST, {"lead_id": "x"}, False),
-    # The old n8n review texts may still sit next to the stale Booked n8n re-sent: still blocked.
-    ("Booked", "Phone number changed; needs review", {"lead_id": "x"}, False),
-    ("Booked", "Error: Lead ID is required", {"lead_id": "x"}, False),
-    ("Start cadence", "Resolved: calls only", {"lead_id": "x"}, False),
-    ("Start cadence", "Phone changed: add a new row", {"lead_id": "x"}, False),
-    ("Booked", "Resolved: calls only", {"lead_id": "x"}, True),
     ("Call later", "", {}, None),
 ])
 def test_which_rows_need_processing(action, status, extra, expected):
@@ -177,7 +155,18 @@ def test_an_impossible_date_gets_a_readable_error_not_request_rejected():
     (200, {"result": "something_new"}, ("Completed", None, False)),
     (503, {"detail": "down"}, ("", None, True)),
     (409, {"detail": "Request is still processing"}, ("", None, True)),
-    (409, {"code": "restart_too_soon", "detail": "Wait 10 minutes"}, ("Error: Wait 10 minutes", None, False)),
+    # Refusals staff fix by picking the command again later say so (owner, 2026-10-25).
+    (409, {"code": "restart_too_soon", "detail": "Wait", "retry_at": "2026-10-25T22:52:30+00:00"},
+     ("Error: restarted less than 10 minutes ago. Pick Restart cadence again after 3:52 PM PT.",
+      None, False)),
+    (409, {"code": "restart_too_soon", "detail": "Wait"},  # stored before retry_at was sent
+     ("Error: restarted less than 10 minutes ago. Pick Restart cadence again in 10 minutes.",
+      None, False)),
+    (409, {"code": "outreach_unresolved", "detail": "Wait for the current call or SMS result"},
+     ("Error: a call or text is going out right now. Pick Restart cadence again in a minute.",
+      None, False)),
+    (409, {"code": "lead_phone_mismatch", "detail": "Lead ID and phone number do not match"},
+     ("Error: Lead ID and phone number do not match", None, False)),
     (422, {"detail": [{"msg": "x"}]}, ("Error: request rejected", None, False)),
 ])
 def test_backend_results_become_the_n8n_labels(status, body, expected):
@@ -201,8 +190,8 @@ def _grid_with(**cells):
 
 
 def test_a_snapshot_lands_on_the_row_with_its_lead_id_and_never_writes_the_action_cell():
-    _, _, grid = _grid_with(name="Asha Rao", lead_id="L1", action="Restart cadence",
-                                     outcome_status="Cadence restarted", lead_status="In cadence")
+    _, _, grid = _grid_with(name="Asha Rao", lead_id="L1", action="",
+                            outcome_status="Cadence restarted", lead_status="In cadence")
     snapshot = {"lead_id": "L1", "sheet": {
         "cadence_day": "Day 0", "call_outcome": "Booked", "message_outcome": None,
         "email_outcome": None, "transcript_link": "https://dash/leads/L1/conversations/calls",
@@ -210,8 +199,8 @@ def test_a_snapshot_lands_on_the_row_with_its_lead_id_and_never_writes_the_actio
     assert apply_snapshot(grid, snapshot)
     row = grid.rows[0]
     assert row.get("outcome_status") == "Booked" and row.get("lead_status") == "Booked"
-    # Owner 2026-10-23: only staff write Action (case 1: the lead booked, any way).
-    assert row.get("action") == "Restart cadence" and row.get("cadence_day") == "Day 0"
+    # Only staff fill Action (owner 2026-10-23/25): the lead booked, any way, writes no "Booked" there.
+    assert row.get("action") == "" and row.get("cadence_day") == "Day 0"
 
 
 def test_a_snapshot_for_a_lead_not_in_the_sheet_is_reported():
@@ -304,11 +293,232 @@ def test_an_unknown_sheet_gender_is_an_error_for_the_row():
         SheetLeadInput(phone="5555550101", gender="X")
 
 
-def test_a_restart_on_a_finished_cadence_runs_only_when_it_is_not_the_rows_last_command():
-    row = _row(name="Asha Rao", action="Restart cadence", outcome_status="Cadence completed", lead_id="x")
-    command = command_of(row)
-    assert needs_processing(row, command) is True
-    assert needs_processing(row, command, {row.number}) is False  # this Restart started that cadence
+# --- Action empties once a command is handled (owner, 2026-10-25) ------------------------------
+
+
+COMMANDS = {label: action for label, (_, action) in sheet_direct.COMMANDS.items()}
+
+
+def _poll(sheet, monkeypatch, outcome=None, trace=None):
+    """One claim + run + write, as the worker does, with the backend's answer faked as `outcome`."""
+    from rpt_agent.services.google_sheet import flush
+
+    ran = []
+
+    def execute(request, request_id, trace):
+        ran.append(request.action)
+        return outcome
+
+    monkeypatch.setattr(sheet_direct, "_execute", execute)
+    trace = trace or WorkflowTrace("t", "test")
+    grid = parse_grid(sheet.read_values(), 2)
+    claims = sheet_direct.claim_commands(grid, trace)
+    claimed = flush(sheet, grid)
+    sheet_direct.run_claims(grid, claims, claimed.deferred_rows, sheet_direct.PollResult(), trace)
+    flush(sheet, grid)
+    return ran
+
+
+LEAD_ID = "00000000-0000-4000-8000-000000000001"
+ROW = {"name": "Asha Rao", "phone": "5555550101", "email": "asha@example.test",
+       "date_of_birth": "16/01/1990", "location": "Dana Point", "case": "Ortho"}
+
+
+@pytest.mark.parametrize(("action", "lead_id", "outcome", "status", "lead_status"), [
+    ("Start cadence", "", sheet_direct.Outcome("Cadence started", "In cadence", LEAD_ID),
+     "Cadence started", "In cadence"),
+    ("Restart cadence", LEAD_ID, sheet_direct.Outcome("Cadence restarted", "In cadence", LEAD_ID),
+     "Cadence restarted", "In cadence"),
+    ("Booked", LEAD_ID, sheet_direct.Outcome("Booked", "Booked", LEAD_ID), "Booked", "Booked"),
+    ("Do Not Contact", LEAD_ID, sheet_direct.Outcome("Do Not Contact applied", "Do not outreach",
+                                                     LEAD_ID), "Do Not Contact applied",
+     "Do not outreach"),
+])
+def test_action_empties_after_the_command_runs(old, monkeypatch, action, lead_id, outcome, status,
+                                               lead_status):
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, action=action, lead_id=lead_id, outcome_status="Cadence started")
+    assert _poll(sheet, monkeypatch, outcome) == [COMMANDS[action]]
+    assert sheet.cell(number, "action") == ""
+    assert sheet.cell(number, "action_request_id") == ""
+    assert (sheet.cell(number, "outcome_status"), sheet.cell(number, "lead_status")) == (
+        status, lead_status)
+    assert sheet.cell(number, "lead_id") == LEAD_ID
+    assert _poll(sheet, monkeypatch, outcome) == []  # nothing left to run
+
+
+@pytest.mark.parametrize(("body", "shown"), [
+    ({"code": "outreach_unresolved", "detail": "Wait for the current call or SMS result"},
+     "Error: a call or text is going out right now. Pick Restart cadence again in a minute."),
+    ({"code": "restart_too_soon", "detail": "x", "retry_at": "2026-10-25T22:52:00+00:00"},
+     "Error: restarted less than 10 minutes ago. Pick Restart cadence again after 3:52 PM PT."),
+    ({"code": "lead_phone_mismatch", "detail": "Lead ID and phone number do not match"},
+     "Error: Lead ID and phone number do not match"),
+])
+def test_action_empties_after_a_refusal_and_the_row_says_what_to_do(old, monkeypatch, body, shown):
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, action="Restart cadence", lead_id=LEAD_ID,
+                       outcome_status="Cadence restarted", lead_status="In cadence")
+    refusal = label_result(ActionExecution(409, {"lead_id": LEAD_ID, **body}))
+    assert _poll(sheet, monkeypatch, refusal) == ["restart_cadence"]
+    assert sheet.cell(number, "outcome_status") == shown
+    assert sheet.cell(number, "action") == "" and sheet.cell(number, "action_request_id") == ""
+    assert sheet.cell(number, "lead_status") == "In cadence"
+    # Staff pick it again: it runs again (here: accepted).
+    sheet.set(number, "action", "Restart cadence")
+    done = sheet_direct.Outcome("Cadence restarted", "In cadence", LEAD_ID)
+    assert _poll(sheet, monkeypatch, done) == ["restart_cadence"]
+    assert sheet.cell(number, "outcome_status") == "Cadence restarted"
+
+
+def test_a_patient_can_be_restarted_any_number_of_times_by_picking_restart_again(old, monkeypatch):
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, lead_id=LEAD_ID, outcome_status="Cadence completed")
+    done = sheet_direct.Outcome("Cadence restarted", "In cadence", LEAD_ID)
+    for _ in range(3):
+        sheet.set(number, "action", "Restart cadence")
+        assert _poll(sheet, monkeypatch, done) == ["restart_cadence"]
+        assert sheet.cell(number, "action") == ""
+        assert sheet.cell(number, "outcome_status") == "Cadence restarted"
+
+
+def test_a_command_still_retrying_keeps_its_action_and_request_id(old, monkeypatch):
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, action="Booked", lead_id=LEAD_ID, outcome_status="Cadence started")
+    _poll(sheet, monkeypatch, sheet_direct.Outcome("", temporary=True))
+    assert sheet.cell(number, "outcome_status") == "Retrying 1/3: Booked"
+    assert sheet.cell(number, "action") == "Booked" and sheet.cell(number, "action_request_id")
+
+
+def test_an_invalid_row_empties_action_and_runs_when_picked_again(old, monkeypatch):
+    sheet = FakeSheet()
+    number = sheet.add(**{**ROW, "date_of_birth": ""}, action="Start cadence")
+    assert _poll(sheet, monkeypatch) == []
+    assert sheet.cell(number, "outcome_status") == "Error: Date Of Birth is required"
+    assert sheet.cell(number, "action") == ""
+    sheet.set(number, "date_of_birth", "16/01/1990")
+    sheet.set(number, "action", "Start cadence")
+    started = sheet_direct.Outcome("Cadence started", "In cadence", LEAD_ID)
+    assert _poll(sheet, monkeypatch, started) == ["start_cadence"]
+
+
+def test_start_cadence_on_a_linked_row_is_turned_down_with_a_reason(old, monkeypatch):
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, action="Start cadence", lead_id=LEAD_ID, outcome_status="Booked",
+                       lead_status="Booked")
+    assert _poll(sheet, monkeypatch) == []
+    assert sheet.cell(number, "outcome_status") == (
+        "Error: this row already has a lead. Pick Restart cadence to start the calls again.")
+    assert sheet.cell(number, "action") == "" and sheet.cell(number, "lead_status") == "Booked"
+
+
+def test_a_command_staff_pick_while_the_result_is_written_is_kept_and_runs(old, monkeypatch):
+    from rpt_agent.services.google_sheet import flush
+
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, action="Restart cadence", lead_id=LEAD_ID,
+                       outcome_status="Cadence completed")
+    monkeypatch.setattr(sheet_direct, "_execute", lambda request, request_id, trace:
+                        sheet_direct.Outcome("Cadence restarted", "In cadence", LEAD_ID))
+    trace = WorkflowTrace("t", "test")
+    grid = parse_grid(sheet.read_values(), 2)
+    claims = sheet_direct.claim_commands(grid, trace)
+    claimed = flush(sheet, grid)
+    sheet_direct.run_claims(grid, claims, claimed.deferred_rows, sheet_direct.PollResult(), trace)
+    # Between our read and our write, staff pick Booked.
+    sheet.before_write = lambda: sheet.set(number, "action", "Booked")
+    result = flush(sheet, grid)
+    assert sheet.cell(number, "action") == "Booked"  # theirs, not wiped
+    assert sheet.cell(number, "outcome_status") == "Cadence restarted"
+    assert sheet.cell(number, "action_request_id") == ""
+    assert result.skipped_cells == {(number, "action")}
+    # The next poll takes it as a new command, not an old one.
+    booked = sheet_direct.Outcome("Booked", "Booked", LEAD_ID)
+    assert _poll(sheet, monkeypatch, booked) == ["booked"]
+    assert sheet.cell(number, "action") == ""
+
+
+# --- rows from before 2026-10-25: a handled command still in Action is emptied, never run ---------
+
+
+@pytest.mark.parametrize(("action", "status", "last", "is_old"), [
+    # The backend wrote these before 2026-10-23; the row's request is the Start.
+    ("Booked", "Booked", "start_cadence", True),
+    ("Restart cadence", "Cadence restarted", "start_cadence", True),
+    ("Start cadence", "Cadence resumed in dashboard", "do_not_contact", True),
+    # Staff's own command, the row's last one (it ran, or the 2026-10-23 rules turned it down).
+    ("Do Not Contact", "Unblocked in dashboard", "do_not_contact", True),
+    ("Restart cadence", "Cadence completed", "restart_cadence", True),
+    ("Restart cadence", "Needs review: wrong number", "restart_cadence", True),
+    ("Booked", "Needs review: appointment cancelled in Stride", "booked", True),
+    ("Restart cadence", "Booked; Restart cadence in Action not run (clear this cell to run it)",
+     "restart_cadence", True),
+    ("Booked", "Error: Lead ID is required", "start_cadence", True),
+    ("Start cadence", "Cadence started", "start_cadence", True),
+    # Picked under the old rules and not run yet: runs as it would have.
+    ("Restart cadence", "Cadence completed", "start_cadence", False),
+    ("Restart cadence", "", "restart_cadence", False),  # Outcome Status cleared to run it again
+    ("Booked", "Needs review: wrong number", "start_cadence", False),
+    ("Restart cadence", "Needs review: wrong number" + REVIEW_FIRST, "start_cadence", False),
+    ("Restart cadence", "Processing: Restart cadence", "restart_cadence", False),  # running
+])
+def test_old_commands_are_the_ones_already_handled(old, action, status, last, is_old):
+    row = _row(name="Asha Rao", phone="5555550101", lead_id=LEAD_ID, action=action,
+               outcome_status=status, action_request_id=str(uuid4()))
+    old[row.get("action_request_id")] = last
+    assert (row.number in sheet_direct.old_commands([row])) is is_old
+
+
+def test_a_command_without_a_request_id_is_never_old(old):
+    # Since 2026-10-25 a handled row has no Action Request ID: a command there was picked again.
+    row = _row(name="Asha Rao", lead_id=LEAD_ID, action="Booked", outcome_status="Booked")
+    assert sheet_direct.old_commands([row]) == set()
+
+
+@pytest.mark.parametrize(("action", "status", "last", "shown"), [
+    ("Booked", "Booked", "start_cadence", "Booked"),
+    ("Restart cadence", "Cadence restarted", "restart_cadence", "Cadence restarted"),
+    ("Do Not Contact", ("Unblocked in dashboard; Do Not Contact in Action already ran (clear this "
+                        "cell to run it again)"), "do_not_contact", "Unblocked in dashboard"),
+    ("Restart cadence", "Booked; Restart cadence in Action not run (clear this cell to run it)",
+     "restart_cadence", "Booked"),
+    ("Start cadence", "Cadence started", "start_cadence", "Cadence started"),
+])
+def test_on_the_first_poll_an_old_command_is_emptied_not_run(old, monkeypatch, action, status, last,
+                                                             shown):
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, action=action, lead_id=LEAD_ID, outcome_status=status,
+                       lead_status="In cadence", action_request_id=(rid := str(uuid4())))
+    old[rid] = last
+    scanned = parse_grid(sheet.read_values(), 2).rows
+    assert sheet_direct.needs_attention(scanned[0], sheet_direct.old_commands(scanned))  # loaded
+    assert _poll(sheet, monkeypatch) == []
+    assert sheet.cell(number, "action") == "" and sheet.cell(number, "action_request_id") == ""
+    # The result stays; the old "clear this cell" words go (they no longer apply).
+    assert sheet.cell(number, "outcome_status") == shown
+    assert sheet.cell(number, "lead_status") == "In cadence"
+    # Picked again later: a new command, it runs.
+    sheet.set(number, "action", action)
+    if action != "Start cadence":
+        assert _poll(sheet, monkeypatch, sheet_direct.Outcome("Done", None, LEAD_ID)) == [
+            COMMANDS[action]]
+
+
+def test_an_old_command_staff_replace_before_it_is_emptied_runs(old, monkeypatch):
+    from rpt_agent.services.google_sheet import flush
+
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, action="Booked", lead_id=LEAD_ID, outcome_status="Booked",
+                       action_request_id=(rid := str(uuid4())))
+    old[rid] = "booked"
+    grid = parse_grid(sheet.read_values(), 2)
+    assert sheet_direct.claim_commands(grid, WorkflowTrace("t", "test")) == []
+    sheet.before_write = lambda: sheet.set(number, "action", "Restart cadence")
+    flush(sheet, grid)
+    assert sheet.cell(number, "action") == "Restart cadence"
+    assert sheet.cell(number, "action_request_id") == ""
+    done = sheet_direct.Outcome("Cadence restarted", "In cadence", LEAD_ID)
+    assert _poll(sheet, monkeypatch, done) == ["restart_cadence"]
 
 
 # --- a command typed on a row in review (QA 2026-10-22, row "QA Actionkeep") ------------------
@@ -337,72 +547,50 @@ def test_a_stride_cancel_snapshot_does_not_clear_a_booked_staff_typed():
     assert grid.rows[0].get("action") == "Booked"
 
 
-def test_a_stride_cancel_keeps_an_old_booked_in_action_and_it_does_not_run_again(old):
-    # Case 4: the Booked that ran stays in Action; the row says it is old (it used to be cleared).
+def test_a_snapshot_empties_an_old_booked_left_before_2026_10_25(old):
+    # A Stride cancel next to the Booked that ran before Action emptied itself: it is not run again.
     _, _, grid = _grid_with(name="Asha Rao", lead_id=LEAD, action="Booked", outcome_status="Booked",
-                            action_request_id=str(uuid4()))
+                            action_request_id=(rid := str(uuid4())))
+    old[rid] = "booked"
     row = grid.rows[0]
-    old[row.get("action_request_id")] = "booked"
     apply_snapshot(grid, {"lead_id": LEAD, "sheet": {
         "action_status": "Needs review: appointment cancelled in Stride", "action": ""}})
-    assert row.get("action") == "Booked"
-    assert row.get("outcome_status") == ("Needs review: appointment cancelled in Stride"
-                                         "; Booked in Action already ran (clear this cell to run it again)")
-    assert needs_processing(row, command_of(row), sheet_direct.spent_rows([row])) is False
+    assert row.get("action") == "" and row.get("action_request_id") == ""
+    assert row.get("outcome_status") == "Needs review: appointment cancelled in Stride"
 
 
-def test_a_restart_typed_on_a_flagged_row_waits_and_the_row_says_so():
-    _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id="L1",
-                            action="Restart cadence", outcome_status="Needs review: wrong number")
-    claims = sheet_direct.claim_commands(grid, WorkflowTrace("t", "test"))
-    assert claims == []
-    row = grid.rows[0]
-    assert row.get("outcome_status") == (
+def test_a_restart_typed_on_a_flagged_row_waits_then_runs_and_empties(old, monkeypatch):
+    from rpt_agent.services.google_sheet import flush
+
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, lead_id=LEAD, action="Restart cadence",
+                       outcome_status="Needs review: wrong number")
+    assert _poll(sheet, monkeypatch) == []
+    assert sheet.cell(number, "outcome_status") == (
         "Needs review: wrong number; resolve it on the dashboard first, then the restart runs")
-    assert row.get("action") == "Restart cadence"
-    # Written once: the next poll finds nothing to do.
-    assert not sheet_direct.needs_attention(row, sheet_direct.spent_rows([row]))
-    # Resolved on the dashboard: the Restart stays and now runs.
-    apply_snapshot(grid, {"lead_id": "L1", "sheet": RESOLVED})
-    assert row.get("outcome_status") == "Resolved: number confirmed"
-    assert row.get("action") == "Restart cadence"
-    assert needs_processing(row, command_of(row)) is True
+    assert sheet.cell(number, "action") == "Restart cadence"  # kept while it waits
+    row = parse_grid(sheet.read_values(), 2).rows[0]
+    assert not sheet_direct.needs_attention(row, sheet_direct.old_commands([row]))  # said once
+    # Resolved on the dashboard: the Restart stays, then runs, then empties.
+    grid = parse_grid(sheet.read_values(), 2)
+    apply_snapshot(grid, {"lead_id": LEAD, "sheet": RESOLVED})
+    flush(sheet, grid)
+    assert sheet.cell(number, "outcome_status") == "Resolved: number confirmed"
+    assert sheet.cell(number, "action") == "Restart cadence"
+    done = sheet_direct.Outcome("Cadence restarted", "In cadence", LEAD)
+    assert _poll(sheet, monkeypatch, done) == ["restart_cadence"]
+    assert sheet.cell(number, "action") == "" and sheet.cell(number, "outcome_status") == (
+        "Cadence restarted")
 
 
-def test_a_restart_that_already_ran_does_not_wait_behind_a_new_review(old):
-    # Case 7: a review flagged next to the Restart that ran. Action is not touched any more (it was
-    # turned into "Start cadence"), and the old Restart neither waits nor runs after the resolution.
-    _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id=LEAD,
-                            action="Restart cadence", outcome_status="Cadence restarted",
-                            action_request_id=str(uuid4()))
-    row = grid.rows[0]
-    old[row.get("action_request_id")] = "restart_cadence"
-    apply_snapshot(grid, {"lead_id": LEAD, "sheet": {"review_status": "Needs review: wrong number"}})
-    assert row.get("action") == "Restart cadence"
-    # No "clear this cell" note on a review text: a Restart there would only wait (tester 2026-10-23).
-    assert row.get("outcome_status") == "Needs review: wrong number"
-    assert sheet_direct.claim_commands(grid, WorkflowTrace("t", "test")) == []
-    assert not row.get("outcome_status").endswith(REVIEW_FIRST)
-    apply_snapshot(grid, {"lead_id": LEAD, "sheet": RESOLVED})  # case 5: no "Start cadence"
-    assert row.get("action") == "Restart cadence"
-    assert row.get("outcome_status") == "Resolved: number confirmed" + OLD.format("Restart cadence")
-    assert sheet_direct.claim_commands(grid, WorkflowTrace("t", "test")) == []
-    # Staff run it again: clear Outcome Status.
-    row.cells["outcome_status"] = ""
-    [(claimed, _, _)] = sheet_direct.claim_commands(grid, WorkflowTrace("t", "test"))
-    assert claimed is row and row.get("outcome_status") == "Processing: Restart cadence"
-
-
-def test_a_restart_that_ended_in_a_review_keeps_its_action_and_is_not_parked(old):
-    # "Number blocked; needs review" from the Restart itself: it ran (its request id is the row's).
+def test_a_restart_that_ended_in_a_review_empties_its_action(old):
+    # "Number blocked; needs review" from the Restart itself: it ran, so it is not a parked one.
     _, _, grid = _grid_with(name="Asha Rao", lead_id=LEAD, action="Restart cadence",
                             outcome_status="Processing: Restart cadence",
                             action_request_id=str(uuid4()))
-    old[grid.rows[0].get("action_request_id")] = "restart_cadence"
     sheet_direct._write_outcome(grid, grid.rows[0], sheet_direct.Outcome(
         "Number blocked; needs review", "Needs Review", LEAD))
-    assert grid.rows[0].get("action") == "Restart cadence"
-    assert not sheet_direct.parked(grid.rows[0], sheet_direct.spent_rows(grid.rows))
+    assert grid.rows[0].get("action") == "" and not sheet_direct.parked(grid.rows[0])
 
 
 HINTED = "Needs review: wrong number" + REVIEW_FIRST
@@ -419,19 +607,12 @@ HINTED = "Needs review: wrong number" + REVIEW_FIRST
     ({"action_status": "Do Not Contact applied", "lead_status": "Do not outreach"},
      "Do Not Contact applied"),
 ])
-def test_a_waiting_restart_is_dropped_when_the_lead_ends(old, sheet, status):
-    # Case 8: the Restart stays in Action (it was replaced), recorded as handled under a new
-    # Action Request ID, so a later text ("Closed: a newer row ...") cannot set it off.
+def test_a_waiting_restart_is_dropped_and_emptied_when_the_lead_ends(old, sheet, status):
     _, _, grid = _grid_with(name="Asha Rao", lead_id=LEAD, action="Restart cadence",
-                            outcome_status=HINTED, action_request_id=str(uuid4()))
+                            outcome_status=HINTED)
     row = grid.rows[0]
-    before = row.get("action_request_id")
     apply_snapshot(grid, {"lead_id": LEAD, "sheet": sheet})
-    assert (row.get("outcome_status"), row.get("action")) == (status, "Restart cadence")
-    assert row.get("action_request_id") != before
-    assert old[row.get("action_request_id")] == "restart_cadence"
-    row.cells["outcome_status"] = "Closed: a newer row has this phone number"
-    assert needs_processing(row, command_of(row), sheet_direct.spent_rows([row])) is False
+    assert (row.get("outcome_status"), row.get("action")) == (status, "")
 
 
 def test_the_waiting_text_goes_when_staff_clear_the_restart():
@@ -443,111 +624,18 @@ def test_the_waiting_text_goes_when_staff_clear_the_restart():
     assert not sheet_direct.needs_attention(row, set())
 
 
-def test_a_restart_the_backend_wrote_before_2026_10_23_is_recorded_not_parked(old):
-    # The dashboard's restart used to write "Restart cadence" + "Cadence restarted" without a Sheet
-    # request. "Cadence restarted" turns that Restart down; it is recorded on the first poll, so the
-    # next review text neither parks it nor lets it run after the resolution.
-    _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id=LEAD,
-                            action="Restart cadence", outcome_status="Cadence restarted")
-    row = grid.rows[0]
-    assert sheet_direct.needs_attention(row, sheet_direct.spent_rows([row]))  # a narrow poll loads it
-    assert sheet_direct.claim_commands(grid, WorkflowTrace("t", "test")) == []
-    assert old[row.get("action_request_id")] == "restart_cadence"
-    assert row.get("outcome_status") == (
-        "Cadence restarted; Restart cadence in Action not run (clear this cell to run it)")
-    assert not sheet_direct.needs_attention(row, sheet_direct.spent_rows([row]))
-    apply_snapshot(grid, {"lead_id": LEAD, "sheet": {"review_status": "Needs review: text failed"}})
-    # It never ran (only recorded as turned down): no "already ran" words.
-    assert row.get("outcome_status") == "Needs review: text failed"
-    assert row.get("action") == "Restart cadence"
-    apply_snapshot(grid, {"lead_id": LEAD, "sheet": RESOLVED})
-    assert needs_processing(row, command_of(row), sheet_direct.spent_rows([row])) is False
-
-
-@pytest.mark.parametrize(("action", "status", "shown"), [
-    ("Restart cadence", "Booked",                 # final
-     "Booked; Restart cadence in Action not run (clear this cell to run it)"),
-    ("Do Not Contact", "Unblocked in dashboard",
-     "Unblocked in dashboard; Do Not Contact in Action not run (clear this cell to run it)"),
-    ("Booked", "Phone number changed; needs review",  # an old n8n review text
-     "Phone number changed; needs review; Booked in Action not run (clear this cell to run it)"),
-])
-def test_a_command_the_outcome_status_turns_down_is_recorded_once_and_said(old, action, status, shown):
-    _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id=LEAD, action=action,
-                            outcome_status=status)
-    row = grid.rows[0]
-    sheet_direct.claim_commands(grid, WorkflowTrace("t", "test"))
-    first = row.get("action_request_id")
-    assert old[first] == command_of(row)[1] and row.get("outcome_status") == shown
-    # The added words change nothing in the rules: still turned down, Lead Status unchanged.
-    assert needs_processing(row, command_of(row)) is False
-    sheet_direct.claim_commands(grid, WorkflowTrace("t", "test"))
-    assert row.get("action_request_id") == first and row.get("outcome_status") == shown  # not again
-    row.cells["outcome_status"] = "Cadence completed"  # a later system text does not set it off
-    assert needs_processing(row, command_of(row), sheet_direct.spent_rows([row])) is False
-
-
-def test_a_start_cadence_or_a_row_without_lead_id_is_never_recorded(old):
-    _, _, grid = _grid_with(name="Asha Rao", lead_id=LEAD, action="Start cadence",
-                            outcome_status="Booked")
-    sheet_direct.claim_commands(grid, WorkflowTrace("t", "test"))
-    _, _, other = _grid_with(name="Asha Rao", action="Booked", outcome_status="Booked")
-    sheet_direct.claim_commands(other, WorkflowTrace("t", "test"))
-    assert old == {}
-
-
-@pytest.mark.parametrize("reason", ["cadence_restarted_after_unblock", "cadence_resumed_after_unblock",
-                                    "number_unblocked"])
-def test_an_unblock_next_to_the_old_do_not_contact_never_blocks_again(old, reason):
-    # Cases 2 and 3: Action keeps the Do Not Contact staff typed; it is the row's last command.
-    from rpt_agent.services.sheet_sync import DASHBOARD_OUTCOMES
-
-    text = DASHBOARD_OUTCOMES[reason][0]
-    _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id=LEAD,
-                            action="Do Not Contact", outcome_status="Do Not Contact applied",
-                            action_request_id=str(uuid4()))
-    row = grid.rows[0]
-    old[row.get("action_request_id")] = "do_not_contact"
-    apply_snapshot(grid, {"lead_id": LEAD, "sheet": {
-        "action_status": text, "action": DASHBOARD_OUTCOMES[reason][2], "lead_status": "In cadence"}})
-    assert row.get("action") == "Do Not Contact"
-    assert row.get("outcome_status") == text + OLD.format("Do Not Contact")
-    assert sheet_direct.claim_commands(grid, WorkflowTrace("t", "test")) == []
-    # Staff block it again: clear Outcome Status.
-    row.cells["outcome_status"] = ""
-    [(claimed, _, _)] = sheet_direct.claim_commands(grid, WorkflowTrace("t", "test"))
-    assert claimed is row
-
-
-def test_a_review_resolved_with_restart_does_not_write_restart_into_action(old):
-    # Case 6: "Cadence restarted" from the dashboard used to put "Restart cadence" in Action.
-    _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id=LEAD, action="Booked",
-                            outcome_status="Booked", action_request_id=str(uuid4()))
-    row = grid.rows[0]
-    old[row.get("action_request_id")] = "booked"
-    apply_snapshot(grid, {"lead_id": LEAD, "sheet": {
-        "review_status": "Cadence restarted", "review_action": "Restart cadence",
-        "lead_status": "In cadence"}})
-    assert row.get("action") == "Booked"
-    assert row.get("outcome_status") == "Cadence restarted" + OLD.format("Booked")
-    assert sheet_direct.claim_commands(grid, WorkflowTrace("t", "test")) == []
-
-
-def test_a_waiting_restart_that_the_resolution_restarted_is_done(old):
+def test_a_waiting_restart_that_the_resolution_restarted_is_done_and_emptied(old):
     # The review was resolved with "Restart cadence" while a typed Restart waited: that was the
-    # restart. Recorded, so it does not run on top once the cadence completes.
+    # restart. Action empties, so it does not run on top.
     _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id=LEAD,
                             action="Restart cadence", outcome_status=HINTED)
     row = grid.rows[0]
     apply_snapshot(grid, {"lead_id": LEAD, "sheet": {
         "review_status": "Cadence restarted", "lead_status": "In cadence"}})
-    assert row.get("outcome_status") == "Cadence restarted"
-    assert old[row.get("action_request_id")] == "restart_cadence"
-    row.cells["outcome_status"] = "Cadence completed"
-    assert needs_processing(row, command_of(row), sheet_direct.spent_rows([row])) is False
+    assert (row.get("outcome_status"), row.get("action")) == ("Cadence restarted", "")
 
 
-def test_clearing_outcome_status_on_a_row_in_review_does_not_start_the_restart(old):
+def test_a_restart_on_a_lead_in_review_waits_even_when_the_row_does_not_say_so(old):
     # Tester 2026-10-23: a cleared Outcome Status ran the Restart at once and closed the review
     # ("restarted" by Google Sheet; a name review's new name accepted with nobody choosing).
     _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id=LEAD,
@@ -556,7 +644,7 @@ def test_clearing_outcome_status_on_a_row_in_review_does_not_start_the_restart(o
     row = grid.rows[0]
     assert sheet_direct.claim_commands(grid, WorkflowTrace("t", "test")) == []
     assert row.get("outcome_status") == "Needs review: name changed" + REVIEW_FIRST
-    assert sheet_direct.parked(row, sheet_direct.spent_rows([row]))
+    assert sheet_direct.parked(row) and row.get("action") == "Restart cadence"
     # Resolved: it runs.
     del old.reviews[LEAD]
     apply_snapshot(grid, {"lead_id": LEAD, "sheet": RESOLVED})
@@ -564,37 +652,13 @@ def test_clearing_outcome_status_on_a_row_in_review_does_not_start_the_restart(o
     assert claimed is row
 
 
-def test_an_old_restart_cleared_on_a_row_in_review_waits_for_the_review(old):
-    _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id=LEAD,
-                            action="Restart cadence", outcome_status="",
-                            action_request_id=str(uuid4()))
-    row = grid.rows[0]
-    old[row.get("action_request_id")] = "restart_cadence"  # it ran before the review
-    old.reviews[LEAD] = "Needs review: name changed"
-    assert sheet_direct.claim_commands(grid, WorkflowTrace("t", "test")) == []
-    assert row.get("outcome_status") == "Needs review: name changed" + REVIEW_FIRST
-    assert row.get("action_request_id") == ""  # no longer the old Restart: it now waits
-    assert sheet_direct.parked(row, sheet_direct.spent_rows([row]))
-
-
 @pytest.mark.parametrize("action", ["Booked", "Do Not Contact"])
-def test_booked_or_do_not_contact_cleared_on_a_row_in_review_still_run(old, action):
+def test_booked_or_do_not_contact_on_a_lead_in_review_still_run(old, action):
     _, _, grid = _grid_with(name="Asha Rao", phone="5555550101", lead_id=LEAD, action=action,
-                            outcome_status="")
+                            outcome_status="Needs review: name changed")
     old.reviews[LEAD] = "Needs review: name changed"
     [(claimed, _, _)] = sheet_direct.claim_commands(grid, WorkflowTrace("t", "test"))
     assert claimed.get("outcome_status") == f"Processing: {action}"
-
-
-@pytest.mark.parametrize("text", ["Closed: a newer row has this phone number",
-                                  "Closed: handled by front desk", "Phone changed: add a new row"])
-def test_no_run_it_again_note_on_a_closed_lead(old, text):
-    _, _, grid = _grid_with(name="Asha Rao", lead_id=LEAD, action="Restart cadence",
-                            outcome_status="Cadence restarted", action_request_id=str(uuid4()))
-    row = grid.rows[0]
-    old[row.get("action_request_id")] = "restart_cadence"
-    apply_snapshot(grid, {"lead_id": LEAD, "sheet": {"action_status": text}})
-    assert row.get("outcome_status") == text
 
 
 # --- "Same person, keep old name": the Name cell goes back (owner, demo test 2026-10-23) ---------
@@ -606,7 +670,7 @@ LEAD = "00000000-0000-4000-8000-000000000001"
 
 def _kept_row(**cells):
     sheet, number, grid = _grid_with(**{"name": "QA Namekeep", "phone": "5555550101",
-                                        "lead_id": LEAD, "action": "Start cadence",
+                                        "lead_id": LEAD, "action": "",
                                         "outcome_status": "Needs review: name changed", **cells})
     return sheet, number, grid
 

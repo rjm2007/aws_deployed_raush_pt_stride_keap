@@ -68,30 +68,35 @@ def test_a_resolved_review_still_updates_the_sheet_on_live_types(live):
     assert live.cell(number, "lead_status") == "In cadence"
 
 
+def _request_id(live, lead_id, action):
+    return live.db.execute("select request_id from lead_action_requests where lead_id=%s and action=%s",
+                           (lead_id, action)).fetchone()["request_id"]
+
+
 def test_a_start_row_rerun_links_the_lead_on_live_types(live):
     """sheet_direct._start_row_already_done joined leads.id (uuid) to lead_action_requests.lead_id (text)."""
     number = live.start_row()
     live.tick()
-    request_id, lead_id = live.cell(number, "action_request_id"), live.cell(number, "lead_id")
-    live.sheet.set(number, "lead_id", "")        # the result never reached the Sheet,
-    live.sheet.set(number, "outcome_status", "")  # and staff cleared the status to try again
+    lead_id = live.cell(number, "lead_id")
+    # A row from before 2026-10-25: the result never reached the Sheet, staff cleared the status.
+    for key, value in {"lead_id": "", "outcome_status": "", "action": "Start cadence",
+                       "action_request_id": _request_id(live, lead_id, "start_cadence")}.items():
+        live.sheet.set(number, key, value)
     live.tick()
     assert live.cell(number, "lead_id") == lead_id and len(live.leads()) == 1
-    assert live.cell(number, "action_request_id") == request_id
 
 
-def test_an_old_command_is_recorded_and_found_on_live_types(live):
-    """sheet_direct._record_handled / _ran_actions (2026-10-23) on the live text columns."""
+def test_an_old_command_is_found_and_emptied_on_live_types(live):
+    """sheet_direct._handled_actions (old_commands, 2026-10-25) on the live text columns."""
     number, lead_id = _started(live)
     live.sheet.set(number, "action", "Booked")
-    live.sheet.set(number, "outcome_status", "")
     live.tick()
-    assert live.cell(number, "outcome_status") == "Booked"
-    live.sheet.set(number, "action", "Restart cadence")  # turned down next to "Booked": recorded
-    live.tick()
-    request_id = live.cell(number, "action_request_id")
-    stored = live.db.execute("select action,lead_id,status from lead_action_requests where request_id=%s",
-                             (request_id,)).fetchone()
-    assert (stored["action"], stored["lead_id"], stored["status"]) == ("restart_cadence", lead_id, "failed")
-    live.tick()
-    assert live.cell(number, "action_request_id") == request_id  # found again, not recorded twice
+    assert live.cell(number, "outcome_status") == "Booked" and live.cell(number, "action") == ""
+    # As the rules before 2026-10-25 left it: the Booked that ran, still in the cell.
+    live.sheet.set(number, "action", "Booked")
+    live.sheet.set(number, "action_request_id", _request_id(live, lead_id, "booked"))
+    live.tick(full=False)
+    assert live.cell(number, "action") == "" and live.cell(number, "action_request_id") == ""
+    count = live.db.execute("select count(*) as n from lead_action_requests where lead_id=%s",
+                            (lead_id,)).fetchone()["n"]
+    assert count == 2  # the Start and the one Booked: nothing ran again

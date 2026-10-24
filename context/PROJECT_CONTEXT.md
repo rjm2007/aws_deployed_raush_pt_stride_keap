@@ -2370,3 +2370,46 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
     it)" (the invitation left out on the texts above). The rules read Outcome Status without these words
     (`_base_status`), so "Booked; Restart cadence in Action not run ..." is still final and Lead Status Booked.
   - Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`, `test_lead_review_integration.py`.
+
+### 2026-10-25 — Sheet: Action empties after each command (owner decision)
+- Replaces the 2026-10-23 "old command" rule, where staff re-ran a command by clearing Outcome Status (the owner
+  does not want staff to do that). Direct mode only; n8n mode unchanged (the snapshot's `action` /
+  `review_action` keys stay for n8n's own intake).
+- New rule: staff pick a command, it runs, the cell empties. Once a command is handled (it ran; the backend
+  refused it; the row was invalid; Start cadence on a linked row; a parked Restart dropped or done by the
+  review's own restart) `sheet_direct._clear_action` empties Action and the Action Request ID in the same write
+  as the result. The result stays in Outcome Status, Lead Status as before. "Retrying n/3" keeps both (still
+  running). The Action write is identity-safe like the Name write-back (`expect`): if staff picked another
+  command between our read and our write, their value is kept (`FlushResult.skipped_cells`) and runs on the next
+  poll as a new command (its Action Request ID is empty). The worker never writes anything else into Action.
+- A command in Action is therefore always new: `needs_processing` is now "not running and not a parked Restart",
+  whatever Outcome Status says. Same command any number of times (restart a patient again by picking Restart
+  cadence again; the 10-minute cooldown still applies). A Restart on a row in review still waits (kept in Action
+  until it runs, then emptied, or is dropped, then emptied with "; the Restart in Action was not run"), also when
+  only the database shows the open review (`_review_waiting`). Booked / Do Not Contact still run on review rows.
+- Refusal texts staff can act on (`label_result` / `_refusal_text`):
+  `outreach_unresolved` -> "Error: a call or text is going out right now. Pick Restart cadence again in a
+  minute."; `restart_too_soon` -> "Error: restarted less than 10 minutes ago. Pick Restart cadence again after
+  3:52 PM PT." (the backend now returns `retry_at` with that refusal: `LeadActionError.extra`, computed in SQL;
+  a stored refusal without it says "... again in 10 minutes."); Start cadence on a linked row -> "Error: this row
+  already has a lead. Pick Restart cadence to start the calls again." (it used to be ignored without a word).
+  Others unchanged ("Error: <reason>", e.g. "Error: Lead ID and phone number do not match").
+- Removed (dead with the new rule): `spent_rows` / `Spent`, `refused`, `_record_handled`, `_mark_handled`,
+  `_rerun_ok`, `_with_note`, `OLD_COMMAND`, `NOT_RUN_TYPED`, `RERUN`; no more failed `lead_action_requests` rows
+  recorded for turned-down or dropped commands; no more "(clear this cell to run it ...)" texts.
+- Rows from before this change (first poll after deploy, narrow or full): a command next to a filled Action
+  Request ID that is not running is checked once (`old_commands`, one lookup per poll). It is old, and emptied
+  without running (`retire_old`, Action Request ID emptied too, the old "clear this cell" words taken off
+  Outcome Status), when the request that id names finished (completed or failed) with the same action and
+  Outcome Status is not blank, or when the pre-2026-10-25 status rules would not run it (`_old_rules_run`:
+  Booked next to "Booked", Restart next to "Cadence restarted", Do Not Contact next to "Unblocked in dashboard",
+  Start cadence on a linked row, anything next to "Error: ..."). A parked Restart keeps waiting; a command picked
+  under the old rules and not run yet (Outcome Status cleared, a different command) runs as before. Since every
+  handled row now has an empty Action Request ID, a re-picked command is never taken for an old one. Expect one
+  larger write on the first poll: every linked row still showing "Start cadence" is emptied. No migration.
+- Tests: `test_sheet_direct.py` (rules, labels, emptied after run / refusal / invalid / Start on linked row,
+  restart N times, retrying keeps it, staff edit not wiped, old commands found and emptied, parked Restart kept
+  then emptied, dropped / done by resolution emptied), `test_sheet_direct_integration.py` (end to end incl.
+  cooldown text with the time, call going out, phone mismatch, staff edit between read and write, first poll on
+  old rows narrow and full, the worker only ever writes "" into Action), `test_lead_review_integration.py`,
+  `test_live_column_types_integration.py`, `test_n8n_integration.py` (`retry_at`).

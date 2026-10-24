@@ -326,8 +326,8 @@ def _direct_tick(backend: SheetBackend, settings: Settings, counts: dict[str, in
             for row in scanned:
                 if row.get("lead_id"):
                     first_row.setdefault(row.get("lead_id"), row.number)
-            spent = sheet_direct.spent_rows(scanned)
-            wanted = {row.number for row in scanned if sheet_direct.needs_attention(row, spent)}
+            old = sheet_direct.old_commands(scanned)
+            wanted = {row.number for row in scanned if sheet_direct.needs_attention(row, old)}
             wanted |= {first_row[lead] for lead in _due_outbox_leads(settings) if lead in first_row}
             load_rows(backend, grid, wanted)
     except SheetLayoutError as exc:
@@ -395,7 +395,9 @@ def _direct_tick(backend: SheetBackend, settings: Settings, counts: dict[str, in
         write_heartbeat(mode="direct", ok=False, error=f"write failed: {type(exc).__name__}")
         return counts
     counts["deferred"] += len(written.deferred_rows)
-    not_written = written.deferred_rows | written.skipped_rows
+    # Only a skipped Name holds a fingerprint back: a skipped Action cell (staff picked a new command
+    # while we emptied it) changes nothing in the profile.
+    not_written = written.deferred_rows | {n for n, key in written.skipped_cells if key == "name"}
     poll.save_baselines(not_written)
     # A Name we wrote back is not staff still editing the row: the last read's fingerprint follows
     # it, so another edit made meanwhile syncs on the next full read, not one later.

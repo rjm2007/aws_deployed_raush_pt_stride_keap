@@ -44,7 +44,7 @@ Action Request ID | Action Started At
 | Date Of Birth | Staff enters `MM/DD/YYYY` (US, month first, since 2026-10-21); stored as a date | Staff |
 | Location | Location text | Staff |
 | Case | Any non-empty case/lead type | Staff |
-| Action | `Start cadence`, `Restart cadence`, `Do not contact`, or `Booked` | Staff only (direct mode never writes it, 2026-10-23) |
+| Action | `Start cadence`, `Restart cadence`, `Do not contact`, or `Booked` | Staff pick it; direct mode only empties it once the command is handled (2026-10-25) |
 | Action Status | Processing, success, duplicate, review, or error result | n8n |
 | Cadence Day | Most recently completed cadence day, for example `Day 5` | AWS status sync |
 | Cadence events | `Call`, `SMS`, or `Call + SMS` | AWS status sync |
@@ -54,7 +54,7 @@ Action Request ID | Action Started At
 | Needs Review | Shows `Needs Review` when staff action is required | AWS status sync |
 | Transcript Link | Dashboard calls page for the Lead ID | AWS status sync |
 | Callback At | Readable Pacific time | AWS status sync |
-| Action Request ID | Unique UUID for safe retry/idempotency | n8n |
+| Action Request ID | Unique UUID for safe retry/idempotency. Direct mode: filled while a command runs, emptied with Action once it is handled (2026-10-25) | n8n / Sheet worker |
 | Action Started At | Time used to detect a stuck request | n8n |
 
 Protect the system-owned columns. Hide `Action Request ID` and `Action Started At`. Format Phone Number as
@@ -163,6 +163,8 @@ Main responses:
 | 200 | Existing linked lead action completed or idempotent retry returned |
 | 401 | Wrong shared secret |
 | 409 `lead_already_exists` | Blank-ID row uses a phone already present in the practice |
+| 409 `outreach_unresolved` | Restart while a call or text is still going out. Direct mode Sheet text: `Error: a call or text is going out right now. Pick Restart cadence again in a minute.` |
+| 409 `restart_too_soon` | Restart within 10 minutes of the last Sheet restart; body has `retry_at` (ISO time a new Restart is accepted). Direct mode Sheet text: `Error: restarted less than 10 minutes ago. Pick Restart cadence again after 3:52 PM PT.` (Pacific) |
 | 200 `already_booked` | Blank-ID row is the same person (phone + name + birthday) as a lead already booked; no new lead, no calls, `lead_id` empty (Sheet shows `Already booked`) |
 | 409 `name_changed_needs_review` | Linked row's name differs from its database lead |
 | 409 `phone_changed_needs_review` | Linked row's phone differs from its database lead |
@@ -257,26 +259,34 @@ states and inbound replies. These endpoints update Supabase first; they never ca
    Restart cadence does not run past the review: the row gets "<review text>; resolve it on the dashboard
    first, then the restart runs", the Action cell is kept, and the Restart runs once the review is resolved.
    If the dashboard ends the lead instead (close, front desk, booking link, Booked, Do not contact, or Stride
-   books it), that newer decision wins: the Restart is dropped (recorded as handled, Action left as is), and
+   books it), that newer decision wins: the Restart is dropped (Action emptied), and
    Outcome Status says "<result>; the Restart in Action was not run" (a final "Booked" / "Do Not Contact
    applied" stays as is). Clearing Action removes the "resolve it on the dashboard first" words on the next poll.
-   Start cadence on a linked row is never a command (as before). Old n8n texts ("Phone number changed; needs
-   review") still block every command.
-   Action column rule (direct mode, owner 2026-10-23): only staff write Action; the backend never does.
-   Results show in Outcome Status and Lead Status. A command is new only when it differs from the one the
-   row last handled: the row's Action Request ID names that request (`lead_action_requests.action`), and a
-   command equal to it never runs again while Outcome Status is not blank. A command the Outcome Status turns
-   down (Restart next to "Booked", Do Not Contact next to "Unblocked in dashboard", ...) is recorded as
-   handled the same way, so it cannot go off when a later text replaces that one, and the row says so:
-   "<text>; <command> in Action not run (clear this cell to run it)". When the backend writes a new non-final
-   Outcome Status next to a command that really ran it adds "; <command> in Action already ran (clear this
-   cell to run it again)". Neither invitation is added on a closed lead ("Closed: ...", "Phone changed: add a
-   new row"), nor for a Restart next to an open review text.
-   **How staff run the same command again: clear the Outcome Status cell.** The command in Action then runs
-   on the next poll. A Restart on a lead whose review is still open (checked in the database, not the row)
-   does not run: the row gets "<review text>; resolve it on the dashboard first, then the restart runs" and
-   it runs after the resolution. Booked and Do Not Contact run at once. A different command picked in Action
-   runs as usual.
+   **Action column rule (direct mode, owner 2026-10-25): staff pick a command, it runs, the cell empties.**
+   Once a command is handled (it ran, the backend refused it, or the row could not run it) the Sheet worker
+   empties Action, and the Action Request ID with it, in the same write as the result. The result stays in
+   Outcome Status ("Cadence started", "Cadence restarted", "Booked", "Do Not Contact applied", "Error: ...");
+   Lead Status as before. A command in Action is therefore always new, whatever Outcome Status says, and staff
+   run the same command again by picking it again (a patient can be restarted any number of times; the
+   10-minute restart cooldown still applies). The empty write only lands if the cell still holds the command
+   that was handled: a command staff picked meanwhile is kept and runs next. An empty Action is never a command,
+   and the worker never writes anything else into Action. The one exception is a Restart parked behind an open
+   review: it stays in Action until it runs (then emptied) or is dropped (then emptied, with "; the Restart in
+   Action was not run"). A Restart on a lead whose review is still open (checked in the database, not the row)
+   waits the same way. Booked and Do Not Contact run at once. Refusals say what to do:
+   - `Error: a call or text is going out right now. Pick Restart cadence again in a minute.`
+   - `Error: restarted less than 10 minutes ago. Pick Restart cadence again after <h:mm AM/PM> PT.`
+   - `Error: this row already has a lead. Pick Restart cadence to start the calls again.` (Start cadence on a
+     linked row)
+   - any other backend refusal or row error: `Error: <reason>`.
+   Rows from before 2026-10-25 can still hold a command that was already handled (the Booked, Start or Restart
+   the backend used to write, or staff's own command that ran). On the first poll that sees such a row it is
+   emptied, not run: a command next to a filled Action Request ID whose request finished with the same action
+   (and Outcome Status is not blank), or one the old rules would not run (Booked next to "Booked", Restart next
+   to "Cadence restarted", Do Not Contact next to "Unblocked in dashboard", Start cadence on a linked row, any
+   command next to "Error: ..."). The old "(clear this cell to run it ...)" words are taken off its Outcome
+   Status. A command picked under the old rules and not run yet (Outcome Status cleared, or a different
+   command) runs as before.
    n8n mode still has the backend write Action (`sheet.action`: "Booked" once booked, "" after a Stride
    cancel; dashboard unblock / resolution values): the n8n intake has no memory of the last command.
 3. Normalize phone and DOB. Accept a one-word Name and any non-empty Case.

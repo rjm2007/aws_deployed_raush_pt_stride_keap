@@ -55,12 +55,14 @@ def _hold_if_number_blocked(conn, lead_id: str, phone: str | None) -> bool:
 
 
 class LeadActionError(RuntimeError):
-    def __init__(self, status_code: int, code: str, detail: str, *, lead_id: str | None = None):
+    def __init__(self, status_code: int, code: str, detail: str, *, lead_id: str | None = None,
+                 extra: dict[str, Any] | None = None):
         super().__init__(detail)
         self.status_code = status_code
         self.code = code
         self.detail = detail
         self.lead_id = lead_id
+        self.extra = extra or {}  # more fields for the stored response (e.g. retry_at)
 
 
 def _request_hash(
@@ -421,17 +423,20 @@ def _restart_cadence(
     # a new request ID, so idempotency cannot catch it and the patient is called
     # every minute or two. A real second restart this soon is not plausible.
     recent = conn.execute(
-        "select changed_at from lead_status_history where lead_id=%s and source='n8n_sheet' "
-        "and reason='cadence restarted from Google Sheets' "
+        "select changed_at+make_interval(mins=>%s) as retry_at from lead_status_history "
+        "where lead_id=%s and source='n8n_sheet' and reason='cadence restarted from Google Sheets' "
         "and changed_at>now()-make_interval(mins=>%s) order by changed_at desc limit 1",
-        (lead_id, RESTART_COOLDOWN_MINUTES),
+        (RESTART_COOLDOWN_MINUTES, lead_id, RESTART_COOLDOWN_MINUTES),
     ).fetchone()
     if recent:
+        # retry_at: when a new Restart is accepted, so the Sheet can say when to pick it again
+        # (owner, 2026-10-25: Action empties after each command, staff re-pick it).
         raise LeadActionError(
             409,
             "restart_too_soon",
             f"Cadence was already restarted in the last {RESTART_COOLDOWN_MINUTES} minutes",
             lead_id=str(lead_id),
+            extra={"retry_at": recent["retry_at"].isoformat()},
         )
     if lead_data:
         _update_lead_profile(conn, lead_id, lead_data)
@@ -703,6 +708,7 @@ def execute_lead_action(
                 "action": action,
                 "code": exc.code,
                 "detail": exc.detail,
+                **exc.extra,
             }
             _complete_request(
                 conn,

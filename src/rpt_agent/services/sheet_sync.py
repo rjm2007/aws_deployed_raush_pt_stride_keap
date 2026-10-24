@@ -166,9 +166,9 @@ def format_cadence_columns(
 #
 # The third value is the Action cell for n8n mode only: there a dashboard unblock replaces the stale
 # "Do Not Contact", and a restart is written as the plain "Cadence restarted" (next to Action
-# "Restart cadence" a status the n8n intake skips). Direct mode never writes Action (owner,
-# 2026-10-23: only staff do); it keeps an old command from running again by the row's Action
-# Request ID (sheet_direct.spent_rows).
+# "Restart cadence" a status the n8n intake skips). Direct mode never fills Action (owner,
+# 2026-10-23/25): it empties the cell once a command is handled, so nothing old is left to re-run
+# (sheet_direct._clear_action).
 DASHBOARD_OUTCOMES = {
     "cadence_restarted_after_unblock": ("Cadence restarted", "In cadence", "Restart cadence"),
     "cadence_resumed_after_unblock": ("Cadence resumed in dashboard", "In cadence", "Start cadence"),
@@ -185,7 +185,8 @@ def _review_status(conn, lead, reasons: set[str]) -> tuple[str | None, str | Non
     Sent only with the review's own update, like DASHBOARD_OUTCOMES: a later snapshot leaves the
     cell alone, so a staff member who cleared it to run a command is not overwritten. The Action
     returned with a resolution ("Start cadence", or "Restart cadence") is for n8n mode only, whose
-    intake has no memory of the last command; direct mode ignores it (sheet_direct.spent_rows).
+    intake has no memory of the last command; direct mode ignores it (it empties Action once a
+    command is handled, sheet_direct._clear_action).
     """
     from .lead_review import (  # lead_review imports this module
         SHEET_RESOLVED,
@@ -382,8 +383,8 @@ def build_sheet_snapshot(
     sheet["lead_status"] = sheet_lead_status(lead)
     # n8n mode only (`action`): its intake re-sends any command whose Outcome Status is not final,
     # so the cell is overwritten once booked, and cleared after a Stride cancel (it re-booked the
-    # lead every two minutes, 2026-10-13). Direct mode ignores the key: only staff write Action
-    # there (owner, 2026-10-23) and an old command is recognised by its Action Request ID.
+    # lead every two minutes, 2026-10-13). Direct mode ignores the key: there staff pick a command,
+    # it runs and the cell empties (owner, 2026-10-25); the backend never fills Action.
     if lead["status"] == "booked":
         sheet["action"] = "Booked"
     elif _stride_problem(lead):

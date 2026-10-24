@@ -957,7 +957,7 @@ def test_restart_rejects_a_repeat_sheet_restart_within_cooldown(monkeypatch):
     def execute(query, params=None):
         if "from lead_status_history" in query:
             conn.queries.append((" ".join(query.split()), params))
-            return _Rows(one={"changed_at": datetime.now(UTC)})
+            return _Rows(one={"retry_at": datetime(2026, 10, 25, 22, 52, tzinfo=UTC)})
         return original_execute(query, params)
 
     conn.execute = execute
@@ -972,6 +972,8 @@ def test_restart_rejects_a_repeat_sheet_restart_within_cooldown(monkeypatch):
         )
 
     assert exc_info.value.code == "restart_too_soon"
+    # When a new Restart is accepted: the Sheet tells staff when to pick it again (2026-10-25).
+    assert exc_info.value.extra == {"retry_at": "2026-10-25T22:52:00+00:00"}
     statements = [query for query, _ in conn.queries]
     assert not any(query.startswith("delete from outreach_events") for query in statements)
 

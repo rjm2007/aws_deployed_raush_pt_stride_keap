@@ -198,6 +198,8 @@ class FlushResult:
     deferred_rows: set[int] = field(default_factory=set)
     # Rows where an `expect` cell had changed: that cell was not written (the rest of the row was).
     skipped_rows: set[int] = field(default_factory=set)
+    # The same, per (row, key): a skipped Name and a skipped Action mean different things.
+    skipped_cells: set[tuple[int, str]] = field(default_factory=set)
 
 
 def flush(backend: SheetBackend, grid: SheetGrid) -> FlushResult:
@@ -207,7 +209,7 @@ def flush(backend: SheetBackend, grid: SheetGrid) -> FlushResult:
     used = {key for _, key, _, _ in grid.pending} | set(IDENTITY)
     fresh = backend.read_rows(sorted({grid.header_row, *(n for n, *_ in grid.pending)}))
     header = fresh.get(grid.header_row) or []
-    cells, deferred, skipped = [], set(), set()
+    cells, deferred, skipped, skipped_cells = [], set(), set(), set()
     # A column inserted, deleted or moved since the read shifts every letter: write nothing.
     moved = any(
         as_text(_cell(header, grid.columns[key] + 1)).strip().casefold() != COLUMNS[key].casefold()
@@ -229,6 +231,7 @@ def flush(backend: SheetBackend, grid: SheetGrid) -> FlushResult:
             held = as_text(_cell(raw, grid.columns[key] + 1))
             if " ".join(held.split()) != " ".join(grid.expect[(number, key)].split()):
                 skipped.add(number)
+                skipped_cells.add((number, key))
                 row = next((r for r in grid.rows if r.number == number), None)
                 if row is not None:
                     row.cells[key] = held  # the grid shows what the Sheet really holds
@@ -245,7 +248,7 @@ def flush(backend: SheetBackend, grid: SheetGrid) -> FlushResult:
     grid.rows = [row for row in grid.rows if row.number not in deferred]
     grid.pending.clear()
     grid.expect.clear()
-    return FlushResult(len(cells), deferred, skipped)
+    return FlushResult(len(cells), deferred, skipped, skipped_cells)
 
 
 def _cell(column: list[Any], number: int) -> Any:

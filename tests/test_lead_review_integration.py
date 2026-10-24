@@ -25,11 +25,10 @@ from rpt_agent.services import sheet_direct
 from rpt_agent.services.delivery import apply_twilio_message_status
 from rpt_agent.services.google_sheet import parse_grid
 from rpt_agent.services.lead_status import report_lead_status
-from rpt_agent.services.sheet_direct import OLD_COMMAND, REVIEW_FIRST, profile_hash
+from rpt_agent.services.sheet_direct import REVIEW_FIRST, profile_hash
 from rpt_agent.worker import CLAIM_SQL, run_safety_checks
 
 pytestmark = pytest.mark.integration
-OLD = OLD_COMMAND.replace("{label}", "{}")
 
 HEADERS = {"X-Dashboard-Token": "x" * 32, "X-Dashboard-User-ID": "emma01",
            "X-Dashboard-User-Name": "Emma", "X-Dashboard-User-Role": "employee"}
@@ -163,7 +162,7 @@ def test_name_change_card_shows_old_and_new_and_use_new_name_resumes_fully(revie
         "use_new_name", "emma01", "Emma", "Called her")
     senv.tick()
     assert senv.cell(number, "outcome_status") == "Resolved: new name used"
-    assert senv.cell(number, "action") == "Start cadence"
+    assert senv.cell(number, "action") == ""  # emptied once the Start ran (2026-10-25), never refilled
     assert senv.cell(number, "lead_status") == "In cadence"
     # Another edit later: the name now matches, so nothing is flagged again.
     senv.sheet.set(number, "email", "kumar@example.test")
@@ -332,7 +331,7 @@ def test_phone_change_closes_the_lead_at_once_and_never_resumes(review_env):
     assert new_phone not in str(review["details"])  # only the last four digits are kept
     assert senv.cell(number, "outcome_status") == "Phone changed: add a new row"
     assert senv.cell(number, "lead_status") == "Closed"
-    assert senv.cell(number, "action") == "Start cadence"
+    assert senv.cell(number, "action") == ""
     assert _post(f"leads/{lead_id}/cadence", {"action": "resume"}).status_code == 409
     assert _post(f"leads/{lead_id}/stage", {"stage": "new"}).status_code == 409
     # Later polls (and another edit) neither duplicate the record nor reopen the lead.
@@ -340,11 +339,12 @@ def test_phone_change_closes_the_lead_at_once_and_never_resumes(review_env):
     senv.tick()
     senv.tick()
     assert len(_reviews(senv, lead_id)) == 1 and senv.lead(lead_id)["status"] == "invalid_phone"
-    # The Sheet's own Restart is refused too.
+    # The Sheet's own Restart is refused too, with the reason; Action empties.
     senv.sheet.set(number, "action", "Restart cadence")
-    senv.sheet.set(number, "outcome_status", "")
     senv.tick()
     assert senv.lead(lead_id)["cadence_state"] == "terminated"
+    assert senv.cell(number, "outcome_status").startswith("Error: ")
+    assert senv.cell(number, "action") == ""
 
 
 # --- text failed --------------------------------------------------------------------------------
@@ -487,7 +487,7 @@ def test_booked_typed_on_a_flagged_row_books_and_closes_the_review(review_env):
     assert review["resolved_at"] is not None and review["resolution"] == "booked"
     assert review["resolved_by_name"] == "Google Sheet"
     assert senv.cell(number, "outcome_status") == "Booked"
-    assert (senv.cell(number, "action"), senv.cell(number, "lead_status")) == ("Booked", "Booked")
+    assert (senv.cell(number, "action"), senv.cell(number, "lead_status")) == ("", "Booked")
     assert not any(e["status"] == "planned" for e in _events(senv, lead_id))
     assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 409
 
@@ -508,7 +508,7 @@ def test_do_not_contact_typed_on_a_flagged_row_blocks_the_number_and_closes_the_
                               (lead["phone_e164"],)).fetchone()
     assert blocked
     assert senv.cell(number, "outcome_status") == "Do Not Contact applied"
-    assert senv.cell(number, "action") == "Do Not Contact"
+    assert senv.cell(number, "action") == ""
 
 
 def test_restart_typed_on_a_flagged_row_waits_for_the_review_then_runs(review_env):
@@ -560,7 +560,7 @@ def test_a_booked_typed_before_the_review_is_resolved_still_runs(review_env, mon
     senv.tick()
     assert senv.lead(lead_id)["status"] == "booked"
     assert senv.cell(number, "outcome_status") == "Booked"
-    assert senv.cell(number, "action") == "Booked"
+    assert senv.cell(number, "action") == ""
 
 
 def _no_cooldown(senv, lead_id):
@@ -574,11 +574,10 @@ def _restarts(senv, lead_id):
         "and action='restart_cadence' and status='completed'", (lead_id,)).fetchone()["n"]
 
 
-def test_a_restart_that_ran_is_old_on_the_next_review_and_clearing_outcome_runs_it(review_env):
-    # Tester 2026-10-22: a Restart typed on the next review was lost. Since 2026-10-23 the backend
-    # no longer turns the Restart that ran into "Start cadence" (only staff write Action), so on the
-    # next review the cell still holds that Restart: it is old (the row's request id names it), it
-    # neither waits nor runs after the resolution, and the row says how to run it again.
+def test_a_restart_runs_after_each_review_only_when_staff_pick_it_again(review_env):
+    # Tester 2026-10-22: a Restart typed on the next review was lost. Owner 2026-10-25: the Restart
+    # that ran is emptied from Action, so the next review neither parks it nor runs it after the
+    # resolution; picking Restart cadence again waits for that review and then runs.
     senv = review_env
     number, lead_id = _started(senv)
     _wrong_person(senv, lead_id)
@@ -586,30 +585,28 @@ def test_a_restart_that_ran_is_old_on_the_next_review_and_clearing_outcome_runs_
     senv.sheet.set(number, "action", "Restart cadence")
     senv.tick()
     assert senv.cell(number, "outcome_status").endswith(REVIEW_FIRST)
+    assert senv.cell(number, "action") == "Restart cadence"  # kept while it waits
     assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 200
     _no_cooldown(senv, lead_id)
     senv.tick()
     senv.tick()
     assert senv.cell(number, "outcome_status") == "Cadence restarted"
-    assert _restarts(senv, lead_id) == 1
-    # The next review: Action still reads Restart cadence (case 7 no longer writes it).
+    assert senv.cell(number, "action") == "" and _restarts(senv, lead_id) == 1
+    # The next review: nothing in Action, nothing waits.
     _wrong_person(senv, lead_id)
     senv.tick()
-    assert senv.cell(number, "action") == "Restart cadence"
-    assert senv.cell(number, "outcome_status") == "Needs review: wrong number"  # no "clear" note
+    assert senv.cell(number, "outcome_status") == "Needs review: wrong number"
     assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 200
     _no_cooldown(senv, lead_id)
     for _ in range(3):
         senv.tick()
-    assert senv.cell(number, "action") == "Restart cadence"  # case 5: no "Start cadence"
-    assert senv.cell(number, "outcome_status") == "Resolved: number confirmed" + OLD.format(
-        "Restart cadence")
+    assert senv.cell(number, "outcome_status") == "Resolved: number confirmed"
     assert _restarts(senv, lead_id) == 1
-    # Staff run it again: clear Outcome Status.
-    senv.sheet.set(number, "outcome_status", "")
+    # Staff restart again: pick it again.
+    senv.sheet.set(number, "action", "Restart cadence")
     senv.tick()
     assert senv.cell(number, "outcome_status") == "Cadence restarted"
-    assert _restarts(senv, lead_id) == 2
+    assert _restarts(senv, lead_id) == 2 and senv.cell(number, "action") == ""
     senv.tick()
     assert _restarts(senv, lead_id) == 2
 
@@ -628,8 +625,8 @@ def test_a_waiting_restart_is_dropped_when_the_review_closes_the_lead(review_env
     words = {"front_desk": "Closed: handled by front desk", "wrong_number": "Closed: wrong number"}
     assert senv.cell(number, "outcome_status") == (
         words[choice] + "; the Restart in Action was not run")
-    # Case 8: the Restart stays in Action (it was replaced with "Start cadence"), recorded as handled.
-    assert senv.cell(number, "action") == "Restart cadence"
+    # Dropped: Action empties (2026-10-25), so it can never run later.
+    assert senv.cell(number, "action") == ""
     assert senv.lead(lead_id)["cadence_state"] == "terminated"
     assert _restarts(senv, lead_id) == 0
     # A later system text over the row does not set it off either.
@@ -651,7 +648,7 @@ def test_a_waiting_restart_is_dropped_when_the_board_books_the_lead(review_env):
     senv.tick()
     senv.tick()
     assert (senv.cell(number, "outcome_status"), senv.cell(number, "action")) == (
-        "Booked", "Restart cadence")  # case 1 / 8: Action is not written
+        "Booked", "")  # dropped, and Action emptied (never "Booked" written into it)
     assert senv.lead(lead_id)["status"] == "booked" and _restarts(senv, lead_id) == 0
 
 
@@ -693,18 +690,17 @@ def test_clearing_outcome_status_on_a_row_in_review_keeps_the_restart_waiting(re
     assert _restarts(senv, lead_id) == 1
 
 
-def test_an_old_restart_cleared_on_a_row_in_review_waits_then_runs_once(review_env):
+def test_a_restart_picked_again_on_a_row_in_review_waits_then_runs_once(review_env):
     senv = review_env
     number, lead_id = _started(senv)
     senv.sheet.set(number, "action", "Restart cadence")
-    senv.sheet.set(number, "outcome_status", "")
     senv.tick()
-    assert _restarts(senv, lead_id) == 1
+    assert _restarts(senv, lead_id) == 1 and senv.cell(number, "action") == ""
     senv.sheet.set(number, "name", "Asha Kumar")
     senv.tick()
     senv.tick()
     assert senv.cell(number, "outcome_status") == "Needs review: name changed"
-    senv.sheet.set(number, "outcome_status", "")  # staff want that Restart again
+    senv.sheet.set(number, "action", "Restart cadence")  # staff want a Restart again
     senv.tick()
     senv.tick()
     assert senv.cell(number, "outcome_status") == "Needs review: name changed" + REVIEW_FIRST
@@ -714,7 +710,7 @@ def test_an_old_restart_cleared_on_a_row_in_review_waits_then_runs_once(review_e
     _no_cooldown(senv, lead_id)
     for _ in range(3):
         senv.tick()
-    assert _restarts(senv, lead_id) == 2
+    assert _restarts(senv, lead_id) == 2 and senv.cell(number, "action") == ""
 
 
 def test_booked_cleared_on_a_row_in_review_still_runs(review_env):
@@ -728,8 +724,8 @@ def test_booked_cleared_on_a_row_in_review_still_runs(review_env):
 
 
 def test_a_waiting_restart_is_dropped_when_the_phone_changes(review_env):
-    # The phone change closes the lead: the Restart stays in Action (no "Start cadence" any more),
-    # recorded as handled, so it never runs (and never shows an error) on a later poll.
+    # The phone change closes the lead: the Restart is dropped and Action empties, so it never runs
+    # (and never shows an error) on a later poll.
     senv = review_env
     number, lead_id = _started(senv)
     _wrong_person(senv, lead_id)
@@ -742,7 +738,7 @@ def test_a_waiting_restart_is_dropped_when_the_phone_changes(review_env):
     senv.tick()
     assert senv.cell(number, "outcome_status") == (
         "Phone changed: add a new row; the Restart in Action was not run")
-    assert senv.cell(number, "action") == "Restart cadence"
+    assert senv.cell(number, "action") == ""
     for _ in range(2):
         senv.tick()
     assert senv.cell(number, "outcome_status") == (

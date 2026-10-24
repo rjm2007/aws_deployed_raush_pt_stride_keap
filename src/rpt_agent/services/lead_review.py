@@ -168,7 +168,7 @@ SHEET_RESOLVED = {
     "front_desk": "Closed: handled by front desk",
 }
 # The Action set with the resolution (default "Start cadence"), n8n mode only: direct mode never
-# writes Action (owner, 2026-10-23). A restart is shown as the Sheet's own restart is.
+# fills Action (owner, 2026-10-23/25; it only empties it once a command is handled). A restart is shown as the Sheet's own restart is.
 SHEET_RESOLVED_ACTION = {"restart_cadence": "Restart cadence"}
 SHEET_TEXTS_OFF = "Calls only (texts off)"
 
