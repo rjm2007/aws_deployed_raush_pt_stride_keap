@@ -189,9 +189,9 @@ def _review_status(conn, lead, reasons: set[str]) -> tuple[str | None, str | Non
     command is handled, sheet_direct._clear_action).
     """
     from .lead_review import (  # lead_review imports this module
-        SHEET_RESOLVED,
         SHEET_RESOLVED_ACTION,
         sheet_open_status,
+        sheet_resolved_text,
     )
 
     if lead["status"] in {"booked", "do_not_contact"}:
@@ -207,14 +207,15 @@ def _review_status(conn, lead, reasons: set[str]) -> tuple[str | None, str | Non
         # A Sheet command that finished after the resolution (staff restarted the row before this
         # poll) owns the cell: its result is already there and is newer.
         row = conn.execute(
-            "select r.resolution from lead_reviews r where r.lead_id=%s and r.resolved_at is not null "
+            "select r.resolution,r.code from lead_reviews r where r.lead_id=%s "
+            "and r.resolved_at is not null "
             # As text: the live databases store lead_action_requests.lead_id as text (2026-10-22).
             "and not exists(select 1 from lead_action_requests a where a.lead_id::text=r.lead_id::text "
             "and a.completed_at>r.resolved_at) "
             "order by r.resolved_at desc,r.id desc limit 1",
             (lead["id"],),
         ).fetchone()
-        text = SHEET_RESOLVED.get(row["resolution"]) if row else None
+        text = sheet_resolved_text(row["resolution"], row.get("code")) if row else None
         action = SHEET_RESOLVED_ACTION.get(row["resolution"], "Start cadence") if row else None
         return (text, action) if text else (None, None)
     return None, None
@@ -228,7 +229,8 @@ def _kept_name(conn, lead) -> tuple[str, str] | None:
     """
     row = conn.execute(
         "select l.full_name,r.details from lead_reviews r join leads l on l.id=r.lead_id "
-        "where r.lead_id=%s and r.code='name_changed' and r.resolution='keep_old_name' "
+        "where r.lead_id=%s and r.code='name_changed' "
+        "and r.resolution in ('keep_old_name','keep_old_name_restart') "
         "and r.resolved_at is not null order by r.resolved_at desc,r.id desc limit 1",
         (lead["id"],),
     ).fetchone() or {}
@@ -237,6 +239,39 @@ def _kept_name(conn, lead) -> tuple[str, str] | None:
     if not (kept and new) or kept.casefold() == new.casefold():
         return None
     return kept, new
+
+
+# Review code -> (lead column, Sheet column) for "Keep old location / case / date of birth".
+KEPT_VALUE_COLUMNS = {"location_changed": ("location", "location"),
+                      "case_changed": ("lead_type", "case"),
+                      "dob_changed": ("date_of_birth", "date_of_birth")}
+
+
+def _kept_values(conn, lead) -> dict[str, list[str]]:
+    """Sheet column -> [value on file, the Sheet value it replaces] after "Keep old <field>".
+
+    Owner, 2026-10-25: like the Name (`_kept_name`), sent only with that resolution's own update.
+    The latest resolved review of each field counts, and only while it was a "keep old" choice.
+    """
+    rows = conn.execute(
+        "select distinct on (r.code) r.code,r.resolution,r.details,l.location,l.lead_type,"
+        "l.date_of_birth from lead_reviews r join leads l on l.id=r.lead_id where r.lead_id=%s "
+        "and r.code=any(%s) and r.resolved_at is not null "
+        "order by r.code,r.resolved_at desc,r.id desc",
+        (lead["id"], list(KEPT_VALUE_COLUMNS)),
+    ).fetchall()
+    kept: dict[str, list[str]] = {}
+    for row in rows:
+        if row["resolution"] not in {"keep_old_value", "keep_old_value_restart"}:
+            continue
+        column, sheet_column = KEPT_VALUE_COLUMNS[row["code"]]
+        value = row[column]
+        text = value.strftime("%m/%d/%Y") if hasattr(value, "strftime") else " ".join(
+            str(value or "").split())
+        replaces = " ".join(str((row.get("details") or {}).get("new_value") or "").split())
+        if text and replaces and text.casefold() != replaces.casefold():
+            kept[sheet_column] = [text, replaces]
+    return kept
 
 
 def _needs_review_text(conn, lead) -> str:
@@ -378,6 +413,9 @@ def build_sheet_snapshot(
     if "name_kept" in pending and (kept := _kept_name(conn, lead)):
         # Direct mode writes it back into the Name cell (sheet_direct._restore_name); n8n ignores it.
         sheet["name"], sheet["name_replaces"] = kept
+    if "value_kept" in pending and (values := _kept_values(conn, lead)):
+        # Direct mode only (sheet_direct._restore_values), like the Name; n8n ignores the key.
+        sheet["kept"] = values
     # Lead Status always mirrors the dashboard column (client decision 2026-10-15), so a pause, a
     # resolved review or a board move shows in the Sheet too, and "Needs Review" never sticks.
     sheet["lead_status"] = sheet_lead_status(lead)

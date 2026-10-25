@@ -395,9 +395,11 @@ def _direct_tick(backend: SheetBackend, settings: Settings, counts: dict[str, in
         write_heartbeat(mode="direct", ok=False, error=f"write failed: {type(exc).__name__}")
         return counts
     counts["deferred"] += len(written.deferred_rows)
-    # Only a skipped Name holds a fingerprint back: a skipped Action cell (staff picked a new command
-    # while we emptied it) changes nothing in the profile.
-    not_written = written.deferred_rows | {n for n, key in written.skipped_cells if key == "name"}
+    # Only a skipped write-back (Name, or a kept Location / Case / Date Of Birth) holds a fingerprint
+    # back: a skipped Action cell (staff picked a new command while we emptied it) changes nothing in
+    # the profile.
+    not_written = written.deferred_rows | {
+        n for n, key in written.skipped_cells if key in sheet_direct.RESTORABLE}
     poll.save_baselines(not_written)
     # A Name we wrote back is not staff still editing the row: the last read's fingerprint follows
     # it, so another edit made meanwhile syncs on the next full read, not one later.

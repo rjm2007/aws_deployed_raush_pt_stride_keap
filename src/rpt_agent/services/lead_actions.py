@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -13,11 +13,16 @@ from ..config import get_settings
 from ..db import transaction
 from ..worker import format_phone, materialize_cadence
 from .lead_review import (
+    DETAIL_FIELDS,
+    FRONT_DESK_REASON,
+    KEEP_OLD_VALUE,
     close_for_phone_change,
     close_open_reviews,
     closed_for_good,
+    last_review_restart,
 )
-from .review import flag_lead_for_review, hand_over_number
+from .lead_status import record_status
+from .review import REPLACED_REASON, flag_lead_for_review, hand_over_number
 from .sheet_sync import enqueue_sheet_update
 
 TERMINAL_START_STATUSES = {
@@ -31,6 +36,12 @@ TERMINAL_START_STATUSES = {
 }
 RESTART_COOLDOWN_MINUTES = 10
 NUMBER_BLOCKED_REASON = "Number blocked: this number asked not to be contacted. Unblock it to start outreach."
+# Restart from the Google Sheet (direct mode, `sheet_rules`), owner 2026-10-25: the Sheet never
+# undoes a decision made on the dashboard. A lead in review is restarted from its review card; a
+# booked or closed lead is reopened on the dashboard. (n8n mode keeps the old rules.)
+RESTART_REVIEW_DETAIL = "This lead needs review. Resolve it on the dashboard; you can restart it from there."
+RESTART_BOOKED_DETAIL = "This lead is booked. Reopen it on the dashboard if needed."
+RESTART_CLOSED_DETAIL = "This lead is closed ({why}). Use the dashboard."
 
 
 @dataclass(frozen=True)
@@ -361,8 +372,8 @@ def _locked_lead(conn, practice_id: int, lead_id: UUID, phone: str) -> dict[str,
     if not normalized:
         raise LeadActionError(422, "invalid_phone", "Phone number is not valid")
     lead = conn.execute(
-        "select id,practice_id,status,cadence_state,call_opt_out,sms_opt_out,phone_e164 "
-        "from leads where id=%s and practice_id=%s for update",
+        "select id,practice_id,status,cadence_state,call_opt_out,sms_opt_out,phone_e164,"
+        "status_reason,needs_review from leads where id=%s and practice_id=%s for update",
         (lead_id, practice_id),
     ).fetchone()
     if not lead:
@@ -377,6 +388,52 @@ def _locked_lead(conn, practice_id: int, lead_id: UUID, phone: str) -> dict[str,
     return lead
 
 
+def _closed_by_decision(lead: dict[str, Any]) -> str | None:
+    """Why a lead was closed by someone's decision (staff words), or None.
+
+    Front desk, a newer row on the number, "not interested" (a call outcome, or staff moving the card
+    to Closed on the board). Booked, Do Not Contact and a wrong / changed number are refused with
+    their own reasons. A cadence that only ran out ("Closed, no response", booking link sent,
+    transferred) is not a decision: restarting it from the Sheet is how staff try the patient again
+    (2026-10-20).
+    """
+    reason = str(lead.get("status_reason") or "")
+    if reason == FRONT_DESK_REASON:
+        return "handled by front desk"
+    if reason == REPLACED_REASON:
+        return "a newer row has this phone number"
+    if lead["status"] == "declined":
+        return "closed on the dashboard" if reason == "closed from the board" else "not interested"
+    return None
+
+
+def _sheet_review_refusal(conn, lead: dict[str, Any]) -> LeadActionError | None:
+    """A Sheet Restart on a lead in review (owner, 2026-10-25): refused, restart it from the card.
+
+    Read from the database under the lead lock, not from the row: a cleared Outcome Status must
+    not let a Restart past a review (tester 2026-10-23). It no longer waits in Action. Checked
+    before the status rules, so a wrong-number review says "needs review", not "invalid phone".
+    """
+    lead_id = str(lead["id"])
+    open_review = lead.get("needs_review") or conn.execute(
+        "select 1 from lead_reviews where lead_id=%s and resolved_at is null limit 1", (lead_id,)
+    ).fetchone()
+    if open_review:
+        return LeadActionError(409, "restart_needs_review", RESTART_REVIEW_DETAIL, lead_id=lead_id)
+    return None
+
+
+def _sheet_closed_refusal(lead: dict[str, Any]) -> LeadActionError | None:
+    """A Sheet Restart on a booked lead or one closed by a decision (owner, 2026-10-25)."""
+    lead_id = str(lead["id"])
+    if lead["status"] == "booked":
+        return LeadActionError(409, "restart_booked", RESTART_BOOKED_DETAIL, lead_id=lead_id)
+    if why := _closed_by_decision(lead):
+        return LeadActionError(409, "restart_closed", RESTART_CLOSED_DETAIL.format(why=why),
+                               lead_id=lead_id, extra={"closed_reason": why})
+    return None
+
+
 def _restart_cadence(
     conn,
     *,
@@ -385,12 +442,15 @@ def _restart_cadence(
     lead_id: UUID,
     phone: str,
     lead_data: dict[str, Any] | None = None,
+    sheet_rules: bool = False,
 ) -> ActionExecution:
     lead = _locked_lead(conn, practice["id"], lead_id, phone)
     # A lead whose phone changed in the Sheet is never restarted on its old number (even if staff
     # put the old number back in the row, or the lead was Booked).
     if closed := closed_for_good(conn, lead):
         raise LeadActionError(409, "restart_not_allowed", closed, lead_id=str(lead_id))
+    if sheet_rules and (refusal := _sheet_review_refusal(conn, lead)):
+        raise refusal
     if lead["status"] in {"do_not_contact", "invalid_phone"}:
         raise LeadActionError(
             409,
@@ -399,8 +459,11 @@ def _restart_cadence(
             else "A Do Not Contact lead cannot be restarted",
             lead_id=str(lead_id),
         )
-    # Booked may be restarted: a mis-clicked Booked needs an undo, and marking
-    # Booked again is the undo for a mis-clicked restart.
+    # n8n mode only: Booked may be restarted there (a mis-clicked Booked needs an undo, and marking
+    # Booked again is the undo for a mis-clicked restart). The direct Sheet refuses a Restart on a
+    # booked, closed or in-review lead (owner, 2026-10-25): the dashboard is the place to undo.
+    if sheet_rules and (refusal := _sheet_closed_refusal(lead)):
+        raise refusal
     was_booked = lead["status"] == "booked"
     if lead["call_opt_out"] and lead["sms_opt_out"]:
         raise LeadActionError(
@@ -423,12 +486,16 @@ def _restart_cadence(
     # a new request ID, so idempotency cannot catch it and the patient is called
     # every minute or two. A real second restart this soon is not plausible.
     recent = conn.execute(
-        "select changed_at+make_interval(mins=>%s) as retry_at from lead_status_history "
+        "select changed_at as at from lead_status_history "
         "where lead_id=%s and source='n8n_sheet' and reason='cadence restarted from Google Sheets' "
         "and changed_at>now()-make_interval(mins=>%s) order by changed_at desc limit 1",
-        (RESTART_COOLDOWN_MINUTES, lead_id, RESTART_COOLDOWN_MINUTES),
+        (lead_id, RESTART_COOLDOWN_MINUTES),
     ).fetchone()
-    if recent:
+    last = recent["at"] if recent else None
+    if sheet_rules and (by_review := last_review_restart(conn, str(lead_id))):
+        # A restart chosen on the dashboard's review card counts too (10 minutes for everyone).
+        last = max(last, by_review) if last else by_review
+    if last:
         # retry_at: when a new Restart is accepted, so the Sheet can say when to pick it again
         # (owner, 2026-10-25: Action empties after each command, staff re-pick it).
         raise LeadActionError(
@@ -436,7 +503,7 @@ def _restart_cadence(
             "restart_too_soon",
             f"Cadence was already restarted in the last {RESTART_COOLDOWN_MINUTES} minutes",
             lead_id=str(lead_id),
-            extra={"retry_at": recent["retry_at"].isoformat()},
+            extra={"retry_at": (last + timedelta(minutes=RESTART_COOLDOWN_MINUTES)).isoformat()},
         )
     if lead_data:
         _update_lead_profile(conn, lead_id, lead_data)
@@ -603,8 +670,15 @@ def execute_lead_action(
     lead: dict[str, Any],
     require_new: bool = False,
     replaces_lead_id: UUID | None = None,
+    sheet_rules: bool = False,
 ) -> ActionExecution:
-    """Apply one signed n8n command with a durable, replayable response."""
+    """Apply one signed n8n command with a durable, replayable response.
+
+    `sheet_rules`: the direct Sheet's rules (owner, 2026-10-25; sheet_direct passes it): a Restart
+    on a lead in review, booked or closed by a decision is refused, and a restart chosen on the
+    dashboard's review card counts for the cooldown. The n8n endpoint leaves it off (n8n mode
+    unchanged).
+    """
     request_hash = _request_hash(
         action,
         lead_id,
@@ -671,6 +745,7 @@ def execute_lead_action(
                         lead_id=lead_id,
                         phone=str(lead.get("phone") or ""),
                         lead_data=lead,
+                        sheet_rules=sheet_rules,
                     )
                 elif action == "do_not_contact":
                     if lead_id is None:
@@ -736,8 +811,70 @@ def _same_name(left: Any, right: Any) -> bool:
     return " ".join(str(left or "").split()).casefold() == " ".join(str(right or "").split()).casefold()
 
 
+def _us_date(value: Any) -> str:
+    """A date as Sheet staff type it (MM/DD/YYYY, sheet_direct.normalize_dob reads it back)."""
+    return value.strftime("%m/%d/%Y") if hasattr(value, "strftime") else str(value or "")
+
+
+def _detail_changes(current: dict[str, Any], lead: dict[str, Any]) -> list[dict[str, Any]]:
+    """Location / case / date of birth that differ from the lead's (owner, 2026-10-25: reviewed).
+
+    A blank cell is no change (it never erased a value); a lead with no value yet just takes it.
+    """
+    changes = []
+    for code, (column, _, field) in DETAIL_FIELDS.items():
+        if column == "date_of_birth":
+            new, old = lead.get("date_of_birth"), current.get("date_of_birth")
+            if not new or not old or new == old:
+                continue
+            changes.append({"code": code, "column": column, "field": field,
+                            "old_value": _us_date(old), "new_value": _us_date(new),
+                            "new_raw": new.isoformat() if hasattr(new, "isoformat") else str(new)})
+            continue
+        incoming = lead.get("location") if column == "location" else (
+            lead.get("lead_type") or lead.get("title"))
+        new = " ".join(str(incoming or "").split())
+        old = " ".join(str(current.get(column) or "").split())
+        if not new or not old or _same_name(new, old):
+            continue
+        changes.append({"code": code, "column": column, "field": field,
+                        "old_value": old, "new_value": new})
+    return changes
+
+
+def _kept_value(conn, lead_id: str, code: str) -> str | None:
+    """The Sheet value staff last chose to keep the old one over ("Keep old ..."), until spent.
+
+    Like `leads.sheet_name_accepted` for the Name, without a new column: the resolution itself is
+    the record. Spent (`kept_spent`) once the row shows the value on file again (write-back landed,
+    or staff typed it back), so the same new value typed later opens a new review.
+    """
+    found = conn.execute(
+        "select details->>'new_value' as value from lead_reviews where lead_id=%s and code=%s "
+        "and resolution=any(%s) and not (details ? 'kept_spent') "
+        "order by resolved_at desc,id desc limit 1",
+        (lead_id, code, sorted(KEEP_OLD_VALUE)),
+    ).fetchone()
+    return found["value"] if found else None
+
+
+def spend_kept_values(conn, lead_id: str, codes: list[str] | None = None) -> None:
+    """The row shows the kept value again: a "keep old" no longer accepts the reviewed new value."""
+    conn.execute(
+        "update lead_reviews set details=details||'{\"kept_spent\":true}'::jsonb,updated_at=now() "
+        "where lead_id=%s and code=any(%s) and resolution=any(%s) and not (details ? 'kept_spent')",
+        (lead_id, codes or sorted(DETAIL_FIELDS), sorted(KEEP_OLD_VALUE)),
+    )
+
+
+EMAIL_CHANGED = "Email changed in Google Sheet"
+# Lead column -> the keys of the Sheet's lead data that carry it (_update_lead_profile).
+_PROFILE_KEYS = {"location": ("location",), "lead_type": ("title", "lead_type"),
+                 "date_of_birth": ("date_of_birth",)}
+
+
 def sync_sheet_lead(
-    *, request_id: UUID, lead_id: UUID, lead: dict[str, Any]
+    *, request_id: UUID, lead_id: UUID, lead: dict[str, Any], sheet_rules: bool = False,
 ) -> ActionExecution:
     """Update one linked Sheet lead; a changed name needs review, a changed phone closes it.
 
@@ -745,6 +882,11 @@ def sync_sheet_lead(
     what changed. Now the review records the old and new name, and staff choose: use the new
     name, keep the old one (that Sheet value is then accepted and never flags again), or close.
     A new phone number is a new lead: this one closes at once (owner, 2026-10-22).
+
+    `sheet_rules` (direct Sheet, owner 2026-10-25): Location, Case and Date Of Birth are reviewed
+    like the Name (old -> new, the lead keeps its value until staff choose), and a changed Email is
+    applied and noted in the lead's Activity. Before, all three and the Email were applied at once
+    without a word (n8n mode still does).
     """
     phone = format_phone(lead.get("phone"))
     if not phone:
@@ -758,7 +900,8 @@ def sync_sheet_lead(
         if not practice:
             return ActionExecution(503, {"detail": "Configured practice is not available"})
         current = conn.execute(
-            "select id,full_name,phone_e164,status,cadence_state,sheet_name_accepted from leads "
+            "select id,full_name,phone_e164,status,cadence_state,sheet_name_accepted,email,"
+            "date_of_birth,location,lead_type from leads "
             "where id=%s and practice_id=%s for update",
             (lead_id, practice["id"]),
         ).fetchone()
@@ -788,18 +931,61 @@ def sync_sheet_lead(
                 **base, "result": code, "code": code,
                 "detail": "Phone number changed; the lead is closed. Add the new number as a new row",
             })
-        if name_changed:
-            flagged = flag_lead_for_review(
-                conn, str(lead_id), "Name changed; needs review", code="name_changed",
-                source="sheet", details={"old_name": stored_name, "new_name": incoming_name},
-            )
-            if flagged:
-                code = "name_changed_needs_review"
-                return ActionExecution(409, {
-                    **base, "result": code, "code": code, "detail": "Name changed; needs review",
-                })
+        if not sheet_rules:  # n8n mode, as before: only the name is reviewed
+            if name_changed:
+                flagged = flag_lead_for_review(
+                    conn, str(lead_id), "Name changed; needs review", code="name_changed",
+                    source="sheet", details={"old_name": stored_name, "new_name": incoming_name},
+                )
+                if flagged:
+                    code = "name_changed_needs_review"
+                    return ActionExecution(409, {
+                        **base, "result": code, "code": code, "detail": "Name changed; needs review",
+                    })
+                # A finished lead (booked, closed) has no outreach left to protect: nothing to
+                # review, and the stored name stays as it was.
+            keep_name = name_changed or accepted
+            _update_lead_profile(conn, lead_id, {**lead, "full_name": None} if keep_name else lead)
+            return ActionExecution(200, {**base, "result": "profile_updated"})
+
+        held: dict[str, Any] = {}  # Sheet values the lead does not take (reviewed or kept)
+        flagged_codes: list[str] = []
+        if name_changed and flag_lead_for_review(
+            conn, str(lead_id), "Name changed; needs review", code="name_changed",
+            source="sheet", details={"old_name": stored_name, "new_name": incoming_name},
+        ):
+            flagged_codes.append("name_changed")
+        if name_changed or accepted:
             # A finished lead (booked, closed) has no outreach left to protect: nothing to review,
-            # and the stored name stays as it was.
-        keep_name = name_changed or accepted
-        _update_lead_profile(conn, lead_id, {**lead, "full_name": None} if keep_name else lead)
+            # and the stored name stays as it was. The same for the fields below.
+            held["full_name"] = None
+        changes = {change["code"]: change for change in _detail_changes(current, lead)}
+        back = [code for code in DETAIL_FIELDS if code not in changes]
+        if back:  # the row shows the value on file again: an earlier "keep old" is spent
+            spend_kept_values(conn, str(lead_id), back)
+        for code, change in changes.items():
+            # The lead keeps its value until staff choose (or for good on a finished lead).
+            held.update(dict.fromkeys(_PROFILE_KEYS[change["column"]]))
+            kept = _kept_value(conn, str(lead_id), code)
+            if kept and _same_name(kept, change["new_value"]):
+                continue  # staff already chose the old value over this one
+            details = {key: change[key] for key in ("field", "old_value", "new_value", "new_raw")
+                       if key in change}
+            if flag_lead_for_review(
+                conn, str(lead_id), f"{change['field'].capitalize()} changed; needs review",
+                code=code, source="sheet", details=details,
+            ):
+                flagged_codes.append(code)
+        new_email = str(lead.get("email") or "").strip().lower()
+        if new_email and new_email != str(current.get("email") or "").strip().lower():
+            # Applied at once (not identity), and said in the lead's Activity (owner, 2026-10-25).
+            record_status(conn, str(lead_id), current["status"], current["status"], "n8n_sheet",
+                          EMAIL_CHANGED)
+        _update_lead_profile(conn, lead_id, {**lead, **held})
+        if flagged_codes:
+            code = f"{flagged_codes[0]}_needs_review"
+            detail = ("Name" if flagged_codes[0] == "name_changed"
+                      else DETAIL_FIELDS[flagged_codes[0]][2].capitalize()) + " changed; needs review"
+            return ActionExecution(409, {**base, "result": code, "code": code, "detail": detail,
+                                         "review_codes": flagged_codes})
         return ActionExecution(200, {**base, "result": "profile_updated"})

@@ -189,12 +189,14 @@ def test_profile_edits_sync_and_a_name_change_goes_to_review(env):
     env.tick()
     lead_id = env.cell(number, "lead_id")
     env.sheet.set(number, "email", "new@example.test")
-    env.sheet.set(number, "case", "Pelvic")
+    env.sheet.set(number, "gender", "F")
     env.tick()
     assert env.lead(lead_id)["email"] == "asha@example.test"  # seen once: wait for it to hold
     env.tick()
     lead = env.lead(lead_id)
-    assert lead["email"] == "new@example.test" and lead["lead_type"] == "Pelvic"
+    # Email (and gender) apply at once (owner, 2026-10-25: the email change is in the Activity).
+    assert lead["email"] == "new@example.test" and lead["gender"] == "F"
+    assert lead["needs_review"] is False
     assert env.cell(number, "outcome_status") == "Cadence started"  # success writes nothing
     env.sheet.set(number, "name", "Asha Kumar")
     env.tick()
@@ -768,15 +770,18 @@ def test_a_stride_cancel_does_not_book_again_and_booked_picked_again_does(env):
     assert env.cell(number, "outcome_status") == "Booked"
 
 
-def test_a_restart_picked_on_a_booked_row_runs(env):
-    # The backend allows it (a mis-clicked Booked needs an undo); the 2026-10-23 rules turned it down
-    # only because a "Restart cadence" left in Action could not be told from a new one.
+def test_a_restart_picked_on_a_booked_row_is_refused(env):
+    # Owner 2026-10-25: the Sheet never undoes a booking (n8n mode still allows it); the dashboard
+    # is the place to reopen a booked lead. Action empties as usual.
     number = env.start_row()
     env.tick()
     lead_id = _command(env, number, "Booked")
     _command(env, number, "Restart cadence")
-    assert env.cell(number, "outcome_status") == "Cadence restarted"
-    assert env.lead(lead_id)["status"] != "booked"
+    assert env.cell(number, "outcome_status") == (
+        "Error: this lead is booked. Reopen it on the dashboard if needed.")
+    assert env.cell(number, "lead_status") == "Booked"
+    assert env.lead(lead_id)["status"] == "booked"
+    assert _requests(env, lead_id, "restart_cadence") == 0
 
 
 def test_a_closed_lead_refuses_a_restart_and_the_number_stays_with_the_newer_row(env):
@@ -790,8 +795,11 @@ def test_a_closed_lead_refuses_a_restart_and_the_number_stays_with_the_newer_row
     env.tick()
     assert env.cell(second, "outcome_status") == "Cadence started"
     assert env.cell(first, "outcome_status") == "Closed: a newer row has this phone number"
+    env.db.execute("update lead_status_history set changed_at=changed_at-interval '11 minutes' "
+                   "where lead_id=%s", (env.cell(first, "lead_id"),))  # not the cooldown
     _command(env, first, "Restart cadence")
-    assert env.cell(first, "outcome_status").startswith("Error: ")
+    assert env.cell(first, "outcome_status") == (
+        "Error: this lead is closed (a newer row has this phone number). Use the dashboard.")
     assert env.lead(env.cell(second, "lead_id"))["status"] == "in_progress"
 
 

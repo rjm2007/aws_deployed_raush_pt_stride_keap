@@ -8,7 +8,7 @@ a choice (or the lead stays paused), and both are recorded.
 Needs TEST_DATABASE_URL (a disposable local database with the migrations applied).
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -25,7 +25,7 @@ from rpt_agent.services import sheet_direct
 from rpt_agent.services.delivery import apply_twilio_message_status
 from rpt_agent.services.google_sheet import parse_grid
 from rpt_agent.services.lead_status import report_lead_status
-from rpt_agent.services.sheet_direct import REVIEW_FIRST, profile_hash
+from rpt_agent.services.sheet_direct import profile_hash
 from rpt_agent.worker import CLAIM_SQL, run_safety_checks
 
 pytestmark = pytest.mark.integration
@@ -147,7 +147,8 @@ def test_name_change_card_shows_old_and_new_and_use_new_name_resumes_fully(revie
     assert {"label": "Old name", "value": "Asha Rao"} in card["review"]["proof"]
     assert {"label": "New name", "value": "Asha Kumar"} in card["review"]["proof"]
     choices = [option["choice"] for option in card["options"]]
-    assert choices == ["use_new_name", "keep_old_name", "different_person", "front_desk"]
+    assert choices == ["use_new_name", "keep_old_name", "use_new_name_restart", "keep_old_name_restart",
+                       "different_person", "front_desk"]
     use_new = next(option for option in card["options"] if option["choice"] == "use_new_name")
     assert "Name becomes Asha Kumar" in use_new["confirm"] and "Next step: Day" in use_new["confirm"]
 
@@ -368,7 +369,8 @@ def test_landline_text_failure_offers_calls_only_and_texts_never_go_out_again(re
     assert card["review"]["landline"] is True
     assert "can't receive texts (likely a landline)" in card["review"]["reason"]
     choices = [option["choice"] for option in card["options"]]
-    assert choices == ["calls_only", "front_desk"]  # trying again cannot work on a landline
+    # Trying again cannot work on a landline.
+    assert choices == ["calls_only", "restart_cadence", "front_desk"]
     calls_only = card["options"][0]
     assert calls_only["confirm"].startswith("Continue with calls only for Asha Rao. Texts off. Next step: Day")
     assert "call" in calls_only["next_step"]
@@ -428,7 +430,8 @@ def test_temporary_text_failure_can_be_tried_again(review_env):
     _, lead_id = _started(senv)
     failed_id = _fail_day0_text(senv, lead_id, "30003")
     card = _get(f"review/{lead_id}").json()
-    assert [o["choice"] for o in card["options"]] == ["calls_only", "retry_texts", "front_desk"]
+    assert [o["choice"] for o in card["options"]] == ["calls_only", "retry_texts", "restart_cadence",
+                                                      "front_desk"]
     assert "switched off" in card["review"]["reason"]
     assert _post(f"review/{lead_id}/resolve", {"choice": "retry_texts"}).status_code == 200
     retry = senv.db.execute(
@@ -462,7 +465,8 @@ def test_wrong_person_number_is_right_continues(review_env):
     card = _get(f"review/{lead_id}").json()
     assert card["review"]["code"] == "wrong_person"
     assert "Bob's number" in card["review"]["reason"]
-    assert [o["choice"] for o in card["options"]] == ["number_ok", "wrong_number", "front_desk"]
+    assert [o["choice"] for o in card["options"]] == ["number_ok", "wrong_number", "restart_cadence",
+                                                      "front_desk"]
     senv.tick()
     assert senv.cell(number, "outcome_status") == "Needs review: wrong number"
     assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 200
@@ -511,31 +515,44 @@ def test_do_not_contact_typed_on_a_flagged_row_blocks_the_number_and_closes_the_
     assert senv.cell(number, "action") == ""
 
 
-def test_restart_typed_on_a_flagged_row_waits_for_the_review_then_runs(review_env):
+REVIEW_REFUSED = ("Error: this lead needs review. Resolve it on the dashboard; you can restart it "
+                  "from there.")
+
+
+def _refusals(senv, lead_id, code):
+    return senv.db.execute(
+        "select count(*) as n from lead_action_requests where lead_id::text=%s "
+        "and action='restart_cadence' and status='failed' "
+        "and response_body#>>'{body,code}'=%s", (lead_id, code)).fetchone()["n"]
+
+
+def test_restart_typed_on_a_flagged_row_is_refused_at_once_and_emptied(review_env):
+    # Owner 2026-10-25: no more waiting in Action. The Restart is refused with a reason, Action
+    # empties, the review stays open, and the restart is chosen on the review card instead.
     senv = review_env
     number, lead_id = _started(senv)
     _wrong_person(senv, lead_id)
     senv.tick()
     senv.sheet.set(number, "action", "Restart cadence")
     senv.tick()
-    senv.tick()
-    assert senv.cell(number, "outcome_status") == (
-        "Needs review: wrong number; resolve it on the dashboard first, then the restart runs")
-    assert senv.cell(number, "action") == "Restart cadence"
+    assert senv.cell(number, "outcome_status") == REVIEW_REFUSED
+    assert senv.cell(number, "action") == "" and senv.cell(number, "action_request_id") == ""
     lead = senv.lead(lead_id)
     assert (lead["status"], lead["needs_review"]) == ("invalid_phone", True)  # no bypass
+    assert _refusals(senv, lead_id, "restart_needs_review") == 1
+    assert _restarts(senv, lead_id) == 0
+    # Resolved on the dashboard: nothing runs by itself (nothing is left in Action).
     assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 200
-    senv.tick()  # the resolution is written; the typed Restart is kept
+    for _ in range(3):
+        senv.tick()
     assert senv.cell(number, "outcome_status") == "Resolved: number confirmed"
-    assert senv.cell(number, "action") == "Restart cadence"
-    senv.tick()  # and runs
-    assert senv.cell(number, "outcome_status") == "Cadence restarted"
-    restarts = senv.db.execute(
-        "select count(*) as n from lead_action_requests where lead_id::text=%s "
-        "and action='restart_cadence' and status='completed'", (lead_id,)).fetchone()["n"]
-    assert restarts == 1
+    assert _restarts(senv, lead_id) == 0
+    # Picked again now the lead is out of review: it runs.
+    _no_cooldown(senv, lead_id)
+    senv.sheet.set(number, "action", "Restart cadence")
     senv.tick()
-    assert senv.cell(number, "outcome_status") == "Cadence restarted"  # once
+    assert senv.cell(number, "outcome_status") == "Cadence restarted"
+    assert _restarts(senv, lead_id) == 1 and senv.cell(number, "action") == ""
 
 
 def test_a_booked_typed_before_the_review_is_resolved_still_runs(review_env, monkeypatch):
@@ -566,90 +583,14 @@ def test_a_booked_typed_before_the_review_is_resolved_still_runs(review_env, mon
 def _no_cooldown(senv, lead_id):
     senv.db.execute("update lead_status_history set changed_at=changed_at-interval '11 minutes' "
                     "where lead_id=%s", (lead_id,))
+    senv.db.execute("update lead_reviews set resolved_at=resolved_at-interval '11 minutes' "
+                    "where lead_id=%s and resolved_at is not null", (lead_id,))
 
 
 def _restarts(senv, lead_id):
     return senv.db.execute(
         "select count(*) as n from lead_action_requests where lead_id::text=%s "
         "and action='restart_cadence' and status='completed'", (lead_id,)).fetchone()["n"]
-
-
-def test_a_restart_runs_after_each_review_only_when_staff_pick_it_again(review_env):
-    # Tester 2026-10-22: a Restart typed on the next review was lost. Owner 2026-10-25: the Restart
-    # that ran is emptied from Action, so the next review neither parks it nor runs it after the
-    # resolution; picking Restart cadence again waits for that review and then runs.
-    senv = review_env
-    number, lead_id = _started(senv)
-    _wrong_person(senv, lead_id)
-    senv.tick()
-    senv.sheet.set(number, "action", "Restart cadence")
-    senv.tick()
-    assert senv.cell(number, "outcome_status").endswith(REVIEW_FIRST)
-    assert senv.cell(number, "action") == "Restart cadence"  # kept while it waits
-    assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 200
-    _no_cooldown(senv, lead_id)
-    senv.tick()
-    senv.tick()
-    assert senv.cell(number, "outcome_status") == "Cadence restarted"
-    assert senv.cell(number, "action") == "" and _restarts(senv, lead_id) == 1
-    # The next review: nothing in Action, nothing waits.
-    _wrong_person(senv, lead_id)
-    senv.tick()
-    assert senv.cell(number, "outcome_status") == "Needs review: wrong number"
-    assert _post(f"review/{lead_id}/resolve", {"choice": "number_ok"}).status_code == 200
-    _no_cooldown(senv, lead_id)
-    for _ in range(3):
-        senv.tick()
-    assert senv.cell(number, "outcome_status") == "Resolved: number confirmed"
-    assert _restarts(senv, lead_id) == 1
-    # Staff restart again: pick it again.
-    senv.sheet.set(number, "action", "Restart cadence")
-    senv.tick()
-    assert senv.cell(number, "outcome_status") == "Cadence restarted"
-    assert _restarts(senv, lead_id) == 2 and senv.cell(number, "action") == ""
-    senv.tick()
-    assert _restarts(senv, lead_id) == 2
-
-
-@pytest.mark.parametrize("choice", ["front_desk", "wrong_number"])
-def test_a_waiting_restart_is_dropped_when_the_review_closes_the_lead(review_env, choice):
-    senv = review_env
-    number, lead_id = _started(senv)
-    _wrong_person(senv, lead_id)
-    senv.tick()
-    senv.sheet.set(number, "action", "Restart cadence")
-    senv.tick()
-    assert _post(f"review/{lead_id}/resolve", {"choice": choice}).status_code == 200
-    for _ in range(3):
-        senv.tick()
-    words = {"front_desk": "Closed: handled by front desk", "wrong_number": "Closed: wrong number"}
-    assert senv.cell(number, "outcome_status") == (
-        words[choice] + "; the Restart in Action was not run")
-    # Dropped: Action empties (2026-10-25), so it can never run later.
-    assert senv.cell(number, "action") == ""
-    assert senv.lead(lead_id)["cadence_state"] == "terminated"
-    assert _restarts(senv, lead_id) == 0
-    # A later system text over the row does not set it off either.
-    senv.sheet.set(number, "outcome_status", "Closed: a newer row has this phone number")
-    senv.tick()
-    senv.tick()
-    assert _restarts(senv, lead_id) == 0
-    assert not any(e["status"] == "planned" for e in _events(senv, lead_id))
-
-
-def test_a_waiting_restart_is_dropped_when_the_board_books_the_lead(review_env):
-    senv = review_env
-    number, lead_id = _started(senv)
-    _wrong_person(senv, lead_id)
-    senv.tick()
-    senv.sheet.set(number, "action", "Restart cadence")
-    senv.tick()
-    assert _post(f"leads/{lead_id}/stage", {"stage": "booked"}).status_code == 200
-    senv.tick()
-    senv.tick()
-    assert (senv.cell(number, "outcome_status"), senv.cell(number, "action")) == (
-        "Booked", "")  # dropped, and Action emptied (never "Booked" written into it)
-    assert senv.lead(lead_id)["status"] == "booked" and _restarts(senv, lead_id) == 0
 
 
 def _name_review(senv):
@@ -668,49 +609,39 @@ def _review_still_open(senv, lead_id):
     assert review["resolved_at"] is None
 
 
-def test_clearing_outcome_status_on_a_row_in_review_keeps_the_restart_waiting(review_env):
-    # Tester 2026-10-23: staff cleared Outcome Status next to a waiting Restart; it ran at once,
-    # closed the name review as "restarted" by Google Sheet and accepted the new name.
+def test_a_restart_with_outcome_status_cleared_is_still_refused_on_a_lead_in_review(review_env):
+    # Tester 2026-10-23: staff cleared Outcome Status next to a Restart on a row in review; it ran at
+    # once, closed the name review as "restarted" by Google Sheet and accepted the new name. The
+    # database decides, not the row.
     senv = review_env
     number, lead_id = _name_review(senv)
     senv.sheet.set(number, "action", "Restart cadence")
-    senv.tick()
-    assert senv.cell(number, "outcome_status").endswith(REVIEW_FIRST)
     senv.sheet.set(number, "outcome_status", "")
     senv.tick()
-    senv.tick()
-    assert senv.cell(number, "outcome_status") == "Needs review: name changed" + REVIEW_FIRST
+    assert senv.cell(number, "outcome_status") == REVIEW_REFUSED
+    assert senv.cell(number, "action") == ""
     _review_still_open(senv, lead_id)
     assert _restarts(senv, lead_id) == 0
-    assert _post(f"review/{lead_id}/resolve", {"choice": "keep_old_name"}).status_code == 200
-    _no_cooldown(senv, lead_id)
-    for _ in range(3):
-        senv.tick()
-    assert senv.cell(number, "outcome_status") == "Cadence restarted"
-    assert _restarts(senv, lead_id) == 1
 
 
-def test_a_restart_picked_again_on_a_row_in_review_waits_then_runs_once(review_env):
+def test_a_restart_left_waiting_by_the_old_rules_is_emptied_never_run(review_env):
+    # One-time, first poll after the 2026-10-25 change: a row still holding a parked Restart (the
+    # old "...then the restart runs" words) is emptied with the refusal text and never run.
     senv = review_env
-    number, lead_id = _started(senv)
+    number, lead_id = _name_review(senv)
     senv.sheet.set(number, "action", "Restart cadence")
-    senv.tick()
-    assert _restarts(senv, lead_id) == 1 and senv.cell(number, "action") == ""
-    senv.sheet.set(number, "name", "Asha Kumar")
-    senv.tick()
-    senv.tick()
-    assert senv.cell(number, "outcome_status") == "Needs review: name changed"
-    senv.sheet.set(number, "action", "Restart cadence")  # staff want a Restart again
-    senv.tick()
-    senv.tick()
-    assert senv.cell(number, "outcome_status") == "Needs review: name changed" + REVIEW_FIRST
+    senv.sheet.set(number, "outcome_status", "Needs review: name changed; resolve it on the "
+                                             "dashboard first, then the restart runs")
+    senv.tick(full=False)  # a narrow poll loads it
+    assert senv.cell(number, "outcome_status") == REVIEW_REFUSED
+    assert senv.cell(number, "action") == ""
     _review_still_open(senv, lead_id)
-    assert _restarts(senv, lead_id) == 1
-    assert _post(f"review/{lead_id}/resolve", {"choice": "keep_old_name"}).status_code == 200
-    _no_cooldown(senv, lead_id)
-    for _ in range(3):
+    for _ in range(2):
         senv.tick()
-    assert _restarts(senv, lead_id) == 2 and senv.cell(number, "action") == ""
+    assert _restarts(senv, lead_id) == 0 and senv.cell(number, "action") == ""
+    titles = [entry["title"] for entry in _get(f"leads/{lead_id}").json()["activity"]]
+    assert ("Restart cadence refused: this lead needs review. Resolve it on the dashboard; you can "
+            "restart it from there.") in titles
 
 
 def test_booked_cleared_on_a_row_in_review_still_runs(review_env):
@@ -723,27 +654,141 @@ def test_booked_cleared_on_a_row_in_review_still_runs(review_env):
     assert senv.cell(number, "outcome_status") == "Booked"
 
 
-def test_a_waiting_restart_is_dropped_when_the_phone_changes(review_env):
-    # The phone change closes the lead: the Restart is dropped and Action empties, so it never runs
-    # (and never shows an error) on a later poll.
+# --- restart from the review card (owner, 2026-10-25) ---------------------------------------------
+
+
+@pytest.mark.parametrize(("choice", "name", "sheet_name", "status"), [
+    ("use_new_name_restart", "Asha Kumar", "Asha Kumar", "Resolved: new name used; cadence restarted"),
+    ("keep_old_name_restart", "Asha Rao", "Asha Rao", "Resolved: old name kept; cadence restarted"),
+])
+def test_a_name_review_can_restart_from_day_0(review_env, choice, name, sheet_name, status):
+    senv = review_env
+    number, lead_id = _name_review(senv)
+    old_events = {e["id"] for e in _events(senv, lead_id)}
+    card = _get(f"review/{lead_id}").json()
+    assert [o["choice"] for o in card["options"]] == [
+        "use_new_name", "keep_old_name", "use_new_name_restart", "keep_old_name_restart",
+        "different_person", "front_desk"]
+    option = next(o for o in card["options"] if o["choice"] == choice)
+    assert option["label"].endswith("& restart from Day 0")
+    assert "new cadence starts from Day 0" in option["effect"]
+    assert option["next_step"] == "Next step: the Day 0 call, within calling hours."
+    response = _post(f"review/{lead_id}/resolve", {"choice": choice})
+    assert response.status_code == 200, response.text
+    lead = senv.lead(lead_id)
+    assert (lead["full_name"], lead["needs_review"], lead["cadence_state"]) == (name, False, "active")
+    events = _events(senv, lead_id)
+    assert events and all(e["status"] == "planned" for e in events)
+    assert not old_events & {e["id"] for e in events}  # a fresh Day 0 run
+    [review] = _reviews(senv, lead_id)
+    assert (review["resolution"], review["resolved_by_name"]) == (choice, "Emma")
+    senv.tick(full=False)
+    assert senv.cell(number, "outcome_status") == status
+    assert senv.cell(number, "name") == sheet_name  # keep old name: written back
+    for _ in range(2):
+        senv.tick()
+    assert senv.lead(lead_id)["needs_review"] is False and len(_reviews(senv, lead_id)) == 1
+    titles = [entry["title"] for entry in _get(f"leads/{lead_id}").json()["activity"]]
+    assert f"Resolved by Emma: {option['label']}." in titles
+
+
+@pytest.mark.parametrize("group", ["text", "call", "technical", "other"])
+def test_text_call_technical_and_other_reviews_can_restart_from_day_0(review_env, group):
     senv = review_env
     number, lead_id = _started(senv)
+    if group == "text":
+        _fail_day0_text(senv, lead_id, "30003")
+    elif group == "call":
+        _wrong_person(senv, lead_id)
+    else:
+        code = "dispatch_failed" if group == "technical" else "other"
+        senv.db.execute("update leads set needs_review=true,review_reason='Patient asked a question',"
+                        "status='needs_attention',cadence_state='paused' where id=%s", (lead_id,))
+        senv.db.execute("update lead_reviews set code=%s where lead_id=%s and resolved_at is null",
+                        (code, lead_id))
+    card = _get(f"review/{lead_id}").json()
+    assert card["review"]["group"] == group
+    choices = [o["choice"] for o in card["options"]]
+    assert "restart_cadence" in choices and choices[-1] == "front_desk"
+    senv.db.execute("update outreach_events set status='delivered' where lead_id=%s "
+                    "and status in ('attempted','in_flight')", (lead_id,))
+    response = _post(f"review/{lead_id}/resolve", {"choice": "restart_cadence"})
+    assert response.status_code == 200, response.text
+    lead = senv.lead(lead_id)
+    assert (lead["needs_review"], lead["cadence_state"]) == (False, "active")
+    assert any(e["status"] == "planned" and e["day_offset"] == 0 for e in _events(senv, lead_id))
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == "Cadence restarted"
+
+
+def test_a_restart_choice_respects_the_cooldown_and_says_why(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "action", "Restart cadence")
+    senv.tick()
+    assert _restarts(senv, lead_id) == 1
     _wrong_person(senv, lead_id)
+    senv.db.execute("update outreach_events set status='delivered' where lead_id=%s "
+                    "and status in ('attempted','in_flight')", (lead_id,))
+    refused = _post(f"review/{lead_id}/resolve", {"choice": "restart_cadence"})
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == ("The cadence was already restarted in the last 10 minutes. "
+                                        "Try the restart again later.")
+    _review_still_open_any(senv, lead_id)
+    _no_cooldown(senv, lead_id)
+    assert _post(f"review/{lead_id}/resolve", {"choice": "restart_cadence"}).status_code == 200
+    # And the other way round: a Sheet Restart right after the card's restart is refused.
     senv.tick()
     senv.sheet.set(number, "action", "Restart cadence")
     senv.tick()
-    assert senv.cell(number, "outcome_status").endswith(REVIEW_FIRST)
-    senv.sheet.set(number, "phone", _phone())
+    assert senv.cell(number, "outcome_status").startswith(
+        "Error: restarted less than 10 minutes ago. Pick Restart cadence again after ")
+    assert _restarts(senv, lead_id) == 1
+
+
+def _review_still_open_any(senv, lead_id):
+    assert senv.lead(lead_id)["needs_review"] is True
+    assert any(r["resolved_at"] is None for r in _reviews(senv, lead_id))
+
+
+def test_no_restart_is_offered_while_another_review_is_open(review_env):
+    # A restart settles every open review at once: the second one would never be decided.
+    senv = review_env
+    number, lead_id = _started(senv)
+    _fail_day0_text(senv, lead_id, "30003")
+    senv.sheet.set(number, "name", "Asha Kumar")
     senv.tick()
+    senv.tick()
+    card = _get(f"review/{lead_id}").json()
+    assert "restart_cadence" not in [o["choice"] for o in card["options"]]
+    refused = _post(f"review/{lead_id}/resolve", {"choice": "restart_cadence"})
+    assert refused.status_code == 409 and "another open review" in refused.json()["detail"]
+    assert _post(f"review/{lead_id}/resolve", {"choice": "retry_texts"}).status_code == 200
+    card = _get(f"review/{lead_id}").json()
+    assert "use_new_name_restart" in [o["choice"] for o in card["options"]]  # the last one
+
+
+# --- Sheet Restart guardrails: booked, closed (owner, 2026-10-25) ----------------------------------
+
+
+def test_a_sheet_restart_on_a_front_desk_lead_is_refused(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    _fail_day0_text(senv, lead_id, "30007")
+    assert _post(f"review/{lead_id}/resolve", {"choice": "front_desk"}).status_code == 200
+    senv.tick()
+    _no_cooldown(senv, lead_id)
+    senv.sheet.set(number, "action", "Restart cadence")
     senv.tick()
     assert senv.cell(number, "outcome_status") == (
-        "Phone changed: add a new row; the Restart in Action was not run")
+        "Error: this lead is closed (handled by front desk). Use the dashboard.")
     assert senv.cell(number, "action") == ""
-    for _ in range(2):
-        senv.tick()
-    assert senv.cell(number, "outcome_status") == (
-        "Phone changed: add a new row; the Restart in Action was not run")
+    lead = senv.lead(lead_id)
+    assert (lead["status"], lead["cadence_state"]) == ("closed_no_response", "terminated")
     assert _restarts(senv, lead_id) == 0
+    titles = [entry["title"] for entry in _get(f"leads/{lead_id}").json()["activity"]]
+    assert ("Restart cadence refused: this lead is closed (handled by front desk). Use the "
+            "dashboard.") in titles
 
 
 def test_wrong_number_close(review_env):
@@ -775,7 +820,7 @@ def test_unconfirmed_dispatch_continue_skips_that_step_only(review_env):
     assert (review["code"], review["outreach_event_id"]) == ("dispatch_unconfirmed", stuck["id"])
     card = _get(f"review/{lead_id}").json()
     assert card["review"]["group"] == "technical"
-    assert [o["choice"] for o in card["options"]] == ["continue", "front_desk"]
+    assert [o["choice"] for o in card["options"]] == ["continue", "restart_cadence", "front_desk"]
     assert _post(f"review/{lead_id}/resolve", {"choice": "continue"}).status_code == 200
     events = {e["id"]: e for e in _events(senv, lead_id)}
     assert events[stuck["id"]]["status"] == "unknown"  # never sent twice
@@ -885,7 +930,7 @@ def test_migration_is_rerunnable_and_backfills_old_flags_with_a_code(review_env)
     assert (review["code"], review["source"], review["details"]["error_code"]) == ("sms_failed", "legacy", "30006")
     card = _get(f"review/{lead_id}").json()
     assert card["review"]["landline"] is True
-    assert [o["choice"] for o in card["options"]] == ["calls_only", "front_desk"]
+    assert [o["choice"] for o in card["options"]] == ["calls_only", "restart_cadence", "front_desk"]
 
 
 def test_an_old_free_text_reason_falls_back_to_continue_or_front_desk(review_env):
@@ -895,7 +940,7 @@ def test_an_old_free_text_reason_falls_back_to_continue_or_front_desk(review_env
                    "status='needs_attention',cadence_state='paused' where id=%s", (lead_id,))
     card = _get(f"review/{lead_id}").json()
     assert card["review"]["group"] == "other"
-    assert [o["choice"] for o in card["options"]] == ["continue", "front_desk"]
+    assert [o["choice"] for o in card["options"]] == ["continue", "restart_cadence", "front_desk"]
     assert _post(f"review/{lead_id}/resolve", {"choice": "continue"}).status_code == 200
     assert senv.lead(lead_id)["status"] == "in_progress"
 
@@ -1108,3 +1153,196 @@ def test_a_lead_replaced_by_a_newer_row_on_the_same_phone_says_so_in_the_sheet(e
     assert env.cell(first, "outcome_status") == "Closed: a newer row has this phone number"
     assert env.cell(first, "lead_status") == "Closed"
     assert env.cell(second, "outcome_status") == "Cadence started"
+
+
+# --- location, case and date of birth edited in the Sheet (owner, 2026-10-25) --------------------
+
+# Sheet column, new cell text, lead column, value on file, value after "use new", review code,
+# field words, the old value as the Sheet shows it after "keep old" (dates: MM/DD/YYYY).
+DETAIL_EDITS = [
+    ("location", "Laguna Niguel", "location", "Dana Point", "Laguna Niguel", "location_changed",
+     "location", "Dana Point"),
+    ("case", "Pelvic", "lead_type", "Ortho", "Pelvic", "case_changed", "case", "Ortho"),
+    ("date_of_birth", "02/03/1991", "date_of_birth", date(1990, 1, 16),
+     date(1991, 2, 3), "dob_changed", "date of birth", "01/16/1990"),
+]
+
+
+def _detail_review(senv, column, new):
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, column, new)
+    senv.tick()
+    senv.tick()
+    return number, lead_id
+
+
+@pytest.mark.parametrize(("column", "new", "lead_column", "old_value", "new_value", "code", "field",
+                          "shown"), DETAIL_EDITS)
+def test_a_location_case_or_birthday_edit_goes_to_review_and_use_new_applies_it(
+        review_env, column, new, lead_column, old_value, new_value, code, field, shown):
+    senv = review_env
+    number, lead_id = _detail_review(senv, column, new)
+    lead = senv.lead(lead_id)
+    assert (lead["needs_review"], lead["status"], lead[lead_column]) == (True, "needs_attention", old_value)
+    assert senv.cell(number, "outcome_status") == f"Needs review: {field} changed"
+    assert senv.cell(number, "lead_status") == "Needs Review"
+    [review] = _reviews(senv, lead_id)
+    assert (review["code"], review["source"]) == (code, "sheet")
+    assert review["details"]["old_value"] == shown and review["details"]["field"] == field
+    card = _get(f"review/{lead_id}").json()
+    assert card["review"]["group"] == "details"
+    assert {"label": f"Old {field}", "value": shown} in card["review"]["proof"]
+    assert [o["label"] for o in card["options"]] == [
+        f"Use new {field} & continue", f"Keep old {field} & continue",
+        f"Use new {field} & restart from Day 0", f"Keep old {field} & restart from Day 0",
+        "Front desk will handle"]
+    assert _post(f"review/{lead_id}/resolve", {"choice": "use_new_value"}).status_code == 200
+    lead = senv.lead(lead_id)
+    assert (lead["needs_review"], lead["cadence_state"], lead[lead_column]) == (False, "active", new_value)
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == f"Resolved: new {field} used"
+    assert senv.cell(number, column) == new  # the Sheet keeps what staff typed
+    for _ in range(2):
+        senv.tick()
+    assert senv.lead(lead_id)["needs_review"] is False and len(_reviews(senv, lead_id)) == 1
+
+
+@pytest.mark.parametrize(("column", "new", "lead_column", "old_value", "new_value", "code", "field",
+                          "shown"), DETAIL_EDITS)
+def test_keep_old_writes_the_old_value_back_without_a_new_review(
+        review_env, monkeypatch, column, new, lead_column, old_value, new_value, code, field, shown):
+    senv = review_env
+    number, lead_id = _detail_review(senv, column, new)
+    assert _post(f"review/{lead_id}/resolve", {"choice": "keep_old_value"}).status_code == 200
+    senv.tick(full=False)
+    assert senv.cell(number, column) == shown  # written back, as for "keep old name"
+    assert senv.cell(number, "outcome_status") == f"Resolved: old {field} kept"
+    state = senv.db.execute("select profile_hash from sheet_row_state where lead_id=%s",
+                            (lead_id,)).fetchone()
+    assert state["profile_hash"] == profile_hash(parse_grid(senv.sheet.read_values(), 2).rows[0])
+    calls = []
+    real = sheet_direct.sync_sheet_lead
+    monkeypatch.setattr(sheet_direct, "sync_sheet_lead", lambda **kw: calls.append(kw) or real(**kw))
+    for _ in range(3):
+        senv.tick()
+    assert calls == []  # in sync: no loop
+    lead = senv.lead(lead_id)
+    assert (lead["needs_review"], lead[lead_column]) == (False, old_value)
+    # The same new value typed again later is a new change: reviewed again.
+    monkeypatch.undo()
+    senv.sheet.set(number, column, new)
+    senv.tick()
+    senv.tick()
+    assert senv.lead(lead_id)["needs_review"] is True and len(_reviews(senv, lead_id)) == 2
+
+
+def test_keep_old_is_remembered_when_the_write_back_is_skipped(review_env):
+    # Staff type a third value between our read and our write: theirs stays, and is reviewed;
+    # the value staff already turned down is not.
+    senv = review_env
+    number, lead_id = _detail_review(senv, "location", "Laguna Niguel")
+    assert _post(f"review/{lead_id}/resolve", {"choice": "keep_old_value"}).status_code == 200
+    senv.sheet.before_write = lambda: senv.sheet.set(number, "location", "Mission Viejo")
+    senv.tick(full=False)
+    senv.sheet.before_write = None
+    assert senv.cell(number, "location") == "Mission Viejo"
+    senv.tick()
+    senv.tick()
+    [_, second] = _reviews(senv, lead_id)
+    assert second["details"]["new_value"] == "Mission Viejo" and second["resolved_at"] is None
+    assert senv.lead(lead_id)["location"] == "Dana Point"
+
+
+def test_keep_old_location_and_restart_from_day_0(review_env):
+    senv = review_env
+    number, lead_id = _detail_review(senv, "location", "Laguna Niguel")
+    old_events = {e["id"] for e in _events(senv, lead_id)}
+    response = _post(f"review/{lead_id}/resolve", {"choice": "keep_old_value_restart"})
+    assert response.status_code == 200, response.text
+    lead = senv.lead(lead_id)
+    assert (lead["location"], lead["needs_review"], lead["cadence_state"]) == ("Dana Point", False, "active")
+    assert not old_events & {e["id"] for e in _events(senv, lead_id) if e["status"] == "planned"}
+    senv.tick(full=False)
+    assert senv.cell(number, "location") == "Dana Point"
+    assert senv.cell(number, "outcome_status") == "Resolved: old location kept; cadence restarted"
+    titles = [entry["title"] for entry in _get(f"leads/{lead_id}").json()["activity"]]
+    assert "Resolved by Emma: Keep old location & restart from Day 0." in titles
+    assert "Flagged: Location changed in the Sheet" in titles
+
+
+def test_name_and_location_changed_together_are_two_reviews_in_order(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "name", "Asha Kumar")
+    senv.sheet.set(number, "location", "Laguna Niguel")
+    senv.tick()
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == "Needs review: name changed"
+    assert [r["code"] for r in _reviews(senv, lead_id)] == ["name_changed", "location_changed"]
+    assert _post(f"review/{lead_id}/resolve", {"choice": "use_new_name"}).status_code == 200
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == "Needs review: location changed"
+    assert _post(f"review/{lead_id}/resolve", {"choice": "use_new_value"}).status_code == 200
+    lead = senv.lead(lead_id)
+    assert (lead["full_name"], lead["location"], lead["needs_review"]) == (
+        "Asha Kumar", "Laguna Niguel", False)
+
+
+def test_an_email_edit_applies_at_once_and_shows_in_the_activity(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "email", "asha.new@example.test")
+    senv.tick()
+    senv.tick()
+    lead = senv.lead(lead_id)
+    assert (lead["email"], lead["needs_review"]) == ("asha.new@example.test", False)
+    activity = _get(f"leads/{lead_id}").json()["activity"]
+    entry = next(e for e in activity if e["title"] == "Email changed in Google Sheet")
+    assert entry["actor_name"] == "Google Sheet"
+
+
+def test_a_finished_lead_keeps_its_details_and_is_not_reviewed(review_env):
+    # Like a name: a booked lead has no outreach left to protect, so nothing is flagged, and the
+    # value on file stays.
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "action", "Booked")
+    senv.tick()
+    senv.sheet.set(number, "case", "Pelvic")
+    senv.tick()
+    senv.tick()
+    lead = senv.lead(lead_id)
+    assert (lead["status"], lead["needs_review"], lead["lead_type"]) == ("booked", False, "Ortho")
+
+
+# --- every Sheet command in the lead's Activity (owner, 2026-10-25) --------------------------------
+
+
+def test_every_sheet_command_shows_in_the_activity_with_refusals_and_reasons(review_env):
+    senv = review_env
+    number, lead_id = _started(senv)
+    senv.sheet.set(number, "action", "Restart cadence")
+    senv.tick()
+    senv.sheet.set(number, "action", "Restart cadence")  # within 10 minutes: refused
+    senv.tick()
+    senv.sheet.set(number, "action", "Start cadence")  # linked row: refused by the Sheet worker
+    senv.tick()
+    senv.sheet.set(number, "action", "Booked")
+    senv.tick()
+    senv.sheet.set(number, "action", "Do Not Contact")
+    senv.tick()
+    activity = _get(f"leads/{lead_id}").json()["activity"]
+    sheet = [e for e in activity if e["actor_name"] == "Google Sheet"]
+    titles = [e["title"] for e in sheet]
+    assert "Start cadence: cadence started" in titles
+    assert "Restart cadence: cadence restarted" in titles
+    assert any(t.startswith("Restart cadence refused: restarted less than 10 minutes ago. Pick "
+                            "Restart cadence again after ") for t in titles)
+    assert ("Start cadence refused: this row already has a lead. Pick Restart cadence to start the "
+            "calls again.") in titles
+    assert "Booked: marked Booked" in titles
+    assert "Do Not Contact: applied" in titles
+    assert all(e["details"].get("source") == "Google Sheet" for e in sheet)
+    # The status lines of these commands are not shown twice.
+    assert not any(e["title"] == "Lead status updated" and e["actor_name"] == "Google Sheet"
+                   for e in activity)

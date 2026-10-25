@@ -20,10 +20,15 @@ The Action column (owner, 2026-10-25): staff pick a command, it runs, the cell e
 command is handled (it ran, the backend refused it, or the row could not run it) the worker empties
 Action and the Action Request ID in the same write as the result (`_clear_action`); the result stays
 in Outcome Status. So a command in Action is always one staff picked and not handled yet, and staff
-run the same command again by picking it again. The only exception is a Restart parked behind an
-open review: it stays until it runs or is dropped. The worker never writes anything else into Action.
+run the same command again by picking it again. The worker never writes anything else into Action.
 Rows from before 2026-10-25 can still hold a handled command; `old_commands` finds them and they are
 emptied without running.
+
+Restart guardrails (owner, 2026-10-25, checked by the backend under the lead lock, `sheet_rules`):
+a Restart on a lead in review is refused at once (no more waiting in Action: the review card offers
+the restart), and so is one on a booked lead or a lead closed by a decision (front desk, a newer row,
+not interested). Booked and Do Not Contact still run on a lead in review. A Restart that waited
+behind a review under the old rules is emptied with the refusal text, never run (`_legacy_waiting`).
 """
 
 from __future__ import annotations
@@ -75,6 +80,10 @@ RESULT_LABELS = {
 }
 REVIEW_LABELS = {
     "name_changed_needs_review": "Needs review: name changed",
+    # Owner, 2026-10-25: reviewed like a name (lead_actions.sync_sheet_lead, `sheet_rules`).
+    "location_changed_needs_review": "Needs review: location changed",
+    "case_changed_needs_review": "Needs review: case changed",
+    "dob_changed_needs_review": "Needs review: date of birth changed",
 }
 # A changed phone number closes the lead at once (owner, 2026-10-22): Outcome Status, Lead Status.
 PHONE_CHANGED_LABELS = {"phone_changed_closed": ("Phone changed: add a new row", "Closed")}
@@ -83,21 +92,24 @@ FINAL_STATUSES = {"booked", "already booked", "do not contact applied", "complet
 # On a row in review, Booked and Do Not Contact still run: they end the lead whatever the review was
 # about, and the backend closes the review as "booked" / "do_not_contact" (as the dashboard's Booked
 # move and Do not contact switch do). QA 2026-10-22: a Booked typed on a "Needs review: wrong number"
-# row was ignored without a word. Start / Restart would skip the decision the review asks for.
+# row was ignored without a word. A Restart is refused (below); a Start on a linked row is too.
 REVIEW_ENDING = {"booked", "do_not_contact"}
-# Added to the review text when staff pick Restart cadence on a row in review. The Restart is kept
-# and runs once the review is resolved on the dashboard (the Resolved text is not final).
-REVIEW_FIRST = "; resolve it on the dashboard first, then the restart runs"
-# A dashboard decision that ends the lead (close, front desk, booking link, Booked, Do not contact) is
-# newer than the parked Restart and wins (tester 2026-10-22: "Front desk will handle", then the
-# Restart ran two minutes later and calls started again). The row says the Restart was dropped.
-NOT_RUN = "; the Restart in Action was not run"
+# The 2026-10-22..25 rules kept a Restart picked on a row in review waiting in Action, with these words
+# after the review text, and ran it once the review was resolved. Gone (owner, 2026-10-25); a row
+# still showing them is emptied with REVIEW_REFUSED, never run (`_legacy_waiting`).
+LEGACY_WAIT_HINT = "; resolve it on the dashboard first, then the restart runs"
 # Refusals staff can act on (owner, 2026-10-25): the row says what to do, and Action is empty again,
 # so picking the command again is the retry.
 OUTREACH_BUSY = "Error: a call or text is going out right now. Pick Restart cadence again in a minute."
 TOO_SOON = "Error: restarted less than {minutes} minutes ago. Pick Restart cadence again after {time}."
 TOO_SOON_NO_TIME = ("Error: restarted less than {minutes} minutes ago. Pick Restart cadence again "
                     "in {minutes} minutes.")
+# Restart guardrails (owner, 2026-10-25; lead_actions._sheet_restart_refusal): the Sheet never undoes
+# a dashboard decision, and a lead in review is restarted from its review card.
+REVIEW_REFUSED = ("Error: this lead needs review. Resolve it on the dashboard; you can restart it "
+                  "from there.")
+BOOKED_REFUSED = "Error: this lead is booked. Reopen it on the dashboard if needed."
+CLOSED_REFUSED = "Error: this lead is closed ({why}). Use the dashboard."
 # Start cadence on a row that already has a Lead ID would create nothing (the phone is taken): it was
 # ignored without a word; now Action empties, so the row says why.
 ALREADY_LINKED = "Error: this row already has a lead. Pick Restart cadence to start the calls again."
@@ -105,7 +117,6 @@ ALREADY_LINKED = "Error: this row already has a lead. Pick Restart cadence to st
 # taken off when the old command next to them is emptied.
 _OLD_NOTE = re.compile(r"; [^;]+ in action (already ran \(clear this cell to run it again\)"
                        r"|not run( \(clear this cell to run it\))?)$", re.IGNORECASE)
-ENDED_LEAD_STATUSES = {"Closed", "Booked", "Do not outreach"}
 RETRYING = re.compile(r"^retrying ([12])/3: ", re.IGNORECASE)
 PROFILE = ("name", "phone", "email", "date_of_birth", "location", "case")
 FIELD_COLUMNS = {"full_name": "Name", "phone": "Phone Number", "email": "Email", "gender": "Gender",
@@ -261,8 +272,9 @@ def old_commands(rows) -> set[int]:
     Status "Processing: ..." / "Retrying ...": left alone) or from before. From before it is old when
     the request that id names finished with this same action (it ran, or the 2026-10-23 rules
     recorded it as turned down) and Outcome Status is not blank, or when the old rules would not run
-    it (`_old_rules_run`). A Restart parked behind a review keeps waiting. Anything else is a command
-    staff picked under the old rules (a cleared Outcome Status, a different command) and runs.
+    it (`_old_rules_run`; a Restart that waited behind a review is one of these since 2026-10-25).
+    Anything else is a command staff picked under the old rules (a cleared Outcome Status, a
+    different command) and runs.
     One lookup per poll, only for rows holding a command and an Action Request ID.
     """
     candidates = [row for row in rows if command_of(row) and row.get("action_request_id")
@@ -276,7 +288,7 @@ def old_commands(rows) -> set[int]:
         # A blank Outcome Status ran the command under the old rules even if it was the last one
         # (how staff re-ran a command then): `_old_rules_run` says so, and it still runs.
         ran = found.get(row.number) == command[1] and bool(row.get("outcome_status"))
-        if ran or not (parked(row) or _old_rules_run(row, command)):
+        if ran or not _old_rules_run(row, command):
             old.add(row.number)
     return old
 
@@ -295,64 +307,57 @@ def _clear_action(grid: SheetGrid, row: SheetRow) -> None:
 
 
 def retire_old(grid: SheetGrid, rows, trace: WorkflowTrace | None = None) -> None:
-    """Empty the old commands among `rows` (`old_commands`), and the 2026-10-23 "clear this cell" words."""
+    """Empty the old commands among `rows` (`old_commands`), and the 2026-10-23 "clear this cell" words.
+
+    An old Restart next to an open review text waited behind the review under the old rules: it is
+    refused now (owner, 2026-10-25), and the row says so, as for one picked today.
+    """
     old = old_commands(rows)
     for row in rows:
         if row.number not in old:
             continue
         action = command_of(row)[1]
         status = row.get("outcome_status")
-        if _OLD_NOTE.search(status):
+        if action == "restart_cadence" and open_review_text(_base_status(status)):
+            grid.set(row, "outcome_status", REVIEW_REFUSED)
+            note_refusal(row, "Restart cadence", REVIEW_REFUSED)
+        elif _OLD_NOTE.search(status):
             grid.set(row, "outcome_status", _base_status(status))
         _clear_action(grid, row)
         if trace is not None:
             trace.log("sheet_old_command_cleared", row=row.number, action=action)
 
 
-def parked(row: SheetRow) -> bool:
-    """Restart cadence on a row in review: staff picked it, and it waits until the review is resolved.
-
-    It stays in Action meanwhile (the one command that does), then runs and is emptied, or is
-    dropped and emptied when the dashboard ends the lead (`_drop_parked`).
-    """
-    return ((command_of(row) or ("", ""))[1] == "restart_cadence"
-            and open_review_text(row.get("outcome_status")))
-
-
 def _hinted(row: SheetRow) -> bool:
-    return row.get("outcome_status").casefold().endswith(REVIEW_FIRST.casefold())
+    return row.get("outcome_status").casefold().endswith(LEGACY_WAIT_HINT.casefold())
 
 
-def _hint_due(row: SheetRow) -> bool:
-    """A parked Restart whose row does not say yet that it waits for the review."""
-    return parked(row) and not _hinted(row)
+def _legacy_waiting(row: SheetRow) -> bool:
+    """A Restart that waited behind a review under the 2026-10-22..25 rules (the row says it waits).
+
+    One-time, on the first polls after the owner's 2026-10-25 change: it is emptied with the refusal
+    text and never run, even if the review was resolved since (staff restart from the review card).
+    """
+    return (command_of(row) or ("", ""))[1] == "restart_cadence" and _hinted(row)
 
 
 def _hint_stale(row: SheetRow) -> bool:
-    """The row still says a Restart waits, but staff took it out of Action."""
-    return _hinted(row) and not parked(row)
-
-
-def _with_hint(status: str, is_parked: bool) -> str:
-    """A review text written over a parked Restart keeps saying the Restart waits."""
-    if is_parked and open_review_text(status) and not status.casefold().endswith(
-            REVIEW_FIRST.casefold()):
-        return status + REVIEW_FIRST
-    return status
+    """The row still says a Restart waits, but there is no Restart in Action: the words go."""
+    return _hinted(row) and not _legacy_waiting(row)
 
 
 def needs_processing(row: SheetRow, command: tuple[str, str]) -> bool:
     """Does the command in Action still need running? (Owner, 2026-10-25.)
 
     Action is emptied once a command is handled, so a command there is new, unless it is running
-    now (Processing / Retrying: recovery's) or a Restart parked behind an open review (`parked`).
-    Rows from before 2026-10-25 can hold a handled command: `old_commands` empties those first.
+    now (Processing / Retrying: recovery's). Rows from before 2026-10-25 can hold a handled command:
+    `old_commands` empties those first. What the backend refuses (a Restart on a lead in review,
+    booked or closed) is still sent: the refusal is the row's answer, and Action empties.
     Booked and Do Not Contact run on a row in review (REVIEW_ENDING, 2026-10-22). Start cadence on
     a linked row is turned down with a reason (`claim_commands`).
     """
-    if _in_progress(row.get("outcome_status")):
-        return False
-    return not parked(row)
+    del command
+    return not _in_progress(row.get("outcome_status"))
 
 
 def _base_status(status: str) -> str:
@@ -360,23 +365,27 @@ def _base_status(status: str) -> str:
     return _OLD_NOTE.sub("", status)
 
 
-def _review_waiting(lead_id: str) -> str | None:
-    """The lead's open review as the Sheet words it ("Needs review: ..."), or None.
+def note_refusal(row: SheetRow, label: str, text: str) -> None:
+    """A command the Sheet worker refused itself (no backend request): said in the lead's Activity.
 
-    Read from the database, not the row: staff who clear Outcome Status on a row in review must not
-    start a Restart past the review (tester 2026-10-23: the Restart ran at once and closed the
-    review as "restarted" by Google Sheet, accepting a new name nobody chose).
+    Owner, 2026-10-25: every Sheet command shows in the lead's Activity, refusals with the reason.
+    Commands the backend handled are read from lead_action_requests (routes/dashboard.py); these
+    few never reach it (Start on a linked row, an invalid linked row, an old waiting Restart), so a
+    status history line (source n8n_sheet, from = to) records them. Never fails the poll.
     """
-    from .lead_review import sheet_open_status  # local: lead_review imports lead_actions
-
-    with transaction() as conn:
-        found = conn.execute(
-            "select l.needs_review,r.code,r.details from leads l left join lateral ("
-            "select code,details from lead_reviews where lead_id=l.id and resolved_at is null "
-            "order by flagged_at,id limit 1) r on true where l.id::text=%s", (lead_id,)).fetchone()
-    if not found or not (found["needs_review"] or found["code"]):
-        return None
-    return sheet_open_status(found["code"], found["details"]) if found["code"] else "Needs review"
+    lead_id = row.get("lead_id")
+    if not _is_uuid(lead_id):
+        return
+    reason = f"{label} refused: {text.removeprefix('Error: ')}"[:500]
+    try:
+        with transaction() as conn:
+            conn.execute(
+                "insert into lead_status_history(lead_id,from_status,to_status,source,reason) "
+                "select id,status,status,'n8n_sheet',%s from leads where id::text=%s",
+                (reason, lead_id),
+            )
+    except Exception:  # noqa: BLE001, S110 - the Activity line is a note; the row is handled anyway
+        pass
 
 
 def _readable(error: ValidationError) -> str:
@@ -488,6 +497,12 @@ def _refusal_text(body: dict[str, Any]) -> str | None:
     code = body.get("code")
     if code == "outreach_unresolved":
         return OUTREACH_BUSY
+    if code == "restart_needs_review":
+        return REVIEW_REFUSED
+    if code == "restart_booked":
+        return BOOKED_REFUSED
+    if code == "restart_closed":
+        return CLOSED_REFUSED.format(why=body.get("closed_reason") or "closed on the dashboard")
     if code != "restart_too_soon":
         return None
     try:
@@ -511,15 +526,17 @@ class PollResult:
     # lead id -> (fingerprint, row, the row's Name): the name is what a pre-048 name review lacks.
     baselines: dict[str, tuple[str, int, str]] = field(default_factory=dict)
 
-    # Names written back after "keep old name": lead id -> (fingerprint before, after, row, Name).
+    # Cells written back after "keep old name" / "keep old <field>": lead id -> (fingerprint
+    # before, after, row, Name), and which Sheet columns were written (RESTORABLE).
     renamed: dict[str, tuple[str, str, int, str]] = field(default_factory=dict)
+    restored: dict[str, set[str]] = field(default_factory=dict)
 
     def save_baselines(self, deferred_rows: set[int]) -> None:
-        """`deferred_rows`: rows not written (moved), or whose guarded Name write was skipped."""
+        """`deferred_rows`: rows not written (moved), or whose guarded write-back was skipped."""
         _save_baseline({lead_id: item for lead_id, item in self.baselines.items()
                         if item[1] not in deferred_rows})
         _save_renamed({lead_id: item for lead_id, item in self.renamed.items()
-                       if item[2] not in deferred_rows})
+                       if item[2] not in deferred_rows}, self.restored)
 
 
 def _now() -> datetime:
@@ -569,23 +586,12 @@ def claim_commands(grid: SheetGrid, trace: WorkflowTrace, *, settle: Settle | No
     retire_old(grid, grid.rows, trace)
     for row in grid.rows:
         if _hint_stale(row):
-            grid.set(row, "outcome_status", row.get("outcome_status")[:-len(REVIEW_FIRST)])
+            grid.set(row, "outcome_status", row.get("outcome_status")[:-len(LEGACY_WAIT_HINT)])
         command = command_of(row)
-        if not command:
-            continue
-        hint = _hint_due(row)
-        if not hint and not needs_processing(row, command):
+        if not command or not needs_processing(row, command):
             continue
         waiting.add(row.number)
         if settle is not None and not settle.ready(row, now):
-            continue
-        if hint:
-            # A Restart picked on a row in review used to be ignored without a word (QA
-            # 2026-10-22). It still waits for the review; the row now says so, and keeps it. Its
-            # Action Request ID goes: a waiting Restart is a new command, never an old one.
-            grid.set(row, "outcome_status", _with_hint(row.get("outcome_status"), True))
-            grid.set(row, "action_request_id", "")
-            trace.log("sheet_command_waits_for_review", row=row.number, action=command[1])
             continue
         if limit is not None and len(claims) >= limit:
             continue
@@ -595,20 +601,22 @@ def claim_commands(grid: SheetGrid, trace: WorkflowTrace, *, settle: Settle | No
             # cell without a word; now Action empties, so the row says what to pick instead.
             grid.set(row, "outcome_status", ALREADY_LINKED)
             _clear_action(grid, row)
+            note_refusal(row, label, ALREADY_LINKED)
             trace.log("sheet_command_refused", row=row.number, action=action)
             continue
-        if action == "restart_cadence" and _is_uuid(row.get("lead_id")) and (
-                review := _review_waiting(row.get("lead_id"))):
-            # The lead has an open review the row does not show (Outcome Status cleared or
-            # overwritten): the Restart still waits for it (Booked / Do Not Contact do run).
-            grid.set(row, "outcome_status", review + REVIEW_FIRST)
-            grid.set(row, "action_request_id", "")
-            trace.log("sheet_command_waits_for_review", row=row.number, action=action)
+        if _legacy_waiting(row):
+            # A Restart left waiting behind a review by the old rules (owner, 2026-10-25): it is
+            # refused like one picked today, and never run, even if the review was resolved since.
+            grid.set(row, "outcome_status", REVIEW_REFUSED)
+            _clear_action(grid, row)
+            note_refusal(row, label, REVIEW_REFUSED)
+            trace.log("sheet_command_refused", row=row.number, action=action)
             continue
         request, error = build_action(row, action)
         if error:
             grid.set(row, "outcome_status", "Error: " + error[:180])
             _clear_action(grid, row)
+            note_refusal(row, label, error[:180])
             trace.log("sheet_command_invalid", row=row.number, action=action)
             continue
         if action == "start_cadence" and (done := _start_row_already_done(row, request)):
@@ -719,6 +727,7 @@ def _execute(request, request_id: str, trace: WorkflowTrace) -> Outcome:
             action=request.action,
             lead_id=request.lead_id,
             lead=request.lead.model_dump(mode="python"),
+            sheet_rules=True,
         )
     except Exception as exc:  # noqa: BLE001 - database trouble: retried like an n8n timeout
         trace.log("sheet_command_failed", error_category=type(exc).__name__)
@@ -737,7 +746,7 @@ def _write_outcome(grid: SheetGrid, row: SheetRow, outcome: Outcome,
         grid.set(row, "lead_status", outcome.lead_status)
     grid.set(row, "outcome_status", outcome.status)
     # Handled (it ran, or was refused): Action empties (owner, 2026-10-25), also after a Restart that
-    # ended in a review ("Number blocked; needs review"), so it is never taken for a parked one.
+    # ended in a review ("Number blocked; needs review").
     # "Retrying n/3" is still running: the command and its Action Request ID stay for recovery.
     if not outcome.status.startswith("Retrying"):
         _clear_action(grid, row)
@@ -815,24 +824,19 @@ def sync_profiles(grid: SheetGrid, result: PollResult, trace: WorkflowTrace,
         else:
             try:
                 synced = sync_sheet_lead(request_id=uuid4(), lead_id=UUID(lead_id),
-                                         lead=lead.model_dump(mode="python"))
+                                         lead=lead.model_dump(mode="python"), sheet_rules=True)
             except Exception as exc:  # noqa: BLE001 - try again next poll
                 trace.log("sheet_profile_failed", error_category=type(exc).__name__)
                 continue
             code = (synced.body or {}).get("code")
             if code in REVIEW_LABELS:
                 grid.set(row, "lead_status", "Needs Review")
-                grid.set(row, "outcome_status", _with_hint(REVIEW_LABELS[code], parked(row)))
+                grid.set(row, "outcome_status", REVIEW_LABELS[code])
             elif code in PHONE_CHANGED_LABELS:
                 outcome_status, lead_status = PHONE_CHANGED_LABELS[code]
                 grid.set(row, "lead_status", lead_status)
                 if not _command_pending(row):  # a command staff just typed runs (and is refused)
-                    # The lead is closed: a Restart waiting for a review goes, and the row says so.
-                    if parked(row):
-                        grid.set(row, "outcome_status", outcome_status + NOT_RUN)
-                        _clear_action(grid, row)
-                    else:
-                        grid.set(row, "outcome_status", outcome_status)
+                    grid.set(row, "outcome_status", outcome_status)
             elif synced.status_code >= 400:
                 detail = synced.body.get("detail") if isinstance(synced.body.get("detail"), str) \
                     else synced.body.get("code")
@@ -873,15 +877,21 @@ def _save_baseline(items: dict[str, tuple[str, int, str]]) -> None:
         )
 
 
-def _save_renamed(items: dict[str, tuple[str, str, int, str]]) -> None:
-    """The fingerprint after a Name write-back, if the stored one is the row's from before it.
+def _save_renamed(items: dict[str, tuple[str, str, int, str]],
+                  restored: dict[str, set[str]] | None = None) -> None:
+    """The fingerprint after a Name (or kept value) write-back, if the stored one is the row's from
+    before it.
 
     Otherwise staff changed something else in the row since the last sync (an Email, say): the
     stored fingerprint stays, and the next full read syncs the row with the kept name, so no
     review is flagged and their edit is not lost.
     """
+    from .lead_actions import spend_kept_values
+
     if not items:
         return
+    restored = restored or {}
+    named = [lead_id for lead_id in items if "name" in restored.get(lead_id, {"name"})]
     with transaction() as conn, conn.cursor() as cursor:
         cursor.executemany(
             "update sheet_row_state set profile_hash=%s,row_number=%s,sheet_name=%s,seen_at=now(),"
@@ -892,8 +902,15 @@ def _save_renamed(items: dict[str, tuple[str, str, int, str]]) -> None:
         # The row shows the name on file again, so the kept Sheet name is spent (as a profile sync
         # of that name would do, lead_actions.sync_sheet_lead). Tester 2026-10-23: left set, the
         # same new name retyped later was accepted silently and never opened a review.
-        cursor.executemany("update leads set sheet_name_accepted=null where id=%s",
-                           [(lead_id,) for lead_id in items])
+        if named:
+            cursor.executemany("update leads set sheet_name_accepted=null where id=%s",
+                               [(lead_id,) for lead_id in named])
+        # The same for a kept location / case / date of birth (lead_actions._kept_value).
+        for lead_id in items:
+            codes = [code for code, column in VALUE_CODES.items()
+                     if column in restored.get(lead_id, set())]
+            if codes:
+                spend_kept_values(conn, lead_id, codes)
 
 
 # --- results from the backend (n8n webhook-flow) ---------------------------------------------
@@ -902,54 +919,51 @@ ALWAYS_WRITTEN = ("cadence_day", "call_outcome", "message_outcome", "email_outco
                   "transcript_link")
 
 
+# Sheet column -> review code, for the cells "keep old <field>" writes back (sheet_sync._kept_values).
+VALUE_CODES = {"location_changed": "location", "case_changed": "case", "dob_changed": "date_of_birth"}
+# Cells a "keep old" choice writes back; a skipped one holds the row's fingerprint back.
+RESTORABLE = frozenset({"name", *VALUE_CODES.values()})
+
+
 def apply_snapshot(grid: SheetGrid, snapshot: dict[str, Any],
                    result: PollResult | None = None) -> bool:
     """Write one lead's snapshot into its row (first row with that Lead ID). False: not in Sheet.
 
-    Action is only ever emptied, never filled (owner, 2026-10-25): when a parked Restart is dropped,
-    or done by the review's own restart. The snapshot's `action` / `review_action` are for n8n mode
-    only (sheet_sync).
+    Action is never written here (owner, 2026-10-25): only a command run on the row empties it.
+    The snapshot's `action` / `review_action` are for n8n mode only (sheet_sync).
     """
     lead_id = str(snapshot["lead_id"])
     row = next((r for r in grid.rows if r.get("lead_id") == lead_id), None)
     if row is None:
         return False
     sheet = snapshot.get("sheet") or {}
-    if sheet.get("name"):
-        _restore_name(grid, row, sheet, result)
+    before = profile_hash(row)
+    written = [*(["name"] if sheet.get("name") and _restore_name(grid, row, sheet) else []),
+               *_restore_values(grid, row, sheet.get("kept") or {})]
+    if written and result is not None:
+        result.renamed[lead_id] = (before, profile_hash(row), row.number, _sheet_name(row))
+        result.restored[lead_id] = set(written)
     # What staff typed is judged on the row as it is now, before this snapshot writes into it. An
     # old command (before 2026-10-25) is emptied first, so it is not taken for a pending one.
     retire_old(grid, [row])
     pending = _command_pending(row)
-    waits = not pending and parked(row)
     for key in ALWAYS_WRITTEN:
         if key in sheet:
             grid.set(row, key, sheet[key] or "")
-    if waits and sheet.get("lead_status") in ENDED_LEAD_STATUSES:
-        _drop_parked(grid, row, sheet)
-        grid.set(row, "lead_status", _lead_status(row, sheet))
-        return True
     if "action_status" in sheet:
-        grid.set(row, "outcome_status", _with_hint(sheet["action_status"] or "", waits))
+        grid.set(row, "outcome_status", sheet["action_status"] or "")
     # Review flagged / resolved (services/lead_review.py). Never over a command staff typed and the
-    # Sheet worker has not run yet (still settling, or waiting) or one still running: QA 2026-10-22,
-    # a new "Needs review" text would block a Booked typed seconds earlier. The command's own result
-    # is written when it runs.
+    # Sheet worker has not run yet (still settling) or one still running: QA 2026-10-22, a new
+    # "Needs review" text would hide a Booked typed seconds earlier. The command's own result is
+    # written when it runs.
     if sheet.get("review_status") and not pending:
-        text = sheet["review_status"]
-        grid.set(row, "outcome_status", _with_hint(text, waits))
-        # A Restart parked behind the review now runs (the Resolved text is not final), unless the
-        # resolution itself restarted the cadence: then it is done, and must not run on top later.
-        if waits and not open_review_text(text) and text.strip().casefold().startswith(
-                "cadence restarted"):
-            _clear_action(grid, row)
+        grid.set(row, "outcome_status", sheet["review_status"])
     grid.set(row, "lead_status", _lead_status(row, sheet))
     return True
 
 
-def _restore_name(grid: SheetGrid, row: SheetRow, sheet: dict[str, Any],
-                  result: PollResult | None) -> None:
-    """"Same person, keep old name": the Name cell goes back to the name on file.
+def _restore_name(grid: SheetGrid, row: SheetRow, sheet: dict[str, Any]) -> bool:
+    """"Same person, keep old name": the Name cell goes back to the name on file. True if queued.
 
     Owner, demo test 2026-10-23: calls resumed under the old name but the row kept showing the new
     one. Only over the exact name the review was about (`name_replaces`): a third name staff typed
@@ -963,25 +977,34 @@ def _restore_name(grid: SheetGrid, row: SheetRow, sheet: dict[str, Any],
     """
     shown = row.get("name")
     if _same_name(shown, sheet["name"]) or not _same_name(shown, sheet.get("name_replaces")):
-        return
-    before = profile_hash(row)
+        return False
     grid.set(row, "name", sheet["name"], expect=shown)
-    if result is not None:
-        result.renamed[str(row.get("lead_id"))] = (before, profile_hash(row), row.number,
-                                                   _sheet_name(row))
+    return True
 
 
-def _drop_parked(grid: SheetGrid, row: SheetRow, sheet: dict[str, Any]) -> None:
-    """The lead ended on the dashboard (or by Stride) while a Restart waited: the Restart goes.
+def _restore_values(grid: SheetGrid, row: SheetRow, kept: dict[str, Any]) -> list[str]:
+    """"Keep old location / case / date of birth": the cell goes back to the value on file.
 
-    Action is emptied, so the Restart never runs later (tester 2026-10-22: "Front desk will
-    handle", then the Restart ran two minutes later).
+    Owner, 2026-10-25: the same rules as the Name (`_restore_name`): only over the exact value the
+    review was about, re-checked just before the write (`expect`), fingerprint stored with it (no
+    new review, no loop), and the kept marker spent once it landed. Returns the columns queued.
     """
-    text = sheet.get("review_status") or sheet.get("action_status") or sheet.get("lead_status") or ""
-    if text.strip().casefold() not in FINAL_STATUSES:  # "Booked" stays exactly that (final)
-        text += NOT_RUN
-    grid.set(row, "outcome_status", text)
-    _clear_action(grid, row)
+    written = []
+    for column, pair in kept.items():
+        if column not in VALUE_CODES.values() or not isinstance(pair, list | tuple) or len(pair) != 2:
+            continue
+        value, replaces = (str(part or "") for part in pair)
+        shown = row.get(column)
+        if column == "date_of_birth":
+            same = bool(shown) and normalize_dob(shown) == normalize_dob(value)
+            matches = bool(shown) and normalize_dob(shown) == normalize_dob(replaces)
+        else:
+            same, matches = _same_name(shown, value), _same_name(shown, replaces)
+        if same or not matches or not value:
+            continue
+        grid.set(row, column, value, expect=shown)
+        written.append(column)
+    return written
 
 
 def _in_progress(status: str) -> bool:
@@ -989,7 +1012,7 @@ def _in_progress(status: str) -> bool:
 
 
 def _command_pending(row: SheetRow) -> bool:
-    """A command in the row that has not finished: typed (settling) or running. Not a parked one."""
+    """A command in the row that has not finished: typed (settling) or running."""
     command = command_of(row)
     return _in_progress(row.get("outcome_status")) or bool(command and needs_processing(row, command))
 
@@ -1022,7 +1045,7 @@ def needs_attention(row: SheetRow, old: set[int] | frozenset[int] = frozenset())
     `old`: `old_commands` of the scanned rows.
     """
     command = command_of(row)
-    if command and (row.number in old or needs_processing(row, command) or _hint_due(row)):
+    if command and (row.number in old or needs_processing(row, command)):
         return True
     if _hint_stale(row):
         return True

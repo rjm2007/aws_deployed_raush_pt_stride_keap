@@ -17,11 +17,15 @@ agent could not confirm a Stride booking; Stride's next file books the lead by i
 (stride_leads.mark_leads_booked_from_stride), otherwise only the front desk can settle it, so a patient who may
 be booked is never called again. Migration 048 stays identical to production: these codes come
 from Python, and older rows are recognised by their stored words (`_demo_code`).
+
+Owner, 2026-10-25: a Sheet Restart on a lead in review is refused, so the cards offer restart from
+Day 0 (name, details, text, call, technical, other); Location / Case / Date Of Birth edits are
+reviewed like a name (group "details").
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from psycopg.types.json import Jsonb
@@ -39,6 +43,10 @@ from .sheet_sync import enqueue_sheet_update
 
 GROUP_OF = {
     "name_changed": "name",
+    # Location, case and date of birth edited in the Sheet (owner, 2026-10-25): reviewed like a name.
+    "location_changed": "details",
+    "case_changed": "details",
+    "dob_changed": "details",
     "phone_changed": "phone",
     "sms_failed": "text",
     "booking_link_failed": "text",
@@ -72,6 +80,7 @@ GROUP_OF = {
 
 GROUP_LABELS = {
     "name": "Name changed",
+    "details": "Details changed",
     "phone": "Phone changed",
     "text": "Text failed",
     "call": "Call problem",
@@ -84,6 +93,9 @@ GROUP_LABELS = {
 
 TITLES = {
     "name_changed": "Name changed in the Sheet",
+    "location_changed": "Location changed in the Sheet",
+    "case_changed": "Case changed in the Sheet",
+    "dob_changed": "Date of birth changed in the Sheet",
     "phone_changed": "Phone number changed in the Sheet",
     "sms_failed": "Text not delivered",
     "booking_link_failed": "Booking-link text not delivered",
@@ -117,6 +129,14 @@ TITLES = {
 CHOICE_LABELS = {
     "use_new_name": "Same person, use new name & continue",
     "keep_old_name": "Same person, keep old name & continue",
+    "use_new_name_restart": "Same person, use new name & restart from Day 0",
+    "keep_old_name_restart": "Same person, keep old name & restart from Day 0",
+    # Location / case / date of birth: "value" is the field the review is about (`choice_label`
+    # names it, e.g. "Use new location & continue"); these generic words are the fallback.
+    "use_new_value": "Use new value & continue",
+    "keep_old_value": "Keep old value & continue",
+    "use_new_value_restart": "Use new value & restart from Day 0",
+    "keep_old_value_restart": "Keep old value & restart from Day 0",
     "different_person": "Different person, close this lead",
     "calls_only": "Continue with calls only",
     "retry_texts": "Try texting again",
@@ -129,23 +149,52 @@ CHOICE_LABELS = {
     "front_desk": "Front desk will handle",
 }
 
+# Owner, 2026-10-25: a Restart picked in the Sheet on a lead in review is refused; the review card
+# offers the restart instead (name, details, text, call, technical, other; appointment had it).
+# Never for phone (closed for good), blocked (an admin unblocks) or booking (may be booked already).
 GROUP_CHOICES = {
-    "name": ["use_new_name", "keep_old_name", "different_person", "front_desk"],
+    "name": ["use_new_name", "keep_old_name", "use_new_name_restart", "keep_old_name_restart",
+             "different_person", "front_desk"],
+    "details": ["use_new_value", "keep_old_value", "use_new_value_restart", "keep_old_value_restart",
+                "front_desk"],
     # Only for leads flagged before 2026-10-22; a phone change now closes the lead at once.
     "phone": ["close_phone_changed", "front_desk"],
-    "text": ["calls_only", "retry_texts", "front_desk"],
-    "call": ["number_ok", "wrong_number", "front_desk"],
-    "technical": ["continue", "front_desk"],
+    "text": ["calls_only", "retry_texts", "restart_cadence", "front_desk"],
+    "call": ["number_ok", "wrong_number", "restart_cadence", "front_desk"],
+    "technical": ["continue", "restart_cadence", "front_desk"],
     # Unblocking stays where it was (lead page / Administration, admins only).
     "blocked": ["front_desk"],
     # Demo only. No "Continue": an appointment lead's cadence is over, and a booking lead may be
     # booked already (owner, 2026-10-22).
     "appointment": ["front_desk", "restart_cadence", "send_booking_link"],
     "booking": ["front_desk"],
-    "other": ["continue", "front_desk"],
+    "other": ["continue", "restart_cadence", "front_desk"],
 }
 
-RESUME_CHOICES = {"use_new_name", "keep_old_name", "calls_only", "retry_texts", "number_ok", "continue"}
+RESUME_CHOICES = {"use_new_name", "keep_old_name", "use_new_value", "keep_old_value", "calls_only",
+                  "retry_texts", "number_ok", "continue"}
+# Restart from Day 0. A variant also applies its name / value choice first (RESTART_BASE).
+RESTART_CHOICES = {"restart_cadence", "use_new_name_restart", "keep_old_name_restart",
+                   "use_new_value_restart", "keep_old_value_restart"}
+RESTART_BASE = {"use_new_name_restart": "use_new_name", "keep_old_name_restart": "keep_old_name",
+                "use_new_value_restart": "use_new_value",
+                "keep_old_value_restart": "keep_old_value"}
+KEEP_OLD_NAME = {"keep_old_name", "keep_old_name_restart"}
+KEEP_OLD_VALUE = {"keep_old_value", "keep_old_value_restart"}
+# Review code -> (lead column, Sheet column key, the field in staff words).
+DETAIL_FIELDS = {
+    "location_changed": ("location", "location", "location"),
+    "case_changed": ("lead_type", "case", "case"),
+    "dob_changed": ("date_of_birth", "date_of_birth", "date of birth"),
+}
+
+
+def choice_label(choice: str, code: str | None = None) -> str:
+    """A choice in staff words; "value" choices name the field of their review ("Use new case & ...")."""
+    label = CHOICE_LABELS.get(choice, choice)
+    if code in DETAIL_FIELDS and "value" in label:
+        label = label.replace("value", DETAIL_FIELDS[code][2])
+    return label
 # Closed for good: the number (or the person) on this lead is wrong. Staff add a new Sheet row.
 WRONG_LEAD_CHOICES = {"different_person", "wrong_number", "close_phone_changed"}
 
@@ -156,6 +205,13 @@ TEXTS_OFF_SKIP_REASON = "texts off (calls only)"
 SHEET_RESOLVED = {
     "use_new_name": "Resolved: new name used",
     "keep_old_name": "Resolved: old name kept",
+    "use_new_name_restart": "Resolved: new name used; cadence restarted",
+    "keep_old_name_restart": "Resolved: old name kept; cadence restarted",
+    # "value": the field (sheet_resolved_text), e.g. "Resolved: old location kept".
+    "use_new_value": "Resolved: new value used",
+    "keep_old_value": "Resolved: old value kept",
+    "use_new_value_restart": "Resolved: new value used; cadence restarted",
+    "keep_old_value_restart": "Resolved: old value kept; cadence restarted",
     "different_person": "Closed: different person, add a new row",
     "calls_only": "Resolved: calls only",
     "retry_texts": "Resolved: texting again",
@@ -173,15 +229,25 @@ SHEET_RESOLVED_ACTION = {"restart_cadence": "Restart cadence"}
 SHEET_TEXTS_OFF = "Calls only (texts off)"
 
 
+def sheet_resolved_text(resolution: str | None, code: str | None = None) -> str | None:
+    """Outcome Status for a resolved review; "value" names the field ("Resolved: old case kept")."""
+    text = SHEET_RESOLVED.get(resolution or "")
+    if text and code in DETAIL_FIELDS and "value" in text:
+        text = text.replace("value", DETAIL_FIELDS[code][2])
+    return text
+
+
 def sheet_open_status(code: str | None, details: dict | None) -> str:
     """Outcome Status while a review is open. Each starts "Needs review" (or "Number blocked;
-    needs review"): the Sheet worker then runs only Booked / Do Not Contact on the row, and keeps a
-    Restart waiting until the review is resolved (sheet_direct.needs_processing / parked)."""
+    needs review"). On such a lead the Sheet runs only Booked / Do Not Contact; a Restart is
+    refused with a reason (owner, 2026-10-25: restart it from the review card instead)."""
     group = group_of(code)
     if code == "number_blocked":
         return "Number blocked; needs review"  # the words the Start command already writes
     if code == "name_changed":
         return "Needs review: name changed"
+    if code in DETAIL_FIELDS:
+        return f"Needs review: {DETAIL_FIELDS[code][2]} changed"
     if group == "phone":
         return "Needs review: phone changed"
     if group == "text":
@@ -366,6 +432,11 @@ def _plain_reason(row: dict, lead: dict) -> str:
                     "file, or close the lead if it is a different person.")
         return (f"The Name in the Google Sheet changed from “{old}” "
                 f"to “{details['new_name']}”. Is it the same person?")
+    if code in DETAIL_FIELDS:
+        field = DETAIL_FIELDS[code][2]
+        return (f"The {field} in the Google Sheet changed from “{details.get('old_value') or '—'}” "
+                f"to “{details.get('new_value') or '—'}”. Which one is right? Outreach is paused "
+                "until staff choose.")
     if code in {"sms_failed", "booking_link_failed"}:
         what = "booking-link text" if code == "booking_link_failed" else (
             step_name("sms", details["day_offset"]) if details.get("day_offset") is not None
@@ -454,6 +525,10 @@ def _proof(row: dict, lead_name: str | None = None) -> list[dict[str, str]]:
     if code == "name_changed":
         proof += [{"label": "Old name", "value": str(details.get("old_name") or lead_name or "—")},
                   {"label": "New name", "value": str(details.get("new_name") or "Not recorded (see Sheet)")}]
+    if code in DETAIL_FIELDS:
+        field = DETAIL_FIELDS[code][2]
+        proof += [{"label": f"Old {field}", "value": str(details.get("old_value") or "—")},
+                  {"label": f"New {field}", "value": str(details.get("new_value") or "—")}]
     if code == "phone_changed":
         if details.get("old_phone"):
             proof.append({"label": "Old number", "value": str(details["old_phone"])})
@@ -472,8 +547,13 @@ def _proof(row: dict, lead_name: str | None = None) -> list[dict[str, str]]:
     return proof
 
 
-def describe(row: dict, lead: dict, *, has_calls: bool = False) -> dict[str, Any]:
-    """One review as the dashboard shows it: what happened, the proof, and the choices."""
+def describe(row: dict, lead: dict, *, has_calls: bool = False, more: bool = False) -> dict[str, Any]:
+    """One review as the dashboard shows it: what happened, the proof, and the choices.
+
+    `more`: other reviews are open after this one. Then no restart is offered: a restart would
+    settle every open review at once (the next one never decided, e.g. a changed location left
+    unread after "use new name & restart"). Staff continue here and restart on the last review.
+    """
     code = _demo_code(row)
     code = code if code in GROUP_OF else "other"
     details = row.get("details") or {}
@@ -484,9 +564,11 @@ def describe(row: dict, lead: dict, *, has_calls: bool = False) -> dict[str, Any
         choice for choice in GROUP_CHOICES[group]
         if not (choice == "retry_texts" and failure and failure["permanent"])
         # A pre-048 name review never recorded the new name, so there is nothing to "use".
-        and not (choice == "use_new_name" and not details.get("new_name"))
+        and not (choice in {"use_new_name", "use_new_name_restart"} and not details.get("new_name"))
+        and not (choice in {"use_new_value", "use_new_value_restart"} and not details.get("new_value"))
         # Calls only / STOP: no text of any kind (owner, 2026-10-22).
         and not (choice == "send_booking_link" and no_texts)
+        and not (choice in RESTART_CHOICES and more)
     ]
     lead_id = str(lead.get("id") or row.get("lead_id"))
     return {
@@ -503,7 +585,7 @@ def describe(row: dict, lead: dict, *, has_calls: bool = False) -> dict[str, Any
         "landline": bool(failure and failure["landline"]),
         "transcript_url": f"/leads/{lead_id}/conversations/calls"
         if group == "call" and has_calls else None,
-        "options": [{"choice": choice, "label": CHOICE_LABELS[choice]} for choice in choices],
+        "options": [{"choice": choice, "label": choice_label(choice, code)} for choice in choices],
     }
 
 
@@ -516,7 +598,7 @@ def lead_review_summary(conn, lead: dict) -> dict[str, Any] | None:
     has_calls = bool(conn.execute(
         "select 1 from call_logs where lead_id=%s limit 1", (lead["id"],)
     ).fetchone())
-    summary = describe(primary, lead, has_calls=has_calls)
+    summary = describe(primary, lead, has_calls=has_calls, more=len(rows) > 1)
     summary["also"] = [
         {"title": TITLES.get(row["code"], TITLES["other"]), "flagged_at": row["flagged_at"]}
         for row in rows[1:]
@@ -594,6 +676,15 @@ def _next_step_text(conn, lead: dict, rows: list[dict], choice: str, now: dateti
 
 
 def _effect(choice: str, details: dict, lead: dict, group: str = "other", code: str = "") -> str:
+    if choice in RESTART_BASE:
+        return (f"{_effect(RESTART_BASE[choice], details, lead, group, code)}. "
+                f"{_effect('restart_cadence', details, lead, group, code)}")
+    if choice in {"use_new_value", "keep_old_value"}:
+        field = DETAIL_FIELDS.get(code, ("", "", "value"))[2]
+        if choice == "use_new_value":
+            return f"The {field} becomes {details.get('new_value') or 'the Sheet value'}"
+        return (f"The {field} stays {details.get('old_value') or 'as on file'}; the Sheet cell is "
+                "set back to it")
     if choice == "use_new_name":
         return f"Name becomes {details.get('new_name') or 'the Sheet name'}"
     if choice == "keep_old_name":
@@ -647,7 +738,7 @@ def options_preview(conn, lead: dict, now: datetime | None = None) -> dict[str, 
             next_step = f"Next step: {_next_step_text(conn, lead, rows, choice, now)}."
         elif choice == "front_desk":
             next_step = "Next step: the front desk contacts the patient."
-        elif choice == "restart_cadence":
+        elif choice in RESTART_CHOICES:
             next_step = "Next step: the Day 0 call, within calling hours."
         elif choice == "send_booking_link":
             next_step = "Next step: the booking link goes out by text within a minute."
@@ -678,9 +769,11 @@ REPLACED_REVIEW_MESSAGE = (
 CLOSED_REVIEW_MESSAGE = "This review is already closed."
 
 
-def resolution_label(resolution: str | None) -> str | None:
+def resolution_label(resolution: str | None, code: str | None = None) -> str | None:
     """The plain words for a stored lead_reviews.resolution, or None when unknown."""
-    return CHOICE_LABELS.get(resolution or "") or OUTCOME_LABELS.get(resolution or "")
+    if resolution in CHOICE_LABELS:
+        return choice_label(resolution, code)
+    return OUTCOME_LABELS.get(resolution or "")
 
 
 def closed_review(conn, lead: dict) -> dict[str, str]:
@@ -690,13 +783,13 @@ def closed_review(conn, lead: dict) -> dict[str, str]:
     replaced the lead (2026-10-23), and Confirm only said the choice was no longer available.
     """
     latest = conn.execute(
-        "select resolution,resolved_by_name from lead_reviews where lead_id=%s "
+        "select code,resolution,resolved_by_name from lead_reviews where lead_id=%s "
         "and resolved_at is not null order by resolved_at desc,id desc limit 1",
         (lead["id"],),
     ).fetchone()
     if lead.get("status_reason") == REPLACED_REASON or (latest and latest["resolution"] == "replaced"):
         return {"reason": "replaced", "message": REPLACED_REVIEW_MESSAGE}
-    label = resolution_label(latest["resolution"]) if latest else None
+    label = resolution_label(latest["resolution"], latest.get("code")) if latest else None
     if latest and latest.get("resolved_by_name") and label:
         return {
             "reason": "resolved",
@@ -782,6 +875,17 @@ def _apply_choice(conn, lead: dict, rows: list[dict], choice: str, details: dict
             "update leads set sheet_name_accepted=%s where id=%s",
             (" ".join(str(details.get("new_name") or "").split()) or None, lead_id),
         )
+    elif choice == "use_new_value":
+        # The value the review recorded (`new_raw`: the date for a date of birth), never re-read.
+        column = DETAIL_FIELDS.get(rows[0].get("code"), (None,))[0]
+        value = details.get("new_raw") or details.get("new_value")
+        if not column or not value:
+            raise ReviewError(409, "The new value is not recorded on this review.")
+        if column == "date_of_birth":
+            value = date.fromisoformat(str(value))
+        conn.execute(f"update leads set {column}=%s,updated_at=now() where id=%s", (value, lead_id))
+    # keep_old_value changes nothing here: the lead keeps its value, and the resolution itself is
+    # what the profile sync reads as "staff kept the old one" (lead_actions._kept_value).
     elif choice == "calls_only":
         conn.execute(
             "update leads set sms_disabled=true,sms_disabled_at=now(),sms_disabled_reason=%s where id=%s",
@@ -836,7 +940,7 @@ def _resume(conn, lead: dict, rows: list[dict], choice: str, now: datetime) -> d
         "update leads set needs_review=false,review_reason=null,review_resolved_at=now(),"
         "status='in_progress',cadence_state='active',status_reason=%s,status_changed_at=now() "
         "where id=%s",
-        (f"review resolved: {CHOICE_LABELS[choice]}"[:500], lead_id),
+        (f"review resolved: {choice_label(choice, rows[0].get('code'))}"[:500], lead_id),
     )
     return {"restored_steps": restored, "shifted_steps": shifted}
 
@@ -865,12 +969,22 @@ def _close(conn, lead: dict, choice: str) -> None:
     )
 
 
-# --- demo only: restart or text the booking link after a Stride appointment fell through -------
+# --- restart from Day 0, or (demo) text the booking link ------------------------------------------
 
 # Same window as a Sheet restart (lead_actions.RESTART_COOLDOWN_MINUTES): a second Day 0 call this
 # soon is never what staff meant.
 RESTART_COOLDOWN_MINUTES = 10
-RESTART_HISTORY_REASON = "Review resolved by %: " + CHOICE_LABELS["restart_cadence"] + "%"
+
+
+def last_review_restart(conn, lead_id: str):
+    """When a review choice last restarted this lead within the cooldown (or None). Shared with the
+    Sheet's Restart (lead_actions), so neither side starts a second Day 0 run within 10 minutes."""
+    found = conn.execute(
+        "select max(resolved_at) as at from lead_reviews where lead_id=%s and resolution=any(%s) "
+        "and resolved_at>now()-make_interval(mins=>%s)",
+        (lead_id, sorted(RESTART_CHOICES), RESTART_COOLDOWN_MINUTES),
+    ).fetchone()
+    return found["at"] if found else None
 
 
 def _restart_guards(conn, lead: dict) -> None:
@@ -891,13 +1005,12 @@ def _restart_guards(conn, lead: dict) -> None:
         raise ReviewError(409, "Wait for the current call or text result before restarting.")
     if conn.execute(
         "select 1 from lead_status_history where lead_id=%s "
-        "and changed_at>now()-make_interval(mins=>%s) and ("
-        "(source='n8n_sheet' and reason='cadence restarted from Google Sheets') or reason like %s) "
-        "limit 1",
-        (lead_id, RESTART_COOLDOWN_MINUTES, RESTART_HISTORY_REASON),
-    ).fetchone():
+        "and changed_at>now()-make_interval(mins=>%s) "
+        "and source='n8n_sheet' and reason='cadence restarted from Google Sheets' limit 1",
+        (lead_id, RESTART_COOLDOWN_MINUTES),
+    ).fetchone() or last_review_restart(conn, lead_id):
         raise ReviewError(409, f"The cadence was already restarted in the last "
-                               f"{RESTART_COOLDOWN_MINUTES} minutes.")
+                               f"{RESTART_COOLDOWN_MINUTES} minutes. Try the restart again later.")
 
 
 def _restart(conn, lead: dict) -> dict:
@@ -976,14 +1089,19 @@ def resolve_review(
     if not lead["needs_review"]:
         raise ReviewError(409, closed_review(conn, lead)["message"])
     rows = rows or [_legacy_row(lead)]
-    primary = describe(rows[0], lead)
+    primary = describe(rows[0], lead, more=len(rows) > 1)
     allowed = {option["choice"] for option in primary["options"]}
     if choice not in CHOICE_LABELS:
         raise ReviewError(422, "Unknown choice.")
+    code = primary["code"]
+    label = choice_label(choice, code)
     if choice not in allowed:
-        raise ReviewError(409, f"“{CHOICE_LABELS[choice]}” is not an option for this review.")
+        if choice in RESTART_CHOICES and len(rows) > 1:
+            raise ReviewError(409, "This lead has another open review. Choose a continue option "
+                                   "here; the restart is offered on the last open review.")
+        raise ReviewError(409, f"“{label}” is not an option for this review.")
     details = rows[0].get("details") or {}
-    if choice == "keep_old_name" and not details.get("new_name"):
+    if choice in KEEP_OLD_NAME and not details.get("new_name"):
         details = _legacy_sheet_name(conn, lead, rows[0])
     note = (note or "").strip()[:500] or None
     result: dict[str, Any] = {}
@@ -1010,9 +1128,13 @@ def resolve_review(
         close_open_reviews(conn, lead_id, choice, by=actor_id, by_name=actor_name, note=note)
         _apply_choice(conn, lead, rows, choice, details)
         result = _resume(conn, lead, rows, choice, now)
-    elif choice == "restart_cadence":
+    elif choice in RESTART_CHOICES:
+        # Guards first: a refused restart (cooldown, call going out) changes nothing, not even
+        # the name; the pop-up shows why and staff choose again.
         _restart_guards(conn, lead)
         close_open_reviews(conn, lead_id, choice, by=actor_id, by_name=actor_name, note=note)
+        if choice in RESTART_BASE:
+            _apply_choice(conn, lead, rows, RESTART_BASE[choice], details)
         result = _restart(conn, lead)
     elif choice == "send_booking_link":
         link = _booking_link_guards(conn, lead)
@@ -1024,8 +1146,7 @@ def resolve_review(
     new = conn.execute("select status,cadence_state from leads where id=%s", (lead_id,)).fetchone()
     record_status(
         conn, lead_id, lead["status"], new["status"], "dashboard",
-        (f"Review resolved by {actor_name}: {CHOICE_LABELS[choice]}"
-         + (f". Note: {note}" if note else ""))[:500],
+        (f"Review resolved by {actor_name}: {label}" + (f". Note: {note}" if note else ""))[:500],
     )
     enqueue_sheet_update(
         conn, lead_id=lead_id,
@@ -1033,14 +1154,18 @@ def resolve_review(
         event_type="review_flagged" if result.get("remaining_reviews") else "review_resolved",
         source_key=f"{lead_id}:{rows[0].get('id')}:{choice}:{now.isoformat()}",
     )
-    if choice == "keep_old_name" and details.get("new_name"):
+    if choice in KEEP_OLD_NAME and details.get("new_name"):
         # The Sheet's Name cell still shows the new name; this update writes the kept one back.
         enqueue_sheet_update(conn, lead_id=lead_id, event_type="name_kept",
+                             source_key=f"{lead_id}:{rows[0].get('id')}:{now.isoformat()}")
+    if choice in KEEP_OLD_VALUE and details.get("new_value"):
+        # The same for a kept location / case / date of birth (sheet_sync._kept_values).
+        enqueue_sheet_update(conn, lead_id=lead_id, event_type="value_kept",
                              source_key=f"{lead_id}:{rows[0].get('id')}:{now.isoformat()}")
     return {
         "status": "resolved",
         "choice": choice,
-        "label": CHOICE_LABELS[choice],
+        "label": label,
         "lead_status": new["status"],
         "cadence_state": new["cadence_state"],
         **result,

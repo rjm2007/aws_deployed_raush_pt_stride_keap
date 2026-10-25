@@ -137,10 +137,10 @@ def test_restart_cadence_starts_over_from_day_0_with_the_cooldown(denv):
     assert [(p["day_offset"], p["channel"]) for p in planned][:2] == [(0, "call"), (0, "sms")]
     assert _reviews(denv, lead)[0]["resolution"] == "restart_cadence"
     # Flagged again minutes later: a second Day 0 restart is refused (same window as the Sheet).
+    # (migration 048's fail-safe writes the one open review row; the restart is offered on it)
     denv.db.execute("update leads set needs_review=true,review_reason='Cancelled in Stride',"
                     "status='needs_attention',cadence_state='completed' where id=%s", (lead,))
-    denv.db.execute("insert into lead_reviews(lead_id,code,message,source) "
-                    "values(%s,'appointment_cancelled','Cancelled in Stride','stride')", (lead,))
+    assert len([r for r in _reviews(denv, lead) if r["resolved_at"] is None]) == 1
     refused = _post(f"review/{lead}/resolve", {"choice": "restart_cadence"})
     assert refused.status_code == 409 and "last 10 minutes" in refused.json()["detail"]
 

@@ -27,26 +27,31 @@ def test_landline_errors_hide_try_again():
     assert card["group"] == "text" and card["landline"] is True
     assert "can't receive texts (likely a landline)" in card["reason"]
     assert "Day 0 text" in card["reason"]
-    assert [o["choice"] for o in card["options"]] == ["calls_only", "front_desk"]
+    assert [o["choice"] for o in card["options"]] == ["calls_only", "restart_cadence", "front_desk"]
     assert {"label": "Error code", "value": "Twilio 30006"} in card["proof"]
 
 
 def test_temporary_errors_keep_try_again():
     card = describe(_review("sms_failed", error_code="30003"), LEAD)
-    assert [o["choice"] for o in card["options"]] == ["calls_only", "retry_texts", "front_desk"]
+    assert [o["choice"] for o in card["options"]] == ["calls_only", "retry_texts", "restart_cadence",
+                                                      "front_desk"]
     assert sms_failure("30003")["permanent"] is False
     assert "Twilio error 39999" in sms_failure("39999")["reason"]
     assert "no reason given" in sms_failure(None)["reason"]
 
 
 @pytest.mark.parametrize(("code", "group", "choices"), [
-    ("name_changed", "name", ["use_new_name", "keep_old_name", "different_person", "front_desk"]),
-    ("wrong_person", "call", ["number_ok", "wrong_number", "front_desk"]),
-    ("call_no_outcome", "call", ["number_ok", "wrong_number", "front_desk"]),
-    ("dispatch_unconfirmed", "technical", ["continue", "front_desk"]),
-    ("manual_sms_unconfirmed", "technical", ["continue", "front_desk"]),
+    # Owner 2026-10-25: restart choices on the card (a Sheet Restart on a lead in review is refused).
+    ("name_changed", "name", ["use_new_name", "keep_old_name", "use_new_name_restart",
+                              "keep_old_name_restart", "different_person", "front_desk"]),
+    ("wrong_person", "call", ["number_ok", "wrong_number", "restart_cadence", "front_desk"]),
+    ("call_no_outcome", "call", ["number_ok", "wrong_number", "restart_cadence", "front_desk"]),
+    ("dispatch_unconfirmed", "technical", ["continue", "restart_cadence", "front_desk"]),
+    ("manual_sms_unconfirmed", "technical", ["continue", "restart_cadence", "front_desk"]),
     ("number_blocked", "blocked", ["front_desk"]),
-    ("something_new", "other", ["continue", "front_desk"]),  # unknown/legacy code
+    ("phone_changed", "phone", ["close_phone_changed", "front_desk"]),
+    ("booking_unclear", "booking", ["front_desk"]),
+    ("something_new", "other", ["continue", "restart_cadence", "front_desk"]),  # unknown/legacy code
 ])
 def test_each_group_offers_its_choices(code, group, choices):
     card = describe(_review(code, old_name="Asha Rao", new_name="Asha Kumar"), LEAD, has_calls=True)
@@ -90,7 +95,8 @@ def test_a_legacy_name_review_shows_the_name_on_file_and_cannot_use_an_unknown_n
     card = describe(_review("name_changed"), {**LEAD, "full_name": "Dana Smith"})
     assert "?" not in card["reason"] and "“Dana Smith”" in card["reason"]
     assert {"label": "Old name", "value": "Dana Smith"} in card["proof"]
-    assert [o["choice"] for o in card["options"]] == ["keep_old_name", "different_person", "front_desk"]
+    assert [o["choice"] for o in card["options"]] == ["keep_old_name", "keep_old_name_restart",
+                                                      "different_person", "front_desk"]
 
 
 def test_a_legacy_wrong_person_review_keeps_the_agents_note():
@@ -199,3 +205,64 @@ def test_resolving_a_closed_review_returns_the_reason():
         resolve_review(Conn(), "lead-1", "calls_only", note=None, actor_id="u", actor_name="Emma")
     assert error.value.status_code == 409
     assert error.value.detail.startswith("This lead was closed: a newer Sheet row")
+
+
+# --- owner, 2026-10-25: restart choices, location / case / date of birth reviews ----------------
+
+
+def test_restart_choices_have_their_labels_and_sheet_words():
+    from rpt_agent.services.lead_review import choice_label, sheet_resolved_text
+
+    assert CHOICE_LABELS["use_new_name_restart"] == "Same person, use new name & restart from Day 0"
+    assert CHOICE_LABELS["keep_old_name_restart"] == "Same person, keep old name & restart from Day 0"
+    assert CHOICE_LABELS["restart_cadence"] == "Restart cadence from Day 0"
+    assert sheet_resolved_text("use_new_name_restart") == "Resolved: new name used; cadence restarted"
+    assert sheet_resolved_text("keep_old_name_restart") == "Resolved: old name kept; cadence restarted"
+    assert sheet_resolved_text("restart_cadence") == "Cadence restarted"
+    assert choice_label("use_new_value", "location_changed") == "Use new location & continue"
+    assert choice_label("keep_old_value", "case_changed") == "Keep old case & continue"
+    assert choice_label("use_new_value_restart", "dob_changed") == (
+        "Use new date of birth & restart from Day 0")
+    assert choice_label("keep_old_value_restart", "location_changed") == (
+        "Keep old location & restart from Day 0")
+    assert sheet_resolved_text("keep_old_value", "dob_changed") == "Resolved: old date of birth kept"
+    assert sheet_resolved_text("use_new_value_restart", "case_changed") == (
+        "Resolved: new case used; cadence restarted")
+
+
+@pytest.mark.parametrize(("code", "field", "sheet"), [
+    ("location_changed", "location", "Needs review: location changed"),
+    ("case_changed", "case", "Needs review: case changed"),
+    ("dob_changed", "date of birth", "Needs review: date of birth changed"),
+])
+def test_a_location_case_or_birthday_change_is_reviewed_like_a_name(code, field, sheet):
+    card = describe(_review(code, field=field, old_value="Old", new_value="New"), LEAD)
+    assert card["group"] == "details" and card["group_label"] == "Details changed"
+    assert f"The {field} in the Google Sheet changed from “Old” to “New”" in card["reason"]
+    assert card["proof"][:2] == [{"label": f"Old {field}", "value": "Old"},
+                                 {"label": f"New {field}", "value": "New"}]
+    assert [(o["choice"], o["label"]) for o in card["options"]] == [
+        ("use_new_value", f"Use new {field} & continue"),
+        ("keep_old_value", f"Keep old {field} & continue"),
+        ("use_new_value_restart", f"Use new {field} & restart from Day 0"),
+        ("keep_old_value_restart", f"Keep old {field} & restart from Day 0"),
+        ("front_desk", "Front desk will handle"),
+    ]
+    assert sheet_open_status(code, {}) == sheet
+
+
+def test_no_restart_is_offered_while_another_review_is_open():
+    card = describe(_review("wrong_person"), LEAD, more=True)
+    assert [o["choice"] for o in card["options"]] == ["number_ok", "wrong_number", "front_desk"]
+    card = describe(_review("name_changed", old_name="A", new_name="B"), LEAD, more=True)
+    assert "use_new_name_restart" not in [o["choice"] for o in card["options"]]
+
+
+def test_restart_choices_say_what_they_do():
+    from rpt_agent.services.lead_review import _effect
+
+    effect = _effect("use_new_name_restart", {"new_name": "Asha Kumar"}, LEAD, "name", "name_changed")
+    assert effect == ("Name becomes Asha Kumar. The old schedule is discarded and a new cadence "
+                      "starts from Day 0")
+    effect = _effect("keep_old_value", {"old_value": "Dana Point"}, LEAD, "details", "location_changed")
+    assert effect == "The location stays Dana Point; the Sheet cell is set back to it"

@@ -957,7 +957,8 @@ def test_restart_rejects_a_repeat_sheet_restart_within_cooldown(monkeypatch):
     def execute(query, params=None):
         if "from lead_status_history" in query:
             conn.queries.append((" ".join(query.split()), params))
-            return _Rows(one={"retry_at": datetime(2026, 10, 25, 22, 52, tzinfo=UTC)})
+            # The last Sheet restart; a new one is accepted 10 minutes after it.
+            return _Rows(one={"at": datetime(2026, 10, 25, 22, 42, tzinfo=UTC)})
         return original_execute(query, params)
 
     conn.execute = execute

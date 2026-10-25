@@ -16,6 +16,7 @@ from ..parsing import parse_flexible_date
 from ..security import DashboardActor, require_dashboard_auth
 from ..services import appointment_views
 from ..services.keap_sync_status import keap_sync_status
+from ..services.lead_actions import _replay_stored_response
 from ..services.lead_review import (
     CHOICE_LABELS,
     FRONT_DESK_REASON,
@@ -47,6 +48,7 @@ from ..services.review import (
     restore_pause_skipped,
     skip_remaining_planned,
 )
+from ..services.sheet_direct import label_result
 from ..services.sheet_sync import enqueue_sheet_update
 from ..services.stride_sync_status import stride_sync_status
 from ..services.twilio_service import TwilioService
@@ -254,8 +256,10 @@ def _review_from_row(row: dict) -> dict | None:
         "details": row.get("review_details") or {}, "source": row.get("review_source") or "legacy",
         "flagged_at": row.get("review_flagged_at") or row.get("lead_review_flagged_at"),
     }
-    summary = describe(review, row, has_calls=bool(row.get("has_calls")))
-    summary["open_count"] = int(row.get("open_reviews") or 1)
+    open_count = int(row.get("open_reviews") or 1)
+    # With more reviews open no restart is offered (lead_review.describe), as on the lead page.
+    summary = describe(review, row, has_calls=bool(row.get("has_calls")), more=open_count > 1)
+    summary["open_count"] = open_count
     return summary
 
 
@@ -376,8 +380,47 @@ def _activity_entry(
     }
 
 
-def _build_activity(audits, events, status_history, appointments, reviews=()) -> list[dict]:
-    entries: list[dict] = []
+# Google Sheet commands in a lead's Activity (owner, 2026-10-25): every command, refusals with the
+# reason, from lead_action_requests (both Sheet modes write it). Source: "Google Sheet".
+SHEET = "Google Sheet"
+SHEET_COMMAND_LABELS = {"start_cadence": "Start cadence", "restart_cadence": "Restart cadence",
+                        "do_not_contact": "Do Not Contact", "booked": "Booked"}
+SHEET_DONE_WORDS = {
+    "cadence_started": "cadence started", "already_started": "already in cadence",
+    "cadence_restarted": "cadence restarted", "do_not_contact_applied": "applied",
+    "booked_applied": "marked Booked", "already_booked": "already booked (not started again)",
+    "number_blocked_needs_review": "number blocked; needs review",
+}
+# Status lines the command's own entry already shows (lead_actions writes one per change).
+SHEET_COMMAND_REASONS = {"cadence started from Google Sheets", "cadence restarted from Google Sheets",
+                         "Do Not Contact selected in Google Sheets", "Booked selected in Google Sheets"}
+
+
+def _sheet_command_entry(row: dict) -> dict:
+    label = SHEET_COMMAND_LABELS.get(row["action"], str(row["action"]))
+    replayed = _replay_stored_response(row.get("response_body"))
+    body = replayed.body if replayed else {}
+    if row["status"] == "completed":
+        title = f"{label}: {SHEET_DONE_WORDS.get(str(body.get('result')), 'done')}"
+    else:
+        # The same words the Sheet's Outcome Status shows (sheet_direct.label_result).
+        text = label_result(replayed).status if replayed else "Error: refused"
+        title = f"{label} refused: {text.removeprefix('Error: ')}"
+    return _activity_entry(
+        entry_id=f"sheet-{row['request_id']}",
+        action=f"sheet.{row['action']}",
+        occurred_at=row.get("completed_at") or row.get("created_at"),
+        actor_type="automation",
+        actor_name=SHEET,
+        category="cadence",
+        title=title,
+        details={"source": SHEET},
+    )
+
+
+def _build_activity(audits, events, status_history, appointments, reviews=(),
+                    sheet_commands=()) -> list[dict]:
+    entries: list[dict] = [_sheet_command_entry(row) for row in sheet_commands]
     for review in reviews:
         title = TITLES.get(review["code"], TITLES["other"])
         entries.append(_activity_entry(
@@ -385,12 +428,13 @@ def _build_activity(audits, events, status_history, appointments, reviews=()) ->
             action="review.flagged",
             occurred_at=review["flagged_at"],
             actor_type="employee" if review["source"] == "dashboard" else "automation",
-            actor_name=(review.get("details") or {}).get("by") or "Automation",
+            actor_name=(review.get("details") or {}).get("by")
+            or (SHEET if review["source"] == "sheet" else "Automation"),
             category="review",
             title=f"Flagged: {title}",
         ))
         if review.get("resolved_at"):
-            label = resolution_label(review.get("resolution")) or "Review cleared"
+            label = resolution_label(review.get("resolution"), review.get("code")) or "Review cleared"
             note = f" Note: {review['note']}" if review.get("note") else ""
             by = review.get("resolved_by_name") or "System"
             entries.append(_activity_entry(
@@ -465,6 +509,24 @@ def _build_activity(audits, events, status_history, appointments, reviews=()) ->
         ))
     for index, row in enumerate(status_history):
         if row.get("source") == "dashboard":
+            continue
+        if row.get("source") == "n8n_sheet":
+            if row.get("reason") in SHEET_COMMAND_REASONS:
+                continue  # the command's own entry (sheet_commands) says it
+            # Phone changed, email changed, a command the Sheet worker refused itself, ...
+            reason = str(row.get("reason") or "Lead status updated")
+            moved = row.get("from_status") != row.get("to_status")
+            entries.append(_activity_entry(
+                entry_id=f"status-{index}-{row['changed_at']}",
+                action="sheet.update",
+                occurred_at=row["changed_at"],
+                actor_type="automation",
+                actor_name=SHEET,
+                category="cadence",
+                title=reason[:1].upper() + reason[1:],
+                details={"source": SHEET, **({"from": row.get("from_status"),
+                                              "to": row.get("to_status")} if moved else {})},
+            ))
             continue
         entries.append(_activity_entry(
             entry_id=f"status-{index}-{row['changed_at']}",
@@ -976,6 +1038,13 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
             (lead_id,),
         ).fetchall()
         review = lead_review_summary(conn, row) if row["needs_review"] else None
+        # As text: the live databases store lead_action_requests.lead_id as text (2026-10-22).
+        sheet_commands = conn.execute(
+            "select request_id::text as request_id,action,status,response_body,created_at,"
+            "completed_at from lead_action_requests where lead_id::text=%s "
+            "and status in ('completed','failed') order by created_at desc limit 100",
+            (str(lead_id),),
+        ).fetchall()
     detail = dict(row)
     detail["review"] = review
     detail["texts_off"] = bool(row.get("sms_disabled"))
@@ -1031,7 +1100,8 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
         "booking": booking,
         "history": status_history,
         "cadence_actions": cadence_actions,
-        "activity": _build_activity(audits, events, status_history, appointments, reviews),
+        "activity": _build_activity(audits, events, status_history, appointments, reviews,
+                                    sheet_commands),
         "cadence_version": version_payload,
     }
 
