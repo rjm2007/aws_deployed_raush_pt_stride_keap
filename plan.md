@@ -164,6 +164,7 @@ Main responses:
 | 401 | Wrong shared secret |
 | 409 `lead_already_exists` | Blank-ID row uses a phone already present in the practice |
 | 409 `outreach_unresolved` | Restart while a call or text is still going out. Direct mode Sheet text: `Error: a call or text is going out right now. Pick Restart cadence again in a minute.` |
+| 409 `restart_needs_review` / `restart_booked` / `restart_closed` | Direct mode only (`sheet_rules`, 2026-10-25): Restart on a lead in review, booked, or closed by a decision (`closed_reason`). Sheet texts in section 5 |
 | 409 `restart_too_soon` | Restart within 10 minutes of the last Sheet restart; body has `retry_at` (ISO time a new Restart is accepted). Direct mode Sheet text: `Error: restarted less than 10 minutes ago. Pick Restart cadence again after 3:52 PM PT.` (Pacific) |
 | 200 `already_booked` | Blank-ID row is the same person (phone + name + birthday) as a lead already booked; no new lead, no calls, `lead_id` empty (Sheet shows `Already booked`) |
 | 409 `name_changed_needs_review` | Linked row's name differs from its database lead |
@@ -201,6 +202,23 @@ Behavior:
   matching name-only, phone-only, or combined `*_changed_needs_review` code.
 - Blank Lead ID is invalid for this endpoint.
 - Profile updates never create or restart cadence.
+- Direct mode (owner, 2026-10-25; n8n mode unchanged): Location, Case and Date Of Birth edits go to review
+  like a Name (`location_changed` / `case_changed` / `dob_changed`, Sheet text `Needs review: location changed`
+  etc.; the lead keeps its value). Choices: `Use new <field> & continue`, `Keep old <field> & continue`, the
+  two `... & restart from Day 0` variants, `Front desk will handle`. Keep old writes the old value back into
+  the cell (dates as MM/DD/YYYY), like keep old name: only over the reviewed value, fingerprint stored, no new
+  review, no loop. A finished lead keeps its value and is not reviewed. An Email edit is applied at once and
+  noted in the lead's Activity ("Email changed in Google Sheet"). A phone change still closes the lead.
+
+### Staff guidance for the Sheet (2026-10-25)
+
+- Pick a command in Action; it runs once and the cell empties. Pick it again to run it again.
+- A lead in Needs Review, booked or closed is handled on the dashboard (Resolve review offers restart from
+  Day 0); the Sheet's Restart refuses it and says why.
+- Don't delete rows, don't copy-paste whole rows (the hidden Lead ID / Action Request ID would come along),
+  and don't edit the hidden columns (Lead ID, Action Request ID, Action Started At). A new patient, or a new
+  phone number, goes in a new row.
+- Every Sheet command (and its refusal, with the reason) shows in the lead's Activity as "Google Sheet".
 
 ### AWS Sheet update webhook in n8n
 
@@ -256,12 +274,11 @@ states and inbound replies. These endpoints update Supabase first; they never ca
    while a changed Action (Restart cadence, Booked) still goes through.
    Direct mode, a row in review (2026-10-22; Outcome Status "Needs review: ..." or "Number blocked; needs
    review"): Booked and Do Not Contact run as on any row and close the review ("booked" / "do_not_contact").
-   Restart cadence does not run past the review: the row gets "<review text>; resolve it on the dashboard
-   first, then the restart runs", the Action cell is kept, and the Restart runs once the review is resolved.
-   If the dashboard ends the lead instead (close, front desk, booking link, Booked, Do not contact, or Stride
-   books it), that newer decision wins: the Restart is dropped (Action emptied), and
-   Outcome Status says "<result>; the Restart in Action was not run" (a final "Booked" / "Do Not Contact
-   applied" stays as is). Clearing Action removes the "resolve it on the dashboard first" words on the next poll.
+   Restart cadence on a lead in review is refused at once (owner, 2026-10-25; checked in the database, not
+   the row): `Error: this lead needs review. Resolve it on the dashboard; you can restart it from there.`,
+   and Action empties. It no longer waits in Action (the 2026-10-22..25 "parked" Restart is gone); the review
+   card offers the restart instead. A row still holding such a waiting Restart ("...; resolve it on the
+   dashboard first, then the restart runs") is emptied with that refusal text on the first poll, never run.
    **Action column rule (direct mode, owner 2026-10-25): staff pick a command, it runs, the cell empties.**
    Once a command is handled (it ran, the backend refused it, or the row could not run it) the Sheet worker
    empties Action, and the Action Request ID with it, in the same write as the result. The result stays in
@@ -270,12 +287,19 @@ states and inbound replies. These endpoints update Supabase first; they never ca
    run the same command again by picking it again (a patient can be restarted any number of times; the
    10-minute restart cooldown still applies). The empty write only lands if the cell still holds the command
    that was handled: a command staff picked meanwhile is kept and runs next. An empty Action is never a command,
-   and the worker never writes anything else into Action. The one exception is a Restart parked behind an open
-   review: it stays in Action until it runs (then emptied) or is dropped (then emptied, with "; the Restart in
-   Action was not run"). A Restart on a lead whose review is still open (checked in the database, not the row)
-   waits the same way. Booked and Do Not Contact run at once. Refusals say what to do:
+   and the worker never writes anything else into Action. Booked and Do Not Contact run at once, also on a lead
+   in review. Restart guardrails (owner, 2026-10-25): the Sheet never undoes a dashboard decision. Refusals say
+   what to do:
+   - `Error: this lead needs review. Resolve it on the dashboard; you can restart it from there.`
+   - `Error: this lead is booked. Reopen it on the dashboard if needed.` (n8n mode still restarts a booked lead)
+   - `Error: this lead is closed (<why>). Use the dashboard.` where <why> is `handled by front desk`,
+     `a newer row has this phone number`, `not interested` or `closed on the dashboard` (moved to Closed on the
+     board). Do Not Contact, wrong number / different person and phone changed keep their own refusals. A
+     cadence that only ran out (Closed, no response; booking link sent; transferred) still restarts from the
+     Sheet (2026-10-20).
    - `Error: a call or text is going out right now. Pick Restart cadence again in a minute.`
-   - `Error: restarted less than 10 minutes ago. Pick Restart cadence again after <h:mm AM/PM> PT.`
+   - `Error: restarted less than 10 minutes ago. Pick Restart cadence again after <h:mm AM/PM> PT.` (the 10
+     minutes count from the last restart, from the Sheet or from a review card)
    - `Error: this row already has a lead. Pick Restart cadence to start the calls again.` (Start cadence on a
      linked row)
    - any other backend refusal or row error: `Error: <reason>`.

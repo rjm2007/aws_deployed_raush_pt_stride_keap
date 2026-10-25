@@ -2413,3 +2413,43 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   cooldown text with the time, call going out, phone mismatch, staff edit between read and write, first poll on
   old rows narrow and full, the worker only ever writes "" into Action), `test_lead_review_integration.py`,
   `test_live_column_types_integration.py`, `test_n8n_integration.py` (`retry_at`).
+
+### 2026-10-25 — Sheet Restart guardrails, restart from the review card, details reviews, Sheet Activity (owner decisions)
+- Direct mode only (`execute_lead_action(..., sheet_rules=True)` / `sync_sheet_lead(..., sheet_rules=True)` from
+  `sheet_direct`); the n8n endpoint passes nothing, so n8n mode is unchanged (it still restarts a booked lead).
+- Sheet Restart is refused, with Action emptied as usual, when the lead (checked in the database under the lead
+  lock) is: in review -> "Error: this lead needs review. Resolve it on the dashboard; you can restart it from
+  there."; booked -> "Error: this lead is booked. Reopen it on the dashboard if needed."; closed by a decision ->
+  "Error: this lead is closed (<why>). Use the dashboard." (handled by front desk / a newer row has this phone
+  number / not interested / closed on the dashboard). DNC, wrong number / different person and phone changed keep
+  their own refusals. A cadence that only ran out (closed_no_response without front desk, booking link sent,
+  transferred) still restarts (2026-10-20 feature). Codes `restart_needs_review`, `restart_booked`,
+  `restart_closed` (`closed_reason`). The Booked-undo-by-Restart path is n8n-only now.
+- The parked Restart is gone (`parked`, `_hint_due`, `_with_hint`, `_drop_parked`, `_review_waiting`, `NOT_RUN`,
+  `REVIEW_FIRST`, `ENDED_LEAD_STATUSES`). One-time safety: a row still showing the old "...; resolve it on the
+  dashboard first, then the restart runs" next to Restart cadence is emptied with the review refusal and never
+  run (`_legacy_waiting`; with an Action Request ID via `retire_old`). The words alone (no Restart) are removed.
+- Review cards: restart choices. Name: "Same person, use new name & restart from Day 0", "Same person, keep old
+  name & restart from Day 0". Text / call / technical / other: "Restart cadence from Day 0" (appointment had it).
+  Not phone / blocked / booking. Not offered while another review is open (it would settle both). Guards first
+  (10-minute cooldown, call going out, opt-outs, blocked): a refusal changes nothing and the pop-up shows it.
+  Sheet: "Cadence restarted", "Resolved: new name used; cadence restarted", "Resolved: old name kept; cadence
+  restarted" (keep old name also writes the old name back). The cooldown is shared: Sheet restarts and
+  review-card restarts (`lead_review.last_review_restart`, from `lead_reviews.resolved_at`) both count, both ways.
+- Profile edits: before, Location / Case / Date Of Birth and Email were applied silently (only Name -> review,
+  Phone -> close). Now Location / Case / Date Of Birth go to review like a Name (codes `location_changed`,
+  `case_changed`, `dob_changed`, group "details" / "Details changed", old -> new on the card, Sheet "Needs review:
+  <field> changed"); choices "Use new <field> & continue", "Keep old <field> & continue", the two restart
+  variants, "Front desk will handle". Keep old writes the old value back (dates MM/DD/YYYY) only over the reviewed
+  value (`value_kept` snapshot, `sheet["kept"]`, `_restore_values`), fingerprint stored, no new review, no loop;
+  until the write lands the kept value is remembered from the resolution itself (`_kept_value`, spent with
+  `kept_spent`), so no migration. A finished lead keeps its values and is not reviewed (as for a name). Email is
+  applied and logged in Activity ("Email changed in Google Sheet").
+- Activity: every Sheet command from `lead_action_requests` (completed and refused, both modes), actor "Google
+  Sheet", e.g. "Restart cadence: cadence restarted", "Restart cadence refused: this lead is booked. ...";
+  refusals the Sheet worker makes itself (Start on a linked row, invalid linked row, old waiting Restart) are
+  status lines (`note_refusal`, source n8n_sheet); other n8n_sheet lines (phone changed, email changed) show their
+  reason as "Google Sheet". Sheet-flagged reviews show "Google Sheet" as who flagged them.
+- No migration. Tests: `test_sheet_direct.py`, `test_lead_review.py`, `test_lead_review_integration.py`,
+  `test_sheet_direct_integration.py`, `test_demo_review_integration.py`, `test_n8n_integration.py`,
+  `test_dashboard.py`. Frontend branch `feat/review-restart` (new choices, Details group, refusal in the pop-up).
