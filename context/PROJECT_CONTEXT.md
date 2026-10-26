@@ -2640,5 +2640,9 @@ Booked when the booking worked (the booking wins over the end-of-call report).
 - Unchanged: `status_reason` (so the card, Sheet Outcome Status `SHEET_REPLACED` / `SHEET_RESTARTED`
   and the review label "Replaced by another lead with this phone number" read as before); Sheet Lead
   Status is "Closed"; board column Closed. A booked lead is never touched (explicit `status <> booked`).
+- Tester fixes (same day): a status already closed (wrong number, Do Not Contact, declined) is kept,
+  so Keap still keeps it out and the "marked as a wrong number" warning still fires; Keap never plans
+  "gave up" for a replaced lead (`keap_desired`, by `status_reason`): it keeps Pending, as before;
+  the lead's Activity title is the replaced / restarted reason, not "Closed, no response".
 - No migration. Older replaced leads in the database keep their old status until a one-off fix.
   Tests: `test_one_lead_per_phone_integration.py`.

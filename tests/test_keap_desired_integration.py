@@ -524,3 +524,54 @@ def test_a_family_member_on_the_same_phone_does_not_carry_the_booking(env):
     env.plan()
     assert env.tags(lead_id=child) == [PENDING]
     assert env.row(lead_id=parent)["status"] != "skipped"
+
+
+def _tags_of(env, lead_id):
+    row = env.row(lead_id=lead_id)
+    return set((row["desired"] or {}).get("tags") or []), row["skip_reason"]
+
+
+def test_a_lead_replaced_by_a_restart_keeps_pending_not_gave_up(env):
+    # Tester 2026-10-26: restarting the older lead closed the newer one, which then planned
+    # "gave up" on the contact while the restarted lead was being called.
+    from rpt_agent.services.review import RESTARTED_REASON, hand_over_number
+
+    old = env.lead("Asha Rao", phone="+15555550188")
+    env.db.execute("update leads set created_at=created_at-interval '1 day' where id=%s", (old,))
+    new = env.lead("Asha Rao", phone="+15555550188")
+    with transaction() as c:
+        hand_over_number(c, practice_id=env.practice_id, phone="+15555550188",
+                         lead_id=str(old), reason=RESTARTED_REASON)
+    env.plan(full=True)
+    assert env.one("select status from leads where id=%s", new)["status"] == "closed_no_response"
+    tags, skip = _tags_of(env, new)
+    assert skip is None and PENDING in tags and "186" not in tags
+
+
+def test_a_family_member_replaced_by_a_newer_row_keeps_pending(env):
+    from rpt_agent.services.review import hand_over_number
+
+    old = env.lead("Asha Rao", phone="+15555550189")
+    env.db.execute("update leads set created_at=created_at-interval '1 day' where id=%s", (old,))
+    new = env.lead("Ravi Rao", phone="+15555550189")
+    with transaction() as c:
+        hand_over_number(c, practice_id=env.practice_id, phone="+15555550189", lead_id=str(new))
+    env.plan(full=True)
+    tags, _ = _tags_of(env, old)
+    assert PENDING in tags and "186" not in tags
+
+
+def test_a_replaced_wrong_number_lead_stays_out_of_keap(env):
+    from rpt_agent.services.review import hand_over_number
+
+    old = env.lead("Asha Rao", phone="+15555550190", status="invalid_phone")
+    env.db.execute("update leads set created_at=created_at-interval '1 day',cadence_state='paused' "
+                   "where id=%s", (old,))
+    new = env.lead("Ravi Mehra", phone="+15555550190")
+    with transaction() as c:
+        warning = hand_over_number(c, practice_id=env.practice_id, phone="+15555550190",
+                                   lead_id=str(new))
+    assert "marked as a wrong number" in warning
+    assert env.one("select status from leads where id=%s", old)["status"] == "invalid_phone"
+    env.plan(full=True)
+    assert _tags_of(env, old)[1] == "do not contact / wrong number: kept out of Keap"

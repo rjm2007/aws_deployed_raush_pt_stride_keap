@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from psycopg.types.json import Jsonb
 
+from .lead_stage import CLOSED_STATUSES
 from .sheet_sync import enqueue_sheet_update
 
 # Skipped by pause/review so Resume can restore only these rows, not DNC/closed skips.
@@ -184,16 +185,19 @@ def hand_over_number(
             # Its status closes as well (owner, 2026-10-26): it kept "In cadence" / "Callback
             # scheduled" (or "Needs review") after its calls had ended. Closed the way a front
             # desk close is; status_reason keeps the "replaced" words for the card and the Sheet.
+            # A status that is already closed stays (tester 2026-10-26): a wrong number or Do Not
+            # Contact must keep it, or Keap stops keeping it out and the wrong-number warning goes.
+            status = other["status"] if other["status"] in CLOSED_STATUSES else "closed_no_response"
             conn.execute(
-                "update leads set status='closed_no_response',cadence_state='terminated',"
+                "update leads set status=%s,cadence_state='terminated',"
                 "status_reason=%s,needs_review=false,status_changed_at=now() where id=%s",
-                (reason, other["id"]),
+                (status, reason, other["id"]),
             )
             skip_remaining_planned(conn, str(other["id"]), reason)
             conn.execute(
                 "insert into lead_status_history(lead_id,from_status,to_status,source,reason) "
-                "values(%s,%s,'closed_no_response','system',%s)",
-                (other["id"], other["status"], reason),
+                "values(%s,%s,%s,'system',%s)",
+                (other["id"], other["status"], status, reason),
             )
     conn.execute(
         "update leads set call_opt_out=call_opt_out or %s,sms_opt_out=sms_opt_out or %s "

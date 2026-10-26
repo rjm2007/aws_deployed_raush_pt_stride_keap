@@ -93,6 +93,9 @@ def test_board_new_on_the_oldest_row_closes_the_newer_lead_as_restarted(phone_en
     titles = [entry["title"] for entry in _get(f"leads/{new_id}").json()["activity"]]
     assert "Resolved by System: Replaced by another lead with this phone number." in titles
     assert not any("newer referral" in title for title in titles)
+    # Its close names why (tester 2026-10-26), not "Closed, no response".
+    assert "Replaced: another lead with this phone was restarted" in titles
+    assert "Closed, no response" not in titles
     # The middle lead was already closed by the newest row: it keeps the newer-row words.
     assert senv.lead(mid_id)["status_reason"] == REPLACED_REASON
     assert senv.cell(mid, "outcome_status") == NEWER_ROW
@@ -211,6 +214,8 @@ def test_a_new_row_still_says_a_newer_row(phone_env):
     lead = _get(f"leads/{old_id}").json()["lead"]
     assert (lead["stage"], lead["next_step"]) == (
         "closed", "Replaced: a newer Sheet row has this phone number")
+    titles = [entry["title"] for entry in _get(f"leads/{old_id}").json()["activity"]]
+    assert "Replaced by a newer referral on this number" in titles
 
 
 def test_a_replaced_lead_in_callback_or_review_closes(phone_env):

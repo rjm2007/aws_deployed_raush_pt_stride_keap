@@ -42,6 +42,7 @@ from ..services.number_block import (
 from ..services.provider_http import ProviderError
 from ..services.review import (
     REPLACED_REASON,
+    REPLACED_REASONS,
     RESTARTED_REASON,
     flag_lead_for_review,
     hand_over_number,
@@ -617,8 +618,10 @@ def _build_activity(audits, events, status_history, appointments, reviews=(),
             actor_type="automation",
             actor_name=actor,
             category="calls" if actor == ELLIOT else "appointments" if actor == STRIDE else "cadence",
+            # A replaced lead's close names why, not "Closed, no response" (tester 2026-10-26).
             title=(STATUS_WORDS.get(to_status, str(to_status).replace("_", " ").capitalize())
-                   if moved or not reason else _sentence(reason)),
+                   if (moved or not reason) and reason not in REPLACED_REASONS
+                   else _sentence(reason)),
             details={**({"reason": reason} if reason and moved else {}),
                      **({"from": row.get("from_status"), "to": to_status} if moved else {})},
         ))

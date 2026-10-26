@@ -22,6 +22,7 @@ from typing import Any
 import psycopg
 
 from ..config import get_settings
+from .review import REPLACED_REASONS
 from .stride_import import CANCELLED_STATUSES
 
 DOC_VERSION = 1
@@ -256,7 +257,11 @@ def compute_desired(
             tags.add(str(completed))
     if lead:
         status = lead.get("status")
-        ended = status in ENDED_LEAD_STATUSES and gave_up_tag and not live
+        # A lead closed because another lead took its number did not give up: the patient is
+        # still being worked on that number (tester 2026-10-26: a restart put "gave up" on the
+        # contact while the restarted lead was being called). It keeps Pending, as before.
+        replaced = lead.get("status_reason") in REPLACED_REASONS
+        ended = status in ENDED_LEAD_STATUSES and gave_up_tag and not live and not replaced
         if ended:
             tags.add(str(gave_up_tag))
         elif pending_tag:
@@ -440,7 +445,7 @@ def _load_context(conn, practice_id, rows, settings, mapping):
         r["id"]: dict(r)
         for r in conn.execute(
             "select id,full_name,first_name,last_name,email,phone_e164,date_of_birth,gender,status,"
-            "is_test,exists(select 1 from leads n where n.practice_id=l.practice_id "
+            "status_reason,is_test,exists(select 1 from leads n where n.practice_id=l.practice_id "
             " and n.phone_e164=l.phone_e164 and n.id<>l.id and n.created_at>l.created_at "
             " and " + _SAME_FIRST_NAME + ") as superseded from leads l where id=any(%s)",
             (lead_ids,),
