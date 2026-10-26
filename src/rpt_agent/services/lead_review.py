@@ -949,8 +949,11 @@ def _resume(conn, lead: dict, rows: list[dict], choice: str, now: datetime) -> d
         "where id=%s",
         (f"review resolved: {choice_label(choice, rows[0].get('code'))}"[:500], lead_id),
     )
-    if lead.get("phone_e164"):
-        # One active lead per phone on every path that sets a lead going again (2026-10-26).
+    # One active lead per phone on every path that sets a lead going again (2026-10-26). Only when
+    # steps are left to run: with none the lead moves to Closed and the live lead keeps the number.
+    if lead.get("phone_e164") and conn.execute(
+        "select 1 from outreach_events where lead_id=%s and status='planned' limit 1", (lead_id,)
+    ).fetchone():
         from .review import hand_over_number
 
         hand_over_number(conn, practice_id=lead["practice_id"], phone=lead["phone_e164"],

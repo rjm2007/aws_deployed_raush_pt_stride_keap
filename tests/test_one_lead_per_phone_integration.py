@@ -52,10 +52,18 @@ def _rows(senv, phone, count):
 
 
 def _active(senv, phone):
+    """Leads on the phone still in outreach with steps left to run (really going to be called)."""
     return [row["id"] for row in senv.db.execute(
-        "select id::text as id from leads where practice_id=%s and phone_e164 like %s "
-        "and cadence_state in ('pending','active','paused')",
+        "select id::text as id from leads l where practice_id=%s and phone_e164 like %s "
+        "and cadence_state in ('pending','active','paused') and exists(select 1 from "
+        "outreach_events e where e.lead_id=l.id and e.status='planned')",
         (senv.practice_id, f"%{phone}")).fetchall()]
+
+
+def _planned(senv, lead_id):
+    return [row["id"] for row in senv.db.execute(
+        "select id from outreach_events where lead_id=%s and status='planned' order by id",
+        (lead_id,)).fetchall()]
 
 
 def test_board_new_on_the_oldest_row_closes_the_newer_lead_as_restarted(phone_env):
@@ -89,11 +97,14 @@ def test_board_new_on_the_oldest_row_closes_the_newer_lead_as_restarted(phone_en
     assert senv.cell(old, "lead_status") != "Closed"
 
 
-def test_board_in_cadence_takes_the_number_too(phone_env):
+def test_board_in_cadence_takes_the_number_when_the_lead_has_steps_left(phone_env):
     senv = phone_env
     phone = _phone()
     (_old, new), (old_id, new_id) = _rows(senv, phone, 2)
-    assert _active(senv, phone) == [new_id]
+    # Two leads with steps on one phone (data from before 2026-10-26): In cadence takes the number.
+    senv.db.execute("update outreach_events set status='planned',failure_reason=null "
+                    "where lead_id=%s and status='skipped'", (old_id,))
+    senv.db.execute("update leads set cadence_state='paused',status_reason=null where id=%s", (old_id,))
 
     assert _post(f"leads/{old_id}/stage", {"stage": "cadence"}).status_code == 200
     senv.tick()
@@ -101,6 +112,30 @@ def test_board_in_cadence_takes_the_number_too(phone_env):
     assert _active(senv, phone) == [old_id]
     assert senv.lead(new_id)["status_reason"] == RESTARTED_REASON
     assert senv.cell(new, "outcome_status") == RESTARTED_ROW
+
+
+def test_board_in_cadence_on_an_ended_lead_leaves_the_live_lead_alone(phone_env):
+    # Tester 2026-10-26: In cadence on the replaced lead closed the live one and started nothing.
+    senv = phone_env
+    phone = _phone()
+    (old, new), (old_id, new_id) = _rows(senv, phone, 2)
+    steps = _planned(senv, new_id)
+    assert steps and _planned(senv, old_id) == []
+
+    assert _post(f"leads/{old_id}/stage", {"stage": "cadence"}).status_code == 200
+    senv.tick()
+
+    assert _active(senv, phone) == [new_id]
+    assert _planned(senv, new_id) == steps  # no call or text lost
+    assert senv.lead(new_id)["cadence_state"] == "active"
+    assert senv.lead(new_id)["status_reason"] is None
+    assert senv.cell(new, "outcome_status") != RESTARTED_ROW
+    # The moved lead still says why it stopped: the newer row has the number.
+    senv.db.execute("update lead_status_history set changed_at=changed_at-interval '11 minutes' "
+                    "where lead_id=%s", (old_id,))
+    senv.sheet.set(old, "action", "Restart cadence")
+    senv.tick()
+    assert _active(senv, phone) == [new_id]
 
 
 def test_sheet_restart_of_an_older_row_closes_the_newer_lead_as_restarted(phone_env):
@@ -164,3 +199,20 @@ def test_a_new_row_still_says_a_newer_row(phone_env):
     assert _active(senv, phone) == [new_id]
     assert senv.lead(old_id)["status_reason"] == REPLACED_REASON
     assert senv.cell(old, "outcome_status") == NEWER_ROW
+
+
+def test_review_continue_with_no_steps_left_leaves_the_live_lead_alone(phone_env):
+    # Tester 2026-10-26: Continue on the replaced lead ("none left, moves to Closed") closed the
+    # live lead too, leaving no lead on the phone.
+    senv = phone_env
+    phone = _phone()
+    (_old, new), (old_id, new_id) = _rows(senv, phone, 2)
+    steps = _planned(senv, new_id)
+    assert _post(f"leads/{old_id}/stage", {"stage": "attention"}).status_code == 200
+    assert _post(f"review/{old_id}/resolve", {"choice": "continue"}).status_code == 200
+    senv.tick()
+
+    assert _active(senv, phone) == [new_id]
+    assert _planned(senv, new_id) == steps
+    assert senv.lead(new_id)["status_reason"] is None
+    assert senv.cell(new, "outcome_status") != RESTARTED_ROW

@@ -1518,8 +1518,12 @@ def move_lead_stage(lead_id: UUID, payload: StageMove, actor: Actor):
                 (lead_id,),
             ).fetchone()["phone_e164"]
             # In cadence sets the lead going again, so it takes the number like New does: two
-            # active leads on one phone would both be called (owner, 2026-10-26).
-            if phone:
+            # active leads on one phone would both be called (owner, 2026-10-26). Only when it has
+            # steps left to run: an ended lead runs nothing, so the live lead keeps the number.
+            if phone and conn.execute(
+                "select 1 from outreach_events where lead_id=%s and status='planned' limit 1",
+                (lead_id,),
+            ).fetchone():
                 hand_over_number(
                     conn, practice_id=lead["practice_id"], phone=phone, lead_id=str(lead_id),
                     reason=RESTARTED_REASON,
