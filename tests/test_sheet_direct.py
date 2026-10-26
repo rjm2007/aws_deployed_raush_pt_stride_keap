@@ -146,6 +146,14 @@ def test_a_valid_start_row_builds_the_same_request_as_the_api():
     assert lead["date_of_birth"].isoformat() == "2007-01-16" and lead["title"] == "Ortho"
 
 
+def test_a_wrong_email_is_not_an_error_and_is_not_sent():
+    # Owner, 2026-10-26: only a warning; the lead gets no email (so none goes to Keap).
+    row = _row(name="Asha Rao", phone="5555550101", email="maria@gmail", date_of_birth="16/01/1990",
+               location="Dana Point", case="Ortho", action="Start cadence")
+    request, error = build_action(row, "start_cadence")
+    assert error is None and request.lead.email is None
+
+
 def test_an_impossible_date_gets_a_readable_error_not_request_rejected():
     row = _row(name="Asha Rao", phone="5555550101", date_of_birth="31/02/1990",
                location="Dana Point", case="Ortho", action="Start cadence")
@@ -824,3 +832,13 @@ def test_an_empty_action_is_left_alone(old, monkeypatch):
     number = sheet.add(**ROW, action="  ", lead_id=LEAD, outcome_status="Cadence started")
     assert _poll(sheet, monkeypatch) == []
     assert sheet.cell(number, "outcome_status") == "Cadence started" and sheet.writes == []
+
+
+def test_a_start_row_with_a_wrong_email_starts_with_a_warning(old, monkeypatch):
+    sheet = FakeSheet()
+    number = sheet.add(**{**ROW, "email": "maria@gmail"}, action="Start cadence")
+    started = sheet_direct.Outcome("Cadence started", "In cadence", LEAD_ID)
+    assert _poll(sheet, monkeypatch, started) == ["start_cadence"]
+    assert sheet.cell(number, "outcome_status") == (
+        "Cadence started; email looks wrong, please fix it")
+    assert sheet.cell(number, "lead_status") == "In cadence"

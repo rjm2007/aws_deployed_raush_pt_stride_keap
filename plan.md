@@ -209,6 +209,9 @@ Behavior:
   the cell (dates as MM/DD/YYYY), like keep old name: only over the reviewed value, fingerprint stored, no new
   review, no loop. A finished lead keeps its value and is not reviewed. An Email edit is applied at once and
   noted in the lead's Activity ("Email changed in Google Sheet"). A phone change still closes the lead.
+  A wrong email (e.g. "maria@gmail") is only a warning (owner, 2026-10-26): the cadence starts / goes on, no
+  review, the wrong email is not stored ("Cadence started; email looks wrong, please fix it" /
+  "Email looks wrong, please fix it"); fixing it applies the email and takes the warning off.
 
 ### Staff guidance for the Sheet (2026-10-25)
 

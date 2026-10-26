@@ -2470,3 +2470,14 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   changed") next to Lead Status "Closed". The move now queues a Sheet update (`board_closed`, like Booked's
   `lead_booked`); Outcome Status reads "Closed on the dashboard", Lead Status "Closed". Action is not written.
 - No migration. Tests: `test_lead_review_integration.py`, `test_n8n_integration.py`.
+
+### 2026-10-26 — Sheet: a wrong email is only a warning (owner-approved)
+- A new row with a wrong email (e.g. "maria@gmail") was refused ("Error: invalid email") and no cadence
+  started; an existing lead's email edited to a wrong one set Lead Status "Needs Review" with no real review.
+- Now (direct mode, `sheet_direct.row_email`): the wrong email is never sent, so it is never stored or sent to
+  Keap. New row: the lead is created with no email, cadence starts, Outcome Status "Cadence started; email
+  looks wrong, please fix it". Edit: the lead keeps its previous email, calls go on, no review, Lead Status
+  unchanged, Outcome Status "Email looks wrong, please fix it" (not over a command typed or running). Once
+  staff fix it the email is applied ("Email changed in Google Sheet" in Activity) and the warning goes
+  ("Cadence started" stays; the edit warning empties). Outreach results may overwrite the warning text.
+- No migration. Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`.

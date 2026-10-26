@@ -207,6 +207,39 @@ def test_profile_edits_sync_and_a_name_change_goes_to_review(env):
     assert env.lead(lead_id)["full_name"] == "Asha Rao"  # identity is never overwritten
 
 
+def test_a_wrong_email_is_only_a_warning(env):
+    # Owner, 2026-10-26: the cadence starts / goes on, no review, the wrong email is never stored.
+    number = env.start_row(email="maria@gmail")
+    env.tick()
+    lead_id = env.cell(number, "lead_id")
+    assert env.cell(number, "outcome_status") == "Cadence started; email looks wrong, please fix it"
+    assert env.cell(number, "lead_status") == "In cadence"
+    assert env.lead(lead_id)["status"] != "needs_review" and env.lead(lead_id)["email"] is None
+    env.sheet.set(number, "email", "maria@gmail.com")  # fixed: applied, warning gone
+    env.tick()
+    env.tick()
+    assert env.lead(lead_id)["email"] == "maria@gmail.com"
+    assert env.cell(number, "outcome_status") == "Cadence started"
+    notes = env.db.execute("select reason from lead_status_history where lead_id=%s",
+                           (lead_id,)).fetchall()
+    assert "Email changed in Google Sheet" in [n["reason"] for n in notes]
+    env.sheet.set(number, "email", "maria@gmail")  # edited to a wrong one: kept the old one
+    env.tick()
+    env.tick()
+    lead = env.lead(lead_id)
+    assert lead["email"] == "maria@gmail.com" and lead["needs_review"] is False
+    assert env.cell(number, "lead_status") == "In cadence"
+    assert env.cell(number, "outcome_status") == "Email looks wrong, please fix it"
+    reviews = env.db.execute("select count(*) as n from lead_reviews where lead_id=%s",
+                             (lead_id,)).fetchone()["n"]
+    assert reviews == 0
+    env.sheet.set(number, "email", "maria@example.test")
+    env.tick()
+    env.tick()
+    assert env.lead(lead_id)["email"] == "maria@example.test"
+    assert env.cell(number, "outcome_status") == ""
+
+
 def test_call_results_are_written_into_the_leads_row(env):
     number = env.start_row()
     env.tick()

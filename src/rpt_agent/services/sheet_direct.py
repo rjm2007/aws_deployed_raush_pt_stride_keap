@@ -128,6 +128,18 @@ FIELD_COLUMNS = {"full_name": "Name", "phone": "Phone Number", "email": "Email",
                  "date_of_birth": "Date Of Birth", "location": "Location", "title": "Case",
                  "lead_type": "Case"}
 EMAIL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+# A wrong email is only a warning (owner, 2026-10-26): the cadence starts / goes on, no review, and
+# the lead keeps no email (new row) or its previous one (edit) until staff fix the cell.
+EMAIL_WARNING = "Email looks wrong, please fix it"
+STARTED_EMAIL_WARNING = "Cadence started; email looks wrong, please fix it"
+
+
+def row_email(row: SheetRow) -> tuple[str, bool]:
+    """(the row's email if valid else "", True if the cell holds an invalid email)."""
+    email = row.get("email").lower()
+    if email and not EMAIL.match(email):
+        return "", True
+    return email, False
 
 
 # --- parsing (the n8n intake rules) --------------------------------------------------------
@@ -428,9 +440,7 @@ def build_action(row: SheetRow, action: str) -> tuple[Any | None, str | None]:
                 errors.append(f"{column} is required")
         if row.get("date_of_birth") and not dob:
             errors.append("Date Of Birth must be MM/DD/YYYY")
-    email = row.get("email").lower()
-    if email and not EMAIL.match(email):
-        errors.append("invalid email")
+    email, _ = row_email(row)  # a wrong email is not sent (only a warning)
     if errors:
         return None, "; ".join(errors)
     try:
@@ -763,7 +773,10 @@ def _write_outcome(grid: SheetGrid, row: SheetRow, outcome: Outcome,
     grid.set(row, "transcript_link", (dashboard_call_link(lead_id) or "") if lead_id else "")
     if outcome.lead_status:
         grid.set(row, "lead_status", outcome.lead_status)
-    grid.set(row, "outcome_status", outcome.status)
+    status = outcome.status
+    if status == "Cadence started" and row_email(row)[1]:
+        status = STARTED_EMAIL_WARNING
+    grid.set(row, "outcome_status", status)
     # Handled (it ran, or was refused): Action empties (owner, 2026-10-25), also after a Restart that
     # ended in a review ("Number blocked; needs review").
     # "Retrying n/3" is still running: the command and its Action Request ID stay for recovery.
@@ -823,14 +836,12 @@ def sync_profiles(grid: SheetGrid, result: PollResult, trace: WorkflowTrace,
         if previous is not None and previous.get(lead_id) != fingerprint:
             continue  # changed since the last full read: wait until it holds still
         phone, dob = normalize_phone(row.get("phone")), normalize_dob(row.get("date_of_birth"))
-        email = row.get("email").lower()
+        email, bad_email = row_email(row)  # a wrong email is not sent: the lead keeps its own
         errors = []
         if not phone:
             errors.append("invalid phone number")
         if row.get("date_of_birth") and not dob:
             errors.append("Date Of Birth must be MM/DD/YYYY or YYYY-MM-DD")
-        if email and not EMAIL.match(email):
-            errors.append("invalid email")
         lead = None
         if not errors:
             try:
@@ -860,6 +871,14 @@ def sync_profiles(grid: SheetGrid, result: PollResult, trace: WorkflowTrace,
                 detail = synced.body.get("detail") if isinstance(synced.body.get("detail"), str) \
                     else synced.body.get("code")
                 grid.set(row, "outcome_status", "Error: " + str(detail or "request rejected")[:180])
+            elif bad_email:
+                if not _command_pending(row):
+                    grid.set(row, "outcome_status", EMAIL_WARNING)
+            elif row.get("outcome_status") in (EMAIL_WARNING, STARTED_EMAIL_WARNING):
+                # Email fixed: the warning goes ("Cadence started" stays).
+                status = row.get("outcome_status")
+                grid.set(row, "outcome_status", "Cadence started" if status == STARTED_EMAIL_WARNING
+                         else "")
         baselines[lead_id] = (fingerprint, row.number, _sheet_name(row))
         result.counts["profiles"] += 1
     return seen_now
