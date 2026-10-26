@@ -139,6 +139,11 @@
           "type": "request-start",
           "content": "Thank you. One moment, please, while I confirm your appointment.",
           "blocking": false
+        },
+        {
+          "type": "request-response-delayed",
+          "content": "Thanks for your patience, I'm still confirming that for you.",
+          "timingMilliseconds": 9000
         }
       ],
       "server": {
