@@ -21,6 +21,7 @@ command is handled (it ran, the backend refused it, or the row could not run it)
 Action and the Action Request ID in the same write as the result (`_clear_action`); the result stays
 in Outcome Status. So a command in Action is always one staff picked and not handled yet, and staff
 run the same command again by picking it again. The worker never writes anything else into Action.
+Other text in Action is answered UNKNOWN_COMMAND and emptied the same way (owner, 2026-10-26).
 Rows from before 2026-10-25 can still hold a handled command; `old_commands` finds them and they are
 emptied without running.
 
@@ -59,8 +60,8 @@ from .sheet_sync import dashboard_call_link
 
 SHEET_TZ = ZoneInfo("America/Los_Angeles")
 
-# Sheet Action text -> (label, backend action). Exact, as n8n matched it (only extra spaces are
-# forgiven): a row n8n ignored, say "booked" in lower case, must not suddenly run at cutover.
+# Sheet Action text -> (label, backend action). Extra spaces and case are forgiven (owner, 2026-10-26:
+# "restart cadence" is clearly the command). Any other text is UNKNOWN_COMMAND (`claim_commands`).
 COMMANDS = {
     "Start cadence": ("Start cadence", "start_cadence"),
     "Restart cadence": ("Restart cadence", "restart_cadence"),
@@ -113,6 +114,9 @@ CLOSED_REFUSED = "Error: this lead is closed ({why}). Use the dashboard."
 # Start cadence on a row that already has a Lead ID would create nothing (the phone is taken): it was
 # ignored without a word; now Action empties, so the row says why.
 ALREADY_LINKED = "Error: this row already has a lead. Pick Restart cadence to start the calls again."
+# Free text in Action ("please call", "restart") sat there without a word (owner, 2026-10-26): once
+# settled, the row says so and Action empties. Nothing runs.
+UNKNOWN_COMMAND = "Error: unknown command. Pick one from the Action list."
 # Words the 2026-10-23 rules added to Outcome Status ("clear this cell ..."). They no longer apply:
 # taken off when the old command next to them is emptied.
 _OLD_NOTE = re.compile(r"; [^;]+ in action (already ran \(clear this cell to run it again\)"
@@ -202,8 +206,17 @@ def parse_started_at(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=SHEET_TZ).astimezone(UTC)
 
 
+_COMMAND_KEYS = {text.casefold(): command for text, command in COMMANDS.items()}
+
+
 def command_of(row: SheetRow) -> tuple[str, str] | None:
-    return COMMANDS.get(" ".join(row.get("action").split()))
+    return _COMMAND_KEYS.get(" ".join(row.get("action").split()).casefold())
+
+
+def unknown_command(row: SheetRow) -> bool:
+    """Text in Action that is not a command, on a row not running one (that is recovery's)."""
+    return bool(row.get("action").strip()) and not command_of(row) \
+        and not _in_progress(row.get("outcome_status"))
 
 
 def open_review_text(status: str) -> bool:
@@ -588,10 +601,18 @@ def claim_commands(grid: SheetGrid, trace: WorkflowTrace, *, settle: Settle | No
         if _hint_stale(row):
             grid.set(row, "outcome_status", row.get("outcome_status")[:-len(LEGACY_WAIT_HINT)])
         command = command_of(row)
-        if not command or not needs_processing(row, command):
+        unknown = unknown_command(row)
+        if not unknown and (not command or not needs_processing(row, command)):
             continue
         waiting.add(row.number)
         if settle is not None and not settle.ready(row, now):
+            continue
+        if unknown:
+            typed = " ".join(row.get("action").split())[:40]
+            grid.set(row, "outcome_status", UNKNOWN_COMMAND)
+            _clear_action(grid, row)
+            note_refusal(row, f'"{typed}"', UNKNOWN_COMMAND)
+            trace.log("sheet_command_unknown", row=row.number)
             continue
         if limit is not None and len(claims) >= limit:
             continue
@@ -1047,7 +1068,7 @@ def needs_attention(row: SheetRow, old: set[int] | frozenset[int] = frozenset())
     command = command_of(row)
     if command and (row.number in old or needs_processing(row, command)):
         return True
-    if _hint_stale(row):
+    if _hint_stale(row) or unknown_command(row):
         return True
     status = row.get("outcome_status")
     return status.casefold().startswith("processing: ") or bool(RETRYING.match(status))

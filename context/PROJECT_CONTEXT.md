@@ -2453,3 +2453,12 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
 - No migration. Tests: `test_sheet_direct.py`, `test_lead_review.py`, `test_lead_review_integration.py`,
   `test_sheet_direct_integration.py`, `test_demo_review_integration.py`, `test_n8n_integration.py`,
   `test_dashboard.py`. Frontend branch `feat/review-restart` (new choices, Details group, refusal in the pop-up).
+
+### 2026-10-26 — Sheet: unknown text in Action (owner-approved)
+- Free text in Action ("restart", "please call") sat there with no message and nothing ran; staff thought the
+  system was broken. Direct mode: once the row settles (same 60 s as commands), Outcome Status gets
+  "Error: unknown command. Pick one from the Action list." and Action empties (`_clear_action`, only over the
+  text read). Nothing runs. A linked row also gets an Activity line (`note_refusal`). Rows running a command
+  (Processing / Retrying) are left to recovery.
+- Commands now match ignoring case as well as extra spaces ("restart cadence", "booked" run).
+- No migration. Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`.

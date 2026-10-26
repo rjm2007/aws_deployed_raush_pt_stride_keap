@@ -92,7 +92,8 @@ def test_started_at_reads_our_iso_text_and_n8n_pacific_date_serials():
 @pytest.mark.parametrize(("action", "status", "extra", "expected"), [
     ("Start cadence", "", {}, True),
     ("Start  cadence ", "", {}, True),                      # extra spaces forgiven
-    ("booked", "", {"lead_id": "x"}, None),                  # exact text, as n8n: not a command
+    ("booked", "", {"lead_id": "x"}, True),                  # any case (owner, 2026-10-26)
+    (" restart  CADENCE", "", {"lead_id": "x"}, True),
     # Owner 2026-10-25: Action empties once a command is handled, so a command in it is new, whatever
     # Outcome Status says (the same command picked again runs again).
     ("Start cadence", "Error: x", {}, True),
@@ -754,3 +755,69 @@ def test_a_landed_name_write_back_clears_the_kept_sheet_name(monkeypatch):
     poll.save_baselines({4})  # row 4 was not written
     cleared = [params for sql, params in calls if "sheet_name_accepted=null" in sql]
     assert cleared == [[(LEAD,)]]
+
+
+# --- unknown text in Action (owner, 2026-10-26) ------------------------------------------------
+
+UNKNOWN = "Error: unknown command. Pick one from the Action list."
+
+
+@pytest.mark.parametrize("lead_id", ["", LEAD])
+@pytest.mark.parametrize("text", ["restart", "please call", "Start", "booked it"])
+def test_unknown_action_text_says_so_and_empties_and_nothing_runs(old, monkeypatch, notes, lead_id,
+                                                                  text):
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, action=text, lead_id=lead_id, outcome_status="Cadence started",
+                       action_request_id=str(uuid4()) if lead_id else "")
+    assert sheet_direct.needs_attention(parse_grid(sheet.read_values(), 2).rows[0], set())
+    assert _poll(sheet, monkeypatch, sheet_direct.Outcome("Done", None, LEAD)) == []
+    assert sheet.cell(number, "outcome_status") == UNKNOWN
+    assert sheet.cell(number, "action") == "" and sheet.cell(number, "action_request_id") == ""
+    assert sheet.cell(number, "lead_id") == lead_id
+    assert notes == [(number, f'"{text}"', UNKNOWN)]  # in the Activity of a linked lead only
+    assert _poll(sheet, monkeypatch) == []
+
+
+@pytest.mark.parametrize(("text", "action"), [("restart cadence", "restart_cadence"),
+                                              ("  BOOKED ", "booked"),
+                                              ("do not  contact", "do_not_contact")])
+def test_any_case_and_spacing_of_a_command_runs(old, monkeypatch, text, action):
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, action=text, lead_id=LEAD)
+    assert _poll(sheet, monkeypatch, sheet_direct.Outcome("Done", None, LEAD)) == [action]
+    assert sheet.cell(number, "outcome_status") == "Done" and sheet.cell(number, "action") == ""
+
+
+def test_unknown_text_waits_for_the_row_to_settle():
+    sheet = FakeSheet()
+    sheet.add(**ROW, action="Restart cad")  # still typing
+    settle = sheet_direct.Settle(60)
+
+    def claim(now):
+        grid = parse_grid(sheet.read_values(), 2)
+        sheet_direct.claim_commands(grid, WorkflowTrace("t", "test"), settle=settle, now=now)
+        return grid.rows[0].get("outcome_status")
+
+    assert claim(0) == "" and claim(59) == ""
+    assert claim(61) == UNKNOWN
+
+
+def test_a_command_staff_pick_over_unknown_text_before_the_write_is_kept(old, monkeypatch):
+    from rpt_agent.services.google_sheet import flush
+
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, action="restart", lead_id=LEAD)
+    grid = parse_grid(sheet.read_values(), 2)
+    assert sheet_direct.claim_commands(grid, WorkflowTrace("t", "test")) == []
+    sheet.before_write = lambda: sheet.set(number, "action", "Restart cadence")
+    flush(sheet, grid)
+    assert sheet.cell(number, "action") == "Restart cadence"
+    done = sheet_direct.Outcome("Cadence restarted", "In cadence", LEAD)
+    assert _poll(sheet, monkeypatch, done) == ["restart_cadence"]
+
+
+def test_an_empty_action_is_left_alone(old, monkeypatch):
+    sheet = FakeSheet()
+    number = sheet.add(**ROW, action="  ", lead_id=LEAD, outcome_status="Cadence started")
+    assert _poll(sheet, monkeypatch) == []
+    assert sheet.cell(number, "outcome_status") == "Cadence started" and sheet.writes == []

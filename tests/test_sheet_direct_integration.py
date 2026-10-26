@@ -436,10 +436,29 @@ def test_a_start_row_rerun_after_a_lost_result_links_the_lead_instead_of_startin
     assert env.cell(number, "action") == ""
 
 
-def test_lower_case_actions_are_ignored_as_n8n_ignored_them(env):
-    number = env.start_row(action="start cadence")
+def test_unknown_action_text_says_so_and_empties_and_any_case_of_a_command_runs(env):
+    # Owner, 2026-10-26: free text sat in Action without a word; "start cadence" was ignored.
+    unknown = "Error: unknown command. Pick one from the Action list."
+    new = env.start_row(action="please call")
     env.tick()
-    assert env.cell(number, "outcome_status") == "" and env.leads() == []
+    assert (env.cell(new, "outcome_status"), env.cell(new, "action")) == (unknown, "")
+    assert env.leads() == []
+    env.sheet.set(new, "action", " start  CADENCE ")
+    env.tick()
+    assert env.cell(new, "outcome_status") == "Cadence started" and env.cell(new, "action") == ""
+    lead_id = env.cell(new, "lead_id")
+    before = env.lead(lead_id)
+    env.sheet.set(new, "action", "restart")  # linked row
+    env.tick()
+    assert (env.cell(new, "outcome_status"), env.cell(new, "action")) == (unknown, "")
+    after = env.lead(lead_id)
+    assert (after["status"], after["cadence_state"]) == (before["status"], before["cadence_state"])
+    assert env.db.execute("select count(*) n from lead_action_requests where lead_id::text=%s",
+                          (lead_id,)).fetchone()["n"] == 1  # only the Start
+    noted = env.db.execute("select reason from lead_status_history where lead_id=%s and "
+                           "source='n8n_sheet' order by changed_at", (lead_id,)).fetchall()
+    assert [r["reason"] for r in noted][-1] == (
+        '"restart" refused: unknown command. Pick one from the Action list.')
 
 
 def test_only_one_sheet_worker_polls_at_a_time(env):
