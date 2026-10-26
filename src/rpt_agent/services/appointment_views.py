@@ -421,25 +421,29 @@ def waiting_records(conn, practice_id: int, now: datetime, limit: int = 500) -> 
 def open_slots(conn, practice_id: int, lower: datetime, upper: datetime, timezone: str,
                now: datetime) -> list[dict]:
     """Open slots cached from Stride's availability API (availability_slots, status open) in
-    [lower, upper), from now on, per clinician and clinic-local day. Nothing is estimated: the
-    calendar draws these open and everything else closed. The same slot cached for several
-    clinics on one Stride location (the demo's three) is listed once. Only as fresh as the last
-    sync, and only inside the cache window (today to 90 days ahead)."""
+    [lower, upper), from now on, per clinician, clinic (booking location: `location_id`,
+    `location`) and clinic-local day. Nothing is estimated: the calendar draws these open and
+    everything else closed. Each slot once per clinic; clinics sharing one Stride location (the
+    demo's three) each list it, so a location filter shows only that clinic's open time. Only as
+    fresh as the last sync, and only inside the cache window (today to 90 days ahead)."""
     if not optional_tables(conn)["booking"]:
         return []
     rows = conn.execute(
-        "select distinct c.stride_user_id as id,c.display_name as name,"
-        "s.start_utc at time zone %s as start_local,s.end_utc at time zone %s as end_local "
+        "select distinct c.stride_user_id as id,c.display_name as name,bl.id as location_id,"
+        "bl.name as location,s.start_utc at time zone %s as start_local,"
+        "s.end_utc at time zone %s as end_local "
         "from availability_slots s join clinicians c on c.id=s.clinician_id "
+        "join booking_locations bl on bl.id=s.booking_location_id "
         "where s.practice_id=%s and c.is_active and s.status='open' and s.start_utc>=%s and s.start_utc<%s "
-        "order by c.display_name,c.stride_user_id,start_local,end_local",
+        "order by c.display_name,c.stride_user_id,bl.name,bl.id,start_local,end_local",
         (timezone, timezone, practice_id, max(lower, now), upper),
     ).fetchall()
     days: dict[tuple, dict] = {}
     for r in rows:
-        key = (str(r["id"]), r["start_local"].date())
+        key = (str(r["id"]), r["start_local"].date(), r["location_id"])
         day = days.setdefault(key, {"date": key[1].isoformat(), "practitioner_id": key[0],
-                                    "practitioner_name": r["name"], "slots": []})
+                                    "practitioner_name": r["name"], "location_id": r["location_id"],
+                                    "location": r["location"], "slots": []})
         day["slots"].append({"start_local": r["start_local"].isoformat(timespec="minutes"),
                              "end_local": r["end_local"].isoformat(timespec="minutes")})
     return list(days.values())

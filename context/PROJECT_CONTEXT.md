@@ -2506,3 +2506,13 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
 - No migration. Tests: `test_appointment_views.py`, `test_dashboard_calendar.py`,
   `test_appointment_views_integration.py` (waiting -> in_stride on the CSV row, every status letter,
   open slots, waiting list order and limit).
+
+### 2026-10-26 — Calendar redesign phase 3: backend fixes (owner-approved)
+- `GET /appointment-calendar`: each `practitioners` entry has `role` (`clinicians.credentials`, else
+  `stride_users.credentials`, else null) so every column header can show it, visits or not.
+- `open_slots` entries are now per clinician, clinic and day, with `location_id` (booking location) and
+  `location` (its name). Each slot is listed once per clinic; clinics sharing one Stride location (the demo's
+  three) each list it. The UI uses only the chosen clinic's open time under a location filter or in the
+  Locations view, and the union of all clinics otherwise.
+- No migration. Tests: `test_dashboard_calendar.py`, `test_appointment_views_integration.py`
+  (`test_practitioners_carry_a_role_ours_first_then_strides`, open slots per clinic).

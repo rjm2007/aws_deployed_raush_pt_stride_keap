@@ -221,6 +221,25 @@ def test_waiting_list_is_upcoming_first_and_skips_what_is_off_the_books(booked):
     assert truncated and [r["lead_id"] for r in records] == [soon, later, late]
 
 
+def test_practitioners_carry_a_role_ours_first_then_strides(booked):
+    ctx = booked
+    _booking_setup(ctx)
+    db, practice = ctx.db, ctx.practice_id
+    actor = DashboardActor("review", "review@example.test", practice_id=practice)
+    first, last = datetime.now(UTC).date(), datetime.now(UTC).date() + timedelta(days=1)
+
+    def roles():
+        result = calendar.appointment_calendar(actor, first, last)
+        return [(p["id"], p["role"]) for p in result["practitioners"]]
+
+    assert roles() == [("3", None)]          # no credentials anywhere: no role, never invented
+    db.execute("insert into stride_users(practice_id,stride_id,first_name,last_name,credentials) "
+               "values(%s,3,'Joe','Smith','PTA')", (practice,))
+    assert roles() == [("3", "PTA")]         # Stride's users export
+    db.execute("update clinicians set credentials='PT, DPT' where practice_id=%s", (practice,))
+    assert roles() == [("3", "PT, DPT")]     # ours wins
+
+
 def test_open_slots_are_the_cached_open_ones_once_per_clinician_and_day(booked):
     ctx = booked
     case = _booking_setup(ctx)
@@ -242,7 +261,7 @@ def test_open_slots_are_the_cached_open_ones_once_per_clinician_and_day(booked):
              when.date(), when.time(), status))
 
     slot(laguna, _at(day, 9))
-    slot(dana, _at(day, 9))                    # same slot, other clinic: listed once
+    slot(dana, _at(day, 9))                    # same slot, other clinic: under that clinic
     slot(laguna, _at(day, 9), minutes=30)      # another visit length: its own end
     slot(laguna, _at(day, 13), status="booked")
     slot(laguna, _at(day, 16), status="gone")
@@ -255,11 +274,15 @@ def test_open_slots_are_the_cached_open_ones_once_per_clinician_and_day(booked):
         DashboardActor("review", "review@example.test", practice_id=practice),
         datetime.now(UTC).date() - timedelta(days=2), date.fromisoformat(next_day), lead_id=lead)
     assert [r["lead_id"] for r in result["appointments"]] == [lead]  # the lead filter is for visits only
+    joe = {"practitioner_id": "3", "practitioner_name": "Joe Smith"}
+    # Grouped by clinic, so a location filter shows only that clinic's open time.
     assert result["open_slots"] == [
-        {"date": day, "practitioner_id": "3", "practitioner_name": "Joe Smith", "slots": [
+        {"date": day, **joe, "location_id": dana, "location": "Dana Point", "slots": [
+            {"start_local": f"{day}T09:00", "end_local": f"{day}T10:00"}]},
+        {"date": day, **joe, "location_id": laguna, "location": "Laguna Niguel", "slots": [
             {"start_local": f"{day}T09:00", "end_local": f"{day}T09:30"},
             {"start_local": f"{day}T09:00", "end_local": f"{day}T10:00"}]},
-        {"date": next_day, "practitioner_id": "3", "practitioner_name": "Joe Smith", "slots": [
+        {"date": next_day, **joe, "location_id": laguna, "location": "Laguna Niguel", "slots": [
             {"start_local": f"{next_day}T10:30", "end_local": f"{next_day}T11:30"}]},
     ]
     # A clinician we no longer book for: their cached open slots are not shown.

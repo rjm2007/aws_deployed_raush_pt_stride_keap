@@ -46,9 +46,13 @@ def appointment_calendar(actor: Actor, start: date, end: date, lead_id: UUID | N
         )
         practitioners = []
         if tables["booking"]:
+            # Role (credentials) for the column headers: ours, else Stride's users export.
+            role = ("coalesce(nullif(trim(c.credentials),''),(select nullif(trim(su.credentials),'') "
+                    "from stride_users su where su.practice_id=c.practice_id and su.stride_id=c.stride_user_id "
+                    "and su.deleted_at is null))" if tables["imports"] else "nullif(trim(c.credentials),'')")
             practitioners = conn.execute(
                 "select distinct c.stride_user_id as id,c.display_name as name,bl.name as location,"
-                "bl.stride_location_id "
+                "bl.stride_location_id," + role + " as role "
                 "from clinicians c join clinician_assignments ca on ca.clinician_id=c.id "
                 "join booking_locations bl on bl.id=ca.booking_location_id "
                 "where c.practice_id=%s and bl.practice_id=%s "
@@ -56,12 +60,12 @@ def appointment_calendar(actor: Actor, start: date, end: date, lead_id: UUID | N
                 (actor.practice_id, actor.practice_id),
             ).fetchall()
         resources = {(str(p["id"]), p["location"]): {
-            "id": str(p["id"]), "name": p["name"], "location": p["location"],
+            "id": str(p["id"]), "name": p["name"], "location": p["location"], "role": p["role"],
         } for p in practitioners}
         for r in records:
             resources.setdefault((r["practitioner_id"], r["location"]), {
                 "id": r["practitioner_id"], "name": r["practitioner_name"],
-                "location": r["location"],
+                "location": r["location"], "role": r["clinician"]["role"],
             })
         # Open slots from Stride's availability cache (whole clinic, never lead-filtered).
         slots = appointment_views.open_slots(conn, actor.practice_id, lower, upper, timezone,

@@ -73,13 +73,14 @@ class CalendarConnection:
         if "from availability_slots s" in sql:
             assert params[2] == 7 and "s.status='open'" in sql
             local = datetime(2026, 10, 13, 9, tzinfo=UTC).replace(tzinfo=None)  # Postgres "at time zone"
-            return Result([{"id": 12, "name": "Synthetic Clinician", "start_local": local,
+            return Result([{"id": 12, "name": "Synthetic Clinician", "location_id": 5,
+                            "location": "Synthetic Clinic", "start_local": local,
                             "end_local": local + timedelta(hours=1)}])
         if "from case_types" in sql:
             return Result([{"id": 1452}])
         if "from clinicians c" in sql:
             return Result([{"id": 12, "name": "Synthetic Clinician", "location": "Synthetic Clinic",
-                            "stride_location_id": 42}])
+                            "stride_location_id": 42, "role": "PT"}])
         return Result([{"at": start}])
 
 
@@ -104,8 +105,11 @@ def test_calendar_deduplicates_bookings_and_keeps_sheet_link_and_stride_cancella
     assert (record["source"], record["approval"], record["stride_status"]) == ("sheet", "in_stride", "late_cancel")
     assert result["open_slots"] == [{
         "date": "2026-10-13", "practitioner_id": "12", "practitioner_name": "Synthetic Clinician",
+        "location_id": 5, "location": "Synthetic Clinic",
         "slots": [{"start_local": "2026-10-13T09:00", "end_local": "2026-10-13T10:00"}],
     }]
+    assert result["practitioners"] == [{"id": "12", "name": "Synthetic Clinician",
+                                        "location": "Synthetic Clinic", "role": "PT"}]
     assert not any(sql.lstrip().startswith(("insert", "update", "delete")) for sql, _ in conn.queries)
 
 
