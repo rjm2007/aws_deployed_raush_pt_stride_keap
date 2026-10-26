@@ -92,8 +92,10 @@ def test_started_at_reads_our_iso_text_and_n8n_pacific_date_serials():
 @pytest.mark.parametrize(("action", "status", "extra", "expected"), [
     ("Start cadence", "", {}, True),
     ("Start  cadence ", "", {}, True),                      # extra spaces forgiven
-    ("booked", "", {"lead_id": "x"}, True),                  # any case (owner, 2026-10-26)
-    (" restart  CADENCE", "", {"lead_id": "x"}, True),
+    ("booked", "", {"lead_id": "x"}, None),                  # exact text, as n8n: not a command
+    # Owner 2026-10-26: Action must be chosen from the drop-down; another case is not a command.
+    (" restart  CADENCE", "", {"lead_id": "x"}, None),
+    ("START CADENCE", "", {}, None),
     # Owner 2026-10-25: Action empties once a command is handled, so a command in it is new, whatever
     # Outcome Status says (the same command picked again runs again).
     ("Start cadence", "Error: x", {}, True),
@@ -759,11 +761,12 @@ def test_a_landed_name_write_back_clears_the_kept_sheet_name(monkeypatch):
 
 # --- unknown text in Action (owner, 2026-10-26) ------------------------------------------------
 
-UNKNOWN = "Error: unknown command. Pick one from the Action list."
+UNKNOWN = "Error: action must be chosen from the drop-down."
 
 
 @pytest.mark.parametrize("lead_id", ["", LEAD])
-@pytest.mark.parametrize("text", ["restart", "please call", "Start", "booked it"])
+@pytest.mark.parametrize("text", ["restart", "please call", "Start", "booked it", "booked",
+                                  "restart cadence", "START CADENCE", "do not contact"])
 def test_unknown_action_text_says_so_and_empties_and_nothing_runs(old, monkeypatch, notes, lead_id,
                                                                   text):
     sheet = FakeSheet()
@@ -778,10 +781,10 @@ def test_unknown_action_text_says_so_and_empties_and_nothing_runs(old, monkeypat
     assert _poll(sheet, monkeypatch) == []
 
 
-@pytest.mark.parametrize(("text", "action"), [("restart cadence", "restart_cadence"),
-                                              ("  BOOKED ", "booked"),
-                                              ("do not  contact", "do_not_contact")])
-def test_any_case_and_spacing_of_a_command_runs(old, monkeypatch, text, action):
+@pytest.mark.parametrize(("text", "action"), [("Restart cadence", "restart_cadence"),
+                                              ("  Booked ", "booked"),
+                                              ("Do Not  Contact", "do_not_contact")])
+def test_a_drop_down_command_with_extra_spaces_runs(old, monkeypatch, text, action):
     sheet = FakeSheet()
     number = sheet.add(**ROW, action=text, lead_id=LEAD)
     assert _poll(sheet, monkeypatch, sheet_direct.Outcome("Done", None, LEAD)) == [action]

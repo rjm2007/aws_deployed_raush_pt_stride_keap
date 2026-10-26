@@ -21,7 +21,7 @@ command is handled (it ran, the backend refused it, or the row could not run it)
 Action and the Action Request ID in the same write as the result (`_clear_action`); the result stays
 in Outcome Status. So a command in Action is always one staff picked and not handled yet, and staff
 run the same command again by picking it again. The worker never writes anything else into Action.
-Other text in Action is answered UNKNOWN_COMMAND and emptied the same way (owner, 2026-10-26).
+Any other text in Action is answered UNKNOWN_COMMAND and emptied the same way (owner, 2026-10-26).
 Rows from before 2026-10-25 can still hold a handled command; `old_commands` finds them and they are
 emptied without running.
 
@@ -60,8 +60,9 @@ from .sheet_sync import dashboard_call_link
 
 SHEET_TZ = ZoneInfo("America/Los_Angeles")
 
-# Sheet Action text -> (label, backend action). Extra spaces and case are forgiven (owner, 2026-10-26:
-# "restart cadence" is clearly the command). Any other text is UNKNOWN_COMMAND (`claim_commands`).
+# Sheet Action text -> (label, backend action). Exact, as the Sheet's drop-down has it (only extra spaces
+# are forgiven, as n8n did): "booked" or "restart cadence" is not a command (owner, 2026-10-26: Action must
+# be chosen from the drop-down). Any other text is UNKNOWN_COMMAND (`claim_commands`).
 COMMANDS = {
     "Start cadence": ("Start cadence", "start_cadence"),
     "Restart cadence": ("Restart cadence", "restart_cadence"),
@@ -114,9 +115,9 @@ CLOSED_REFUSED = "Error: this lead is closed ({why}). Use the dashboard."
 # Start cadence on a row that already has a Lead ID would create nothing (the phone is taken): it was
 # ignored without a word; now Action empties, so the row says why.
 ALREADY_LINKED = "Error: this row already has a lead. Pick Restart cadence to start the calls again."
-# Free text in Action ("please call", "restart") sat there without a word (owner, 2026-10-26): once
-# settled, the row says so and Action empties. Nothing runs.
-UNKNOWN_COMMAND = "Error: unknown command. Pick one from the Action list."
+# Text in Action that is not a drop-down value ("please call", "restart", "booked") sat there without a
+# word (owner, 2026-10-26): once settled, the row says so and Action empties. Nothing runs.
+UNKNOWN_COMMAND = "Error: action must be chosen from the drop-down."
 # Words the 2026-10-23 rules added to Outcome Status ("clear this cell ..."). They no longer apply:
 # taken off when the old command next to them is emptied.
 _OLD_NOTE = re.compile(r"; [^;]+ in action (already ran \(clear this cell to run it again\)"
@@ -206,15 +207,12 @@ def parse_started_at(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=SHEET_TZ).astimezone(UTC)
 
 
-_COMMAND_KEYS = {text.casefold(): command for text, command in COMMANDS.items()}
-
-
 def command_of(row: SheetRow) -> tuple[str, str] | None:
-    return _COMMAND_KEYS.get(" ".join(row.get("action").split()).casefold())
+    return COMMANDS.get(" ".join(row.get("action").split()))
 
 
 def unknown_command(row: SheetRow) -> bool:
-    """Text in Action that is not a command, on a row not running one (that is recovery's)."""
+    """Text in Action that is not a drop-down command, on a row not running one (that is recovery's)."""
     return bool(row.get("action").strip()) and not command_of(row) \
         and not _in_progress(row.get("outcome_status"))
 

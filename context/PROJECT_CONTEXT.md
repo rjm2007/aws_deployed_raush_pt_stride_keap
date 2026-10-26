@@ -2457,10 +2457,12 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
 ### 2026-10-26 — Sheet: unknown text in Action (owner-approved)
 - Free text in Action ("restart", "please call") sat there with no message and nothing ran; staff thought the
   system was broken. Direct mode: once the row settles (same 60 s as commands), Outcome Status gets
-  "Error: unknown command. Pick one from the Action list." and Action empties (`_clear_action`, only over the
+  "Error: action must be chosen from the drop-down." and Action empties (`_clear_action`, only over the
   text read). Nothing runs. A linked row also gets an Activity line (`note_refusal`). Rows running a command
   (Processing / Retrying) are left to recovery.
-- Commands now match ignoring case as well as extra spaces ("restart cadence", "booked" run).
+- Action must be chosen from the drop-down (owner): commands match the drop-down values exactly, only extra
+  spaces forgiven, as before. "booked", "restart cadence", "START CADENCE" are not commands: they get the
+  error above and nothing runs.
 - No migration. Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`.
 
 ### 2026-10-26 — Board move to Closed updates the Sheet (owner-approved)

@@ -213,9 +213,9 @@ Behavior:
 ### Staff guidance for the Sheet (2026-10-25)
 
 - Pick a command in Action; it runs once and the cell empties. Pick it again to run it again.
-- Other text in Action (e.g. "please call") runs nothing: after the same 60 s settle the row says
-  `Error: unknown command. Pick one from the Action list.` and Action empties (2026-10-26). Case and extra
-  spaces don't matter ("restart cadence" is Restart cadence).
+- Action must be chosen from the drop-down (owner, 2026-10-26). Any other text (e.g. "please call", or
+  "restart cadence" / "booked" typed in another case) runs nothing: after the same 60 s settle the row says
+  `Error: action must be chosen from the drop-down.` and Action empties. Only extra spaces are forgiven.
 - A lead in Needs Review, booked or closed is handled on the dashboard (Resolve review offers restart from
   Day 0); the Sheet's Restart refuses it and says why.
 - Don't delete rows, don't copy-paste whole rows (the hidden Lead ID / Action Request ID would come along),
@@ -290,9 +290,10 @@ states and inbound replies. These endpoints update Supabase first; they never ca
    run the same command again by picking it again (a patient can be restarted any number of times; the
    10-minute restart cooldown still applies). The empty write only lands if the cell still holds the command
    that was handled: a command staff picked meanwhile is kept and runs next. An empty Action is never a command,
-   and the worker never writes anything else into Action. Commands match ignoring case and extra spaces; any
-   other text, once settled, gets `Error: unknown command. Pick one from the Action list.` and Action empties
-   the same way, nothing runs (owner, 2026-10-26). Booked and Do Not Contact run at once, also on a lead
+   and the worker never writes anything else into Action. Commands match the drop-down values exactly (only
+   extra spaces forgiven, as n8n did); any other text, also another case, once settled, gets
+   `Error: action must be chosen from the drop-down.` and Action empties the same way, nothing runs (owner,
+   2026-10-26). Booked and Do Not Contact run at once, also on a lead
    in review. Restart guardrails (owner, 2026-10-25): the Sheet never undoes a dashboard decision. Refusals say
    what to do:
    - `Error: this lead needs review. Resolve it on the dashboard; you can restart it from there.`
