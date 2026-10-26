@@ -63,6 +63,9 @@ def appointment_calendar(actor: Actor, start: date, end: date, lead_id: UUID | N
                 "id": r["practitioner_id"], "name": r["practitioner_name"],
                 "location": r["location"],
             })
+        # Per day and clinician: working hours, booked, available (sources in appointment_views).
+        day_summary = appointment_views.day_summaries(
+            conn, actor.practice_id, records, start, end, timezone, datetime.now(UTC))
         last_import = None
         if tables["imports"]:
             last_import = conn.execute(
@@ -74,8 +77,24 @@ def appointment_calendar(actor: Actor, start: date, end: date, lead_id: UUID | N
         "timezone": timezone, "business_hours": settings.get("business_hours") or {},
         "booking_enabled": bool(settings.get("stride_booking_enabled") and tables["booking"]),
         "stride_import_enabled": tables["imports"], "last_import_at": last_import,
-        "truncated": truncated, "generated_at": datetime.now(UTC),
+        "truncated": truncated, "generated_at": datetime.now(UTC), "day_summary": day_summary,
     }
+
+
+@router.get("/appointment-approvals")
+def appointment_approvals(actor: Actor):
+    """Visits we booked that Stride's export has not shown yet: waiting for the front desk
+    to approve them in Stride (Elliot books as pending). Upcoming first, then past ones."""
+    with transaction() as conn:
+        records, truncated = appointment_views.waiting_records(conn, actor.practice_id, datetime.now(UTC))
+        last_import = None
+        if appointment_views.optional_tables(conn)["imports"]:
+            last_import = conn.execute(
+                "select max(processed_at) as at from stride_import_files "
+                "where practice_id=%s and status='processed'", (actor.practice_id,),
+            ).fetchone()["at"]
+    return {"appointments": records, "count": len(records), "truncated": truncated,
+            "last_import_at": last_import, "generated_at": datetime.now(UTC)}
 
 
 def _staff_lead(conn, actor, lead_id):

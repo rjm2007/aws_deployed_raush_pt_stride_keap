@@ -10,7 +10,8 @@ the board, so each place tags and words a booking the same way:
 """
 
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from .stride_import import CANCELLED_STATUSES, LATE_CANCEL_STATUSES, NO_SHOW_STATUSES
 
@@ -22,6 +23,25 @@ COMPLETED_STATUSES = {"checked in", "c"}
 ACTIVE_STATES = {"booking", "scheduled", "unknown"}
 # Every booking our engine makes is a new patient's first visit.
 NATIVE_VISIT_TYPE = "Initial Evaluation"
+# The calendar's source: who the visit belongs to (same split as the tag, shorter words).
+SOURCE_OF_TAG = {TAG_ELLIOT: "elliot", TAG_SHEET_LEAD: "sheet", TAG_STRIDE_ONLY: "stride"}
+# Stride's export Status column, letter or word -> one stable value. The export has no
+# "pending": an appointment Stride has not approved yet is simply not in the file, so it
+# is ours alone (approval "waiting"). "open" was our early guess at the letter O (owner,
+# 2026-10-26: O is Confirmed); a visit "open" is still unconfirmed, so it reads unmarked.
+STRIDE_STATUS = {
+    "": "unmarked", "u": "unmarked", "unmarked": "unmarked", "open": "unmarked",
+    "o": "confirmed", "confirmed": "confirmed",
+    "c": "checked_in", "checked in": "checked_in", "checked-in": "checked_in",
+    "a": "cancelled", "cancel": "cancelled", "cancelled": "cancelled", "canceled": "cancelled",
+    "l": "late_cancel", "late cancel": "late_cancel",
+    "n": "no_show", "no show": "no_show",
+}
+# Visit kinds the calendar colours by. Re-evaluations and treatments are returning patients.
+_FIRST_VISIT = re.compile(r"\b(initial|new patient|first visit)\b|^\s*eval", re.IGNORECASE)
+_FOLLOW_UP = re.compile(r"follow|\bf/u\b|re-?eval|treatment|daily|progress", re.IGNORECASE)
+# Visits that no longer hold the clinician's time.
+NOT_HELD_STATES = {"cancelled", "late_cancel", "rescheduled"}
 _CONFIRMATION = re.compile(r"\b(booked|all set|you're set|you are set|confirmed|scheduled you)\b", re.IGNORECASE)
 _SPEAKER = re.compile(r"^\s*(ai|assistant|bot|agent|user|customer|patient)\s*:\s*(.+)$", re.IGNORECASE)
 
@@ -47,6 +67,44 @@ def booking_tag(row) -> str:
     if row.get("booking_source") == "voice_agent":
         return TAG_ELLIOT
     return TAG_SHEET_LEAD if row.get("lead_id") else TAG_STRIDE_ONLY
+
+
+def stride_status(raw) -> str:
+    """Stride's export status as unmarked / confirmed / checked_in / cancelled / late_cancel /
+    no_show. A word Stride adds later passes through (lowercase, underscores), never hidden."""
+    key = str(raw or "").strip().lower()
+    return STRIDE_STATUS.get(key) or re.sub(r"[^a-z0-9]+", "_", key).strip("_")
+
+
+def visit_kind(type_name: str | None, type_id=None, first_visit_types=frozenset()) -> str:
+    """first_visit / follow_up / other, by the appointment type's name; a Stride type id we
+    book first visits with (case_types.stride_appointment_type_id) is a first visit too."""
+    name = type_name or ""
+    if _FOLLOW_UP.search(name):
+        return "follow_up"
+    if _FIRST_VISIT.search(name) or (type_id is not None and type_id in first_visit_types):
+        return "first_visit"
+    return "other"
+
+
+def patient_name(first, last, full) -> str:
+    """"Last, First" as Stride shows it; a lone full name is split on its last word."""
+    first, last = (str(first or "").strip(), str(last or "").strip())
+    if first and last:
+        return f"{last}, {first}"
+    words = str(full or "").split()
+    if len(words) > 1:
+        return f"{words[-1]}, {' '.join(words[:-1])}"
+    return words[0] if words else (last or first or "Patient name unavailable")
+
+
+def approval(state: str, *, imported: bool) -> str:
+    """in_stride once Stride's export has the visit. Ours alone and still on the books =
+    waiting for the front desk to approve it in Stride (Elliot books it as pending). Ours
+    alone and no longer on the books (cancelled before Stride ever showed it) = not_in_stride."""
+    if imported:
+        return "in_stride"
+    return "waiting" if state in ACTIVE_STATES else "not_in_stride"
 
 
 def booked_by(row, *, imported: bool) -> str:
@@ -81,11 +139,16 @@ def booking_quote(transcript: str | None) -> str | None:
     return None
 
 
-def record(row, *, imported: bool) -> dict:
+def record(row, *, imported: bool, first_visit_types=frozenset()) -> dict:
     start, end = row["start_utc"], row.get("end_utc")
     duration = (end - start).total_seconds() / 60 if start and end else None
     provider_key = row["id"] if imported else row.get("stride_appointment_id")
     offset = row.get("call_offset_seconds")
+    state = normalise_state(row.get("state"), imported=imported)
+    tag = booking_tag(row)
+    visit_type = row.get("type") or ("Appointment" if imported else NATIVE_VISIT_TYPE)
+    practitioner_id = str(row.get("clinician_id") or "unassigned")
+    practitioner_name = row.get("clinician_name") or "Unassigned practitioner"
     return {
         "id": f"stride:{provider_key}" if provider_key is not None else f"booking:{row['id']}",
         "lead_id": row.get("lead_id"),
@@ -93,17 +156,27 @@ def record(row, *, imported: bool) -> dict:
         "start_utc": start,
         "end_utc": end,
         "duration_minutes": duration if duration and duration > 0 else None,
-        "practitioner_id": str(row.get("clinician_id") or "unassigned"),
-        "practitioner_name": row.get("clinician_name") or "Unassigned practitioner",
+        "practitioner_id": practitioner_id,
+        "practitioner_name": practitioner_name,
         "location": row.get("location") or "Location unavailable",
         "case_title": row.get("case_title") or "Case unavailable",
-        "type": row.get("type") or ("Appointment" if imported else NATIVE_VISIT_TYPE),
-        "state": normalise_state(row.get("state"), imported=imported),
+        "type": visit_type,
+        "state": state,
         "needs_staff_review": bool(row.get("needs_staff_review")),
-        "source": "Stride" if imported else "Booking service",
+        # Was "Stride" / "Booking service" until 2026-10-26 (no reader); that is record_from now.
+        "source": SOURCE_OF_TAG[tag],
+        "record_from": "Stride" if imported else "Booking service",
         "lead_source": row.get("lead_source"),
         "stride_appointment_id": row.get("stride_appointment_id"),
-        "tag": booking_tag(row),
+        "tag": tag,
+        "approval": approval(state, imported=imported),
+        "stride_status": stride_status(row.get("state")) if imported else None,
+        "visit_type": visit_type,
+        "visit_kind": visit_kind(visit_type, row.get("appointment_type_id"), first_visit_types),
+        "patient_name": patient_name(row.get("first_name"), row.get("last_name"), row.get("full_name")),
+        "clinician": {"id": practitioner_id, "name": practitioner_name,
+                      "role": row.get("clinician_role") or None},
+        "location_id": row.get("location_id"),
         "booked_by": booked_by(row, imported=imported),
         "booked_at": row.get("booked_at"),
         "call_log_id": row.get("call_log_id"),
@@ -120,11 +193,12 @@ _OURS = (
 
 def load_records(conn, practice_id: int, *, lower: datetime | None = None,
                  upper: datetime | None = None, lead_ids: list | None = None,
-                 limit: int = 2000) -> tuple[list[dict], bool]:
+                 limit: int = 2000, waiting_only: bool = False) -> tuple[list[dict], bool]:
     """Every booking in [lower, upper) (open ends allowed), optionally for some leads.
 
     Returns (records sorted by start, truncated). Stride's copy of a visit wins over
     ours once imported, because Stride is the record (cancellations included).
+    waiting_only: only our visits Stride has not shown yet and still on the books.
     """
     lead_filter = [str(i) for i in lead_ids] if lead_ids is not None else None
     if lead_filter == []:
@@ -138,7 +212,7 @@ def load_records(conn, practice_id: int, *, lower: datetime | None = None,
         if tables["imports"] else ""
     )
     native = conn.execute(
-        "select a.id,a.lead_id,l.full_name,a.start_utc,a.end_utc,a.clinician_id,"
+        "select a.id,a.lead_id,l.full_name,l.first_name,l.last_name,a.appointment_type_id,a.start_utc,a.end_utc,a.clinician_id,"
         "a.location_id,l.location,coalesce(ct.name,l.lead_type) as case_title,"
         "l.source_system as lead_source,a.state,a.needs_staff_review,a.stride_appointment_id,"
         "coalesce(a.confirmed_at,a.booked_at,a.created_at) as booked_at," + _OURS + " "
@@ -148,13 +222,18 @@ def load_records(conn, practice_id: int, *, lower: datetime | None = None,
         "where a.practice_id=%s and (%s::timestamptz is null or a.start_utc>=%s) "
         "and (%s::timestamptz is null or a.start_utc<%s) "
         "and (%s::uuid[] is null or a.lead_id=any(%s::uuid[])) and a.state<>'failed' "
+        + ("and a.state in ('booking','scheduled','unknown') and a.start_utc is not null "
+           if waiting_only else "")
         + mirror_filter + "order by a.start_utc,a.id limit %s",
         (practice_id, *window, lead_filter, lead_filter, limit + 1),
     ).fetchall()
     imported = []
-    if tables["imports"]:
+    if tables["imports"] and not waiting_only:
         imported = conn.execute(
             "select sa.stride_id as id,sp.lead_id,"
+            "coalesce(nullif(sp.first_name,''),l.first_name) as first_name,"
+            "coalesce(nullif(sp.last_name,''),l.last_name) as last_name,"
+            "sa.appointment_type_id,su.credentials as clinician_role,"
             "coalesce(l.full_name,nullif(trim(concat_ws(' ',sp.first_name,sp.last_name)),'')) "
             "as full_name,sa.start_utc,sa.end_utc,sa.clinician_id,sa.clinician_name,"
             "sa.location_id,sa.location_name as location,coalesce(sc.title,l.lead_type) as case_title,"
@@ -168,6 +247,8 @@ def load_records(conn, practice_id: int, *, lower: datetime | None = None,
             "left join stride_cases sc on sc.practice_id=sa.practice_id "
             "and sc.stride_id=sa.case_stride_id and sc.deleted_at is null "
             "left join leads l on l.id=sp.lead_id and l.practice_id=sa.practice_id "
+            "left join stride_users su on su.practice_id=sa.practice_id "
+            "and su.stride_id=sa.clinician_id and su.deleted_at is null "
             "left join appointments a on a.practice_id=sa.practice_id "
             "and a.stride_appointment_id=sa.stride_id "
             "left join call_logs cl on a.call_id is not null and cl.vapi_call_id=a.call_id "
@@ -178,14 +259,17 @@ def load_records(conn, practice_id: int, *, lower: datetime | None = None,
             "order by sa.start_utc,sa.stride_id limit %s",
             (practice_id, *window, lead_filter, lead_filter, limit + 1),
         ).fetchall()
-    names, location_names, clinics = practitioner_names(conn, practice_id, tables["booking"])
+    names, location_names, clinics, roles = practitioner_names(conn, practice_id, tables["booking"])
+    first_visits = first_visit_types(conn, practice_id, tables["booking"])
     for row in native + imported:
         row["location"] = clinic_name(row.get("location_id"), row.get("location"), location_names, clinics)
+        # Our own clinician list (credentials typed by the clinic) wins over Stride's users export.
+        row["clinician_role"] = roles.get(str(row.get("clinician_id"))) or row.get("clinician_role")
     for row in native:
         row["clinician_name"] = names.get(str(row["clinician_id"]))
     imported_ids = {r["stride_appointment_id"] for r in imported}
-    records = [record(r, imported=True) for r in imported]
-    records += [record(r, imported=False) for r in native
+    records = [record(r, imported=True, first_visit_types=first_visits) for r in imported]
+    records += [record(r, imported=False, first_visit_types=first_visits) for r in native
                 if r["stride_appointment_id"] not in imported_ids]
     records.sort(key=lambda r: (r["start_utc"], r["id"]))
     return records[:limit], len(records) > limit
@@ -222,12 +306,24 @@ def clinic_name(location_id, raw: str | None, by_id: dict, clinics=()) -> str | 
     return raw
 
 
-def practitioner_names(conn, practice_id: int, booking_tables: bool = True):
-    """Clinician names by Stride user id, clinic names by (unshared) Stride location id, all clinics."""
+def first_visit_types(conn, practice_id: int, booking_tables: bool = True) -> frozenset:
+    """Stride appointment type ids our booking engine books (all first visits)."""
     if not booking_tables:
-        return {}, {}, []
+        return frozenset()
     rows = conn.execute(
-        "select c.stride_user_id as id,c.display_name as name,bl.name as location,"
+        "select distinct stride_appointment_type_id as id from case_types where practice_id=%s",
+        (practice_id,),
+    ).fetchall()
+    return frozenset(r["id"] for r in rows if r.get("id") is not None)
+
+
+def practitioner_names(conn, practice_id: int, booking_tables: bool = True):
+    """Clinician names by Stride user id, clinic names by (unshared) Stride location id, all
+    clinics, and clinician credentials (role) by Stride user id."""
+    if not booking_tables:
+        return {}, {}, [], {}
+    rows = conn.execute(
+        "select c.stride_user_id as id,c.display_name as name,c.credentials,bl.name as location,"
         "bl.stride_location_id from clinicians c "
         "left join clinician_assignments ca on ca.clinician_id=c.id and ca.is_active "
         "left join booking_locations bl on bl.id=ca.booking_location_id and bl.is_active "
@@ -245,6 +341,7 @@ def practitioner_names(conn, practice_id: int, booking_tables: bool = True):
         {str(r["id"]): r["name"] for r in rows},
         {key: names.pop() for key, names in by_id.items() if len(names) == 1},
         sorted(clinics),
+        {str(r["id"]): r["credentials"] for r in rows if r.get("credentials")},
     )
 
 
@@ -305,3 +402,124 @@ def booking_card(conn, practice_id: int, lead_id, now: datetime) -> dict | None:
         ).fetchone()
         card["quote"] = booking_quote(call and call["transcript_text"])
     return card
+
+
+def waiting_records(conn, practice_id: int, now: datetime, limit: int = 500) -> tuple[list[dict], bool]:
+    """Our visits Stride has not shown yet (waiting for approval): upcoming soonest first,
+    then past ones newest first (past and still waiting: the front desk never approved it)."""
+    records, truncated = load_records(conn, practice_id, limit=limit, waiting_only=True)
+    upcoming = [r for r in records if r["start_utc"] >= now]
+    past = sorted((r for r in records if r["start_utc"] < now), key=lambda r: r["start_utc"], reverse=True)
+    return upcoming + past, truncated
+
+
+def _clock(moment: datetime, zone: ZoneInfo) -> str:
+    return moment.astimezone(zone).strftime("%H:%M")
+
+
+def day_summaries(conn, practice_id: int, records: list[dict], start: date, end: date,
+                  timezone: str, now: datetime) -> list[dict]:
+    """Per day and clinician: working hours, visits booked and slots still open.
+
+    Sources (all read-only, no Stride call):
+    - working_hours: the clinician's cached Stride slots that day (availability_slots, any
+      status: open, booked by us, or gone = taken since) from the first slot's start to the
+      last slot's end, widened by that day's visits. Stride's API only gives open slots, not
+      the schedule, so a fully booked stretch the cache never saw open shows only through its
+      visits. No slot ever cached (outside the 90-day cache, before booking was on, or a
+      clinician we do not book for): the visits' span ("visits"), or None.
+    - available: open slots starting from now on, at the clinician's first-visit length
+      (default case type, else their shortest), counted once per start time (the demo's three
+      clinics share one Stride location, so the same slot is cached three times). None on a
+      day no successful sync covered (availability_sync_state window): unknown, not zero.
+    - booked: that day's visits for the clinician (ours waiting + Stride's), except cancelled,
+      late cancel and rescheduled. Only as complete as `records` (the calendar's 2000 cap).
+    """
+    zone = ZoneInfo(timezone)
+    tables = optional_tables(conn)
+    people: dict[str, dict] = {}
+    lengths: dict[str, set] = {}
+    default_length: dict[str, int] = {}
+    location_ids: dict[str, set] = {}
+    if tables["booking"]:
+        for r in conn.execute(
+            "select c.stride_user_id as id,c.display_name as name,c.credentials as role,"
+            "ca.booking_location_id,ct.duration_minutes,ct.is_default from clinicians c "
+            "join clinician_assignments ca on ca.clinician_id=c.id and ca.is_active "
+            "join booking_locations bl on bl.id=ca.booking_location_id and bl.is_active "
+            "join case_types ct on ct.id=ca.case_type_id and ct.is_active "
+            "where c.practice_id=%s and c.is_active order by c.display_name",
+            (practice_id,),
+        ).fetchall():
+            key = str(r["id"])
+            people.setdefault(key, {"name": r["name"], "role": r["role"] or None})
+            lengths.setdefault(key, set()).add(r["duration_minutes"])
+            location_ids.setdefault(key, set()).add(r["booking_location_id"])
+            if r["is_default"]:
+                default_length[key] = r["duration_minutes"]
+    for r in records:
+        if r["practitioner_id"] != "unassigned":
+            people.setdefault(r["practitioner_id"], {"name": r["practitioner_name"],
+                                                     "role": r["clinician"]["role"]})
+    slot_length = {key: default_length.get(key) or min(found) for key, found in lengths.items()}
+
+    spans: dict[tuple, list] = {}
+    open_counts: dict[tuple, int] = {}
+    covered: dict[int, list] = {}
+    if tables["booking"] and people:
+        lower = datetime.combine(start, datetime.min.time(), zone)
+        upper = datetime.combine(end + timedelta(days=1), datetime.min.time(), zone)
+        for r in conn.execute(
+            "select c.stride_user_id as id,(s.start_utc at time zone %s)::date as day,"
+            "s.duration_minutes,min(s.start_utc) as first_start,max(s.end_utc) as last_end,"
+            "count(distinct s.start_utc) filter (where s.status='open' and s.start_utc>=%s) as open "
+            "from availability_slots s join clinicians c on c.id=s.clinician_id "
+            "where s.practice_id=%s and s.start_utc>=%s and s.start_utc<%s "
+            "group by 1,2,3",
+            (timezone, now, practice_id, lower, upper),
+        ).fetchall():
+            key = (str(r["id"]), r["day"])
+            span = spans.setdefault(key, [r["first_start"], r["last_end"]])
+            span[0], span[1] = min(span[0], r["first_start"]), max(span[1], r["last_end"])
+            if r["duration_minutes"] == slot_length.get(key[0]):
+                open_counts[key] = r["open"]
+        for r in conn.execute(
+            "select st.booking_location_id,st.window_start,st.window_end from availability_sync_state st "
+            "join booking_locations bl on bl.id=st.booking_location_id where bl.practice_id=%s "
+            "and st.last_success_at is not null and st.window_start is not null",
+            (practice_id,),
+        ).fetchall():
+            covered.setdefault(r["booking_location_id"], []).append((r["window_start"], r["window_end"]))
+
+    visits: dict[tuple, list] = {}
+    for r in records:
+        if r["state"] in NOT_HELD_STATES or r["practitioner_id"] == "unassigned" or not r["start_utc"]:
+            continue
+        key = (r["practitioner_id"], r["start_utc"].astimezone(zone).date())
+        visits.setdefault(key, []).append(r)
+
+    today = now.astimezone(zone).date()
+    days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    summary = []
+    for key, person in sorted(people.items(), key=lambda item: (item[1]["name"] or "", item[0])):
+        for day in days:
+            cell = (key, day)
+            booked = visits.get(cell, [])
+            span = list(spans.get(cell) or [])
+            source = "slots" if span else None
+            for v in booked:
+                finish = v["end_utc"] or v["start_utc"]
+                span = [min(span[0], v["start_utc"]), max(span[1], finish)] if span else [v["start_utc"], finish]
+                source = source or "visits"
+            cached = day >= today and any(
+                low <= day <= high for loc in location_ids.get(key, ()) for low, high in covered.get(loc, ()))
+            summary.append({
+                "date": day.isoformat(), "practitioner_id": key, "practitioner_name": person["name"],
+                "role": person["role"],
+                "working_hours": ({"start": _clock(span[0], zone), "end": _clock(span[1], zone),
+                                   "source": source} if span else None),
+                "booked": len(booked),
+                "available": open_counts.get(cell, 0) if cached and key in slot_length else None,
+                "slot_minutes": slot_length.get(key),
+            })
+    return summary

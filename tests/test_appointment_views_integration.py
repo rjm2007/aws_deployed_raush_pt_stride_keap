@@ -4,7 +4,8 @@ Needs TEST_DATABASE_URL (a disposable local database). Reuses the Stride import 
 which builds its own practice and removes it afterwards.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from test_stride_import_integration import (  # noqa: F401 (env is a fixture)
@@ -17,6 +18,8 @@ from test_stride_import_integration import (  # noqa: F401 (env is a fixture)
     patient,
 )
 
+from rpt_agent.routes import dashboard_calendar as calendar
+from rpt_agent.security import DashboardActor
 from rpt_agent.services import appointment_views as av
 
 pytestmark = pytest.mark.integration
@@ -134,3 +137,145 @@ def test_stride_copy_wins_and_a_removed_visit_stays_hidden(booked):
                (practice,))
     records, _ = av.load_records(db, practice, lead_ids=[lead])
     assert records == []  # removed in Stride: neither copy shows
+
+
+# --- calendar redesign data (2026-10-26) -------------------------------------------------
+
+NY = ZoneInfo("America/New_York")  # the import fixture's practice timezone
+
+
+def _at(day: str, hour: int, minute: int = 0) -> datetime:
+    return datetime.combine(date.fromisoformat(day), time(hour, minute), NY)
+
+
+def _ours(ctx, lead, start, stride_id=None, case=None):
+    ctx.db.execute(
+        "insert into appointments(lead_id,practice_id,booking_source,state,start_utc,end_utc,clinician_id,"
+        "location_id,case_type_id,stride_appointment_id) values(%s,%s,'voice_agent','scheduled',%s,%s,3,2,%s,%s)",
+        (lead, ctx.practice_id, start, start + timedelta(hours=1), case, stride_id))
+
+
+def test_elliot_booking_waits_for_approval_until_the_stride_export_shows_it(booked):
+    ctx = booked
+    case = _booking_setup(ctx)
+    db, practice = ctx.db, ctx.practice_id
+    db.execute("update clinicians set credentials='PT, DPT' where practice_id=%s", (practice,))
+    lead = ctx.lead("Ada Lovelace", dob="1991-02-02", phone="+15552010002")
+    day = future_day(5)
+    _ours(ctx, lead, _at(day, 10), stride_id=9200, case=case)
+    actor = DashboardActor("review", "review@example.test", practice_id=practice)
+
+    (waiting,), _ = av.load_records(db, practice, lead_ids=[lead])
+    assert waiting["id"] == "stride:9200"
+    assert (waiting["approval"], waiting["stride_status"], waiting["source"]) == ("waiting", None, "elliot")
+    assert waiting["patient_name"] == "Lovelace, Ada" and waiting["visit_kind"] == "first_visit"
+    assert waiting["clinician"] == {"id": "3", "name": "Joe Smith", "role": "PT, DPT"}
+    assert waiting["location_id"] == 2 and waiting["location"] == "Laguna Niguel"
+    listed = calendar.appointment_approvals(actor)
+    assert [r["id"] for r in listed["appointments"]] == ["stride:9200"] and listed["count"] == 1
+
+    # Stride's export shows the visit (front desk approved it): Stride's copy, Stride's status.
+    ctx.drop("patients_20261001100000.csv", csv_bytes(PATIENT_HEADER, [
+        patient("201", "Ada", "Lovelace", "1991-02-02", mobile="(555) 201-0002")]))
+    ctx.drop("appointments_20261001100000.csv", csv_bytes(APPOINTMENT_HEADER, [
+        appointment("9200", "201", "7200", day, status="U")]))
+    ctx.tick()
+    (seen,), _ = av.load_records(db, practice, lead_ids=[lead])
+    assert seen["id"] == "stride:9200" and seen["record_from"] == "Stride"
+    assert (seen["approval"], seen["stride_status"], seen["source"]) == ("in_stride", "unmarked", "elliot")
+    assert seen["patient_name"] == "Lovelace, Ada" and seen["visit_type"] == "Initial Evaluation"
+    assert calendar.appointment_approvals(actor)["appointments"] == []
+
+    for minute, (letter, status) in enumerate([("O", "confirmed"), ("C", "checked_in"), ("N", "no_show"),
+                                               ("L", "late_cancel"), ("A", "cancelled")], start=1):
+        ctx.drop(f"appointments_202610011{minute:02d}000.csv", csv_bytes(APPOINTMENT_HEADER, [
+            appointment("9200", "201", "7200", day, status=letter,
+                        modified=f"2026-10-01 11:{minute:02d}:00")]))
+        ctx.tick()
+        (seen,), _ = av.load_records(db, practice, lead_ids=[lead])
+        assert (seen["approval"], seen["stride_status"]) == ("in_stride", status)
+
+
+def test_waiting_list_is_upcoming_first_and_skips_what_is_off_the_books(booked):
+    ctx = booked
+    case = _booking_setup(ctx)
+    db, practice = ctx.db, ctx.practice_id
+    now = datetime.now(UTC)
+    late, soon, later, gone = (ctx.lead(f"Lead {n}", phone=f"+1555201000{n}") for n in range(4))
+    _ours(ctx, late, now - timedelta(days=2), case=case)   # never approved: still listed, after the upcoming
+    _ours(ctx, soon, now + timedelta(days=1), case=case)
+    _ours(ctx, later, now + timedelta(days=9), stride_id=9300, case=case)
+    _ours(ctx, gone, now + timedelta(days=3), case=case)
+    db.execute("update appointments set state='cancelled' where lead_id=%s", (gone,))
+    records, truncated = av.waiting_records(db, practice, now)
+    assert not truncated
+    assert [r["lead_id"] for r in records] == [soon, later, late]
+    assert all(r["approval"] == "waiting" for r in records)
+
+
+def test_day_summary_counts_booked_and_open_slots_and_finds_working_hours(booked):
+    ctx = booked
+    case = _booking_setup(ctx)
+    db, practice = ctx.db, ctx.practice_id
+    clinician = db.execute("select id from clinicians where practice_id=%s", (practice,)).fetchone()["id"]
+    laguna = db.execute("select id from booking_locations where practice_id=%s", (practice,)).fetchone()["id"]
+    # A second clinic on the same Stride location (as on the demo): its slots are the same slots.
+    dana = db.execute(
+        "insert into booking_locations(practice_id,name,stride_location_id,timezone) "
+        "values(%s,'Dana Point',2,'America/New_York') returning id", (practice,)).fetchone()["id"]
+    db.execute("insert into clinician_assignments(clinician_id,booking_location_id,case_type_id) "
+               "values(%s,%s,%s)", (clinician, dana, case))
+    day, next_day = future_day(3), future_day(4)
+
+    def slot(location, hour, status="open", minutes=60):
+        start = _at(day, hour)
+        db.execute(
+            "insert into availability_slots(practice_id,clinician_id,booking_location_id,duration_minutes,"
+            "start_utc,end_utc,local_date,local_time,timezone,status) values(%s,%s,%s,%s,%s,%s,%s,%s,"
+            "'America/New_York',%s)",
+            (practice, clinician, location, minutes, start, start + timedelta(minutes=minutes),
+             start.date(), start.time(), status))
+
+    for hour in (9, 10, 11, 14):
+        slot(laguna, hour)
+    slot(dana, 9)                      # same 9:00 slot cached for the other clinic: counted once
+    slot(laguna, 13, status="booked")  # we booked it: not open, still the schedule
+    slot(laguna, 16, status="gone")    # taken since: not open, still the schedule
+    slot(laguna, 17, minutes=30)       # another visit length: not counted, still the schedule
+    # Only `day` is covered by a successful sync.
+    db.execute(
+        "insert into availability_sync_state(booking_location_id,duration_minutes,chunk,window_start,"
+        "window_end,last_success_at,slot_count) values(%s,60,0,current_date,%s,now(),5)", (laguna, day))
+
+    lead = ctx.lead("Ada Lovelace", dob="1991-02-02", phone="+15552010002")
+    _ours(ctx, lead, _at(day, 13), case=case)  # Elliot's, waiting for approval: holds the time
+    ctx.drop("patients_20261001100000.csv", csv_bytes(PATIENT_HEADER, [
+        patient("301", "Walk", "In", "1985-05-05", mobile="(555) 201-0099")]))
+    ctx.drop("appointments_20261001100000.csv", csv_bytes(APPOINTMENT_HEADER, [
+        appointment("9401", "301", "7401", day, start="12:00 PM", end="1:00 PM"),
+        appointment("9402", "301", "7401", day, start="3:00 PM", end="4:00 PM", status="Cancel"),
+        appointment("9403", "301", "7401", day, start="4:00 PM", end="5:00 PM", status="L"),
+        appointment("9404", "301", "7401", day, start="6:00 PM", end="7:00 PM", status="O"),
+        appointment("9405", "301", "7401", next_day, start="10:00 AM", end="11:00 AM"),
+    ]))
+    ctx.tick()
+
+    result = calendar.appointment_calendar(
+        DashboardActor("review", "review@example.test", practice_id=practice),
+        date.fromisoformat(day), date.fromisoformat(next_day) + timedelta(days=1))
+    summary = {r["date"]: r for r in result["day_summary"] if r["practitioner_id"] == "3"}
+    assert summary[day] == {
+        "date": day, "practitioner_id": "3", "practitioner_name": "Joe Smith", "role": None,
+        # 9:00 first slot; the 6-7 PM visit stretches the day past the last slot (17:30).
+        "working_hours": {"start": "09:00", "end": "19:00", "source": "slots"},
+        "booked": 3,     # 12:00 + 18:00 Stride, 13:00 ours waiting; cancel and late cancel excluded
+        "available": 4,  # 9, 10, 11, 14 at 60 minutes
+        "slot_minutes": 60,
+    }
+    # Outside the synced window: open slots unknown; hours only from the visit.
+    assert summary[next_day]["available"] is None and summary[next_day]["booked"] == 1
+    assert summary[next_day]["working_hours"] == {"start": "10:00", "end": "11:00", "source": "visits"}
+    last = (date.fromisoformat(next_day) + timedelta(days=1)).isoformat()
+    assert summary[last]["working_hours"] is None and summary[last]["booked"] == 0
+    waiting = [r for r in result["appointments"] if r["approval"] == "waiting"]
+    assert [r["lead_id"] for r in waiting] == [lead]

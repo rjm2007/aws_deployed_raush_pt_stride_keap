@@ -152,6 +152,8 @@ class _Conn:
         if "from clinicians c" in sql:
             return _Result([{"id": 5980, "name": "Joe Smith", "location": "Laguna Niguel",
                              "stride_location_id": 3169}])
+        if "from case_types" in sql:
+            return _Result([{"id": 1452}])
         if "from call_logs cl" in sql:
             return _Result([{"transcript_text": "User: I'd prefer Joe if he is free please.\n"
                                                 "AI: Perfect, you're all set."}])
@@ -202,7 +204,7 @@ def test_a_stride_location_shared_by_clinics_is_not_mapped_by_id():
                 {"id": 1, "name": "A", "location": "Dana Point", "stride_location_id": 3170},
                 {"id": 2, "name": "B", "location": "Mission Viejo", "stride_location_id": 3169},
             ])
-    _, by_id, clinics = av.practitioner_names(Conn(), 7)
+    _, by_id, clinics, _ = av.practitioner_names(Conn(), 7)
     assert by_id == {3169: "Mission Viejo"}
     assert clinics == ["Dana Point", "Laguna Niguel", "Mission Viejo"]
 
@@ -217,3 +219,66 @@ def test_table_check_is_asked_once_both_tables_exist():
     av.optional_tables(Conn())
     av.optional_tables(Conn())
     assert Conn.calls == 1
+
+
+# --- calendar fields (2026-10-26) -------------------------------------------------------
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("U", "unmarked"), ("Unmarked", "unmarked"), (None, "unmarked"), ("", "unmarked"), ("open", "unmarked"),
+    ("O", "confirmed"), ("Confirmed", "confirmed"),
+    ("C", "checked_in"), ("Checked In", "checked_in"),
+    ("A", "cancelled"), ("Cancel", "cancelled"), ("Canceled", "cancelled"),
+    ("L", "late_cancel"), ("Late Cancel", "late_cancel"),
+    ("N", "no_show"), ("No Show", "no_show"),
+    ("Something New", "something_new"),
+])
+def test_each_stride_export_status_maps_to_one_value(raw, expected):
+    assert av.stride_status(raw) == expected
+
+
+@pytest.mark.parametrize(("name", "type_id", "kind"), [
+    ("Initial Evaluation", None, "first_visit"), ("Initial Eval - Pelvic", None, "first_visit"),
+    ("Evaluation", None, "first_visit"), ("New Patient", None, "first_visit"),
+    ("Follow-up", None, "follow_up"), ("Follow Up Visit", None, "follow_up"),
+    ("Re-Evaluation", None, "follow_up"), ("Treatment", None, "follow_up"),
+    ("Massage", None, "other"), ("Appointment", None, "other"), (None, None, "other"),
+    ("PT Visit", 1452, "first_visit"),  # a type id our engine books first visits with
+])
+def test_visit_kind_for_colouring(name, type_id, kind):
+    assert av.visit_kind(name, type_id, frozenset({1452})) == kind
+
+
+@pytest.mark.parametrize(("row", "imported", "source"), [
+    ({"booking_source": "voice_agent", "lead_id": uuid4()}, False, "elliot"),
+    ({"booking_source": "voice_agent", "lead_id": uuid4()}, True, "elliot"),
+    ({"booking_source": "manual", "lead_id": uuid4()}, False, "sheet"),
+    ({"booking_source": None, "lead_id": uuid4()}, True, "sheet"),
+    ({"booking_source": None, "lead_id": None}, True, "stride"),
+])
+def test_source_follows_the_tag(row, imported, source):
+    rec = av.record({"id": 1, "start_utc": NOW, **row}, imported=imported)
+    assert rec["source"] == source
+    assert rec["record_from"] == ("Stride" if imported else "Booking service")
+
+
+@pytest.mark.parametrize(("first", "last", "full", "shown"), [
+    ("Jane", "Doe", "ignored", "Doe, Jane"), (None, None, "Jane Q Doe", "Doe, Jane Q"),
+    (None, None, "Cher", "Cher"), (None, None, None, "Patient name unavailable"),
+])
+def test_patient_name_is_last_comma_first(first, last, full, shown):
+    assert av.patient_name(first, last, full) == shown
+
+
+def test_ours_waits_for_approval_until_stride_shows_it():
+    ours = av.record({"id": 5, "start_utc": NOW, "state": "scheduled", "lead_id": uuid4(),
+                      "booking_source": "voice_agent", "clinician_id": 5980, "clinician_role": "PT, DPT",
+                      "location_id": 3169}, imported=False)
+    assert (ours["approval"], ours["stride_status"], ours["visit_kind"]) == ("waiting", None, "first_visit")
+    assert ours["clinician"] == {"id": "5980", "name": "Unassigned practitioner", "role": "PT, DPT"}
+    assert ours["location_id"] == 3169
+    gone = av.record({"id": 6, "start_utc": NOW, "state": "cancelled", "lead_id": uuid4()}, imported=False)
+    assert gone["approval"] == "not_in_stride"
+    theirs = av.record({"id": 900, "start_utc": NOW, "state": "O", "type": "Follow-up"}, imported=True)
+    assert (theirs["approval"], theirs["stride_status"], theirs["state"]) == ("in_stride", "confirmed", "scheduled")
+    assert theirs["visit_kind"] == "follow_up"

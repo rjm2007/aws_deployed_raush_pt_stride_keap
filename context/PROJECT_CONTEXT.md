@@ -2481,3 +2481,28 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   staff fix it the email is applied ("Email changed in Google Sheet" in Activity) and the warning goes
   ("Cadence started" stays; the edit warning empties). Outreach results may overwrite the warning text.
 - No migration. Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`.
+
+### 2026-10-26 — Calendar redesign phase 1: backend data (owner-approved)
+- The Appointments page is being rebuilt to look like Stride's calendar, view only. Phase 1 adds the data;
+  no UI yet. Elliot books in Stride as pending and Stride's 5-minute export has no pending status (it has
+  U/O/C/A/L/N), so a visit we booked that the export has not shown yet is "waiting for approval".
+- `GET /appointment-calendar`, per visit (old fields unchanged except `source`): `source` elliot / sheet /
+  stride (from the tag; the old "Stride" / "Booking service" text, read by nothing, is now `record_from`),
+  `approval` waiting / in_stride (not_in_stride: ours, cancelled before Stride ever showed it),
+  `stride_status` unmarked / confirmed / checked_in / cancelled / late_cancel / no_show (null while waiting;
+  an unknown Stride word passes through), `visit_type` + `visit_kind` first_visit / follow_up / other
+  (by type name; a type id in `case_types.stride_appointment_type_id` is a first visit), `patient_name`
+  "Last, First", `clinician` {id, name, role = `clinicians.credentials`, else `stride_users.credentials`},
+  `location_id` (Stride's).
+- New `day_summary` in the same response, one row per day and clinician: `working_hours` (first to last
+  cached slot that day in `availability_slots`, any status, widened by that day's visits; source "slots",
+  or "visits" when no slot was ever cached; null otherwise. Stride gives only open slots, never the
+  schedule, so these are an estimate. `business_hours` is Elliot's calling hours, not clinic hours, and is
+  not used), `booked` (visits that day except cancelled, late cancel, rescheduled; waiting ones count),
+  `available` (open slots from now on at the clinician's first-visit length, one per start time; null on a
+  day no successful sync covered: before today or past the 90-day cache), `slot_minutes`.
+- New `GET /appointment-approvals`: every visit waiting for approval, upcoming first, then past ones (never
+  approved). Frontend proxy needs `appointment-approvals` in `ALLOWED_PATH` (phase 2).
+- No migration. Tests: `test_appointment_views.py`, `test_dashboard_calendar.py`,
+  `test_appointment_views_integration.py` (waiting -> in_stride on the CSV row, every status letter,
+  counts, working hours).
