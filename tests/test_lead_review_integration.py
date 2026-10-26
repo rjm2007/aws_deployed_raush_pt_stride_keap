@@ -869,6 +869,25 @@ def test_board_close_on_a_flagged_lead_records_who(review_env):
     assert (review["resolution"], review["resolved_by_name"]) == ("board_closed", "Emma")
 
 
+@pytest.mark.parametrize("in_review", [True, False])
+def test_board_close_writes_closed_into_the_sheet(review_env, in_review):
+    """2026-10-26: a board move to Closed sent nothing, so Outcome Status kept the old text."""
+    senv = review_env
+    number, lead_id = _started(senv)
+    if in_review:
+        senv.sheet.set(number, "name", "Asha Kumar")
+        senv.tick()
+        senv.tick()
+        assert senv.cell(number, "outcome_status") == "Needs review: name changed"
+    assert _post(f"leads/{lead_id}/stage", {"stage": "closed"}).status_code == 200
+    senv.tick()
+    assert senv.cell(number, "outcome_status") == "Closed on the dashboard"
+    assert senv.cell(number, "lead_status") == "Closed"
+    assert senv.cell(number, "action") == ""  # never written by the backend
+    assert all(r["resolved_at"] is not None for r in _reviews(senv, lead_id))
+    assert len(_reviews(senv, lead_id)) == (1 if in_review else 0)
+
+
 def test_history_and_activity_show_flag_and_resolution(review_env):
     senv = review_env
     _, lead_id = _started(senv)

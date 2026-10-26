@@ -170,6 +170,8 @@ def format_cadence_columns(
 # 2026-10-23/25): it empties the cell once a command is handled, so nothing old is left to re-run
 # (sheet_direct._clear_action).
 DASHBOARD_OUTCOMES = {
+    # Board move to Closed (2026-10-26): without it the cell kept e.g. "Needs review: name changed".
+    "board_closed": ("Closed on the dashboard", "Closed", None),
     "cadence_restarted_after_unblock": ("Cadence restarted", "In cadence", "Restart cadence"),
     "cadence_resumed_after_unblock": ("Cadence resumed in dashboard", "In cadence", "Start cadence"),
     "number_unblocked": ("Unblocked in dashboard", None, None),

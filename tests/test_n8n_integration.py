@@ -1357,3 +1357,23 @@ def test_every_snapshot_carries_lead_status_as_the_board_column():
 
     paused = build_sheet_snapshot(Paused(), "00000000-0000-0000-0000-000000000002")
     assert paused["sheet"]["lead_status"] == "Paused"
+
+
+def test_board_close_snapshot_says_closed_on_the_dashboard():
+    """2026-10-26: a board move to Closed left the Sheet's Outcome Status on the old text."""
+    class Closed(_SnapshotConnection):
+        def execute(self, query, params=None):
+            if "a.patient_dob" in query:
+                return _Rows(one=None)
+            rows = super().execute(query, params)
+            if query.startswith("select l.id,l.status"):
+                rows.one = {**rows.one, "status": "declined", "cadence_state": "terminated",
+                            "needs_review": False, "status_reason": "closed from the board",
+                            "cadence_total": 4, "next_event_id": None}
+            return rows
+
+    lead = "00000000-0000-0000-0000-000000000002"
+    sheet = build_sheet_snapshot(Closed(), lead, reasons=["stage_changed", "board_closed"])["sheet"]
+    assert (sheet["action_status"], sheet["lead_status"]) == ("Closed on the dashboard", "Closed")
+    assert "action" not in sheet
+    assert "action_status" not in build_sheet_snapshot(Closed(), lead, reasons=["stage_changed"])["sheet"]

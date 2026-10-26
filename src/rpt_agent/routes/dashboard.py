@@ -1435,6 +1435,12 @@ def move_lead_stage(lead_id: UUID, payload: StageMove, actor: Actor):
                 "where lead_id=%s and status='planned'",
                 (lead_id,),
             )
+            enqueue_sheet_update(
+                conn,
+                lead_id=str(lead_id),
+                event_type="board_closed",
+                source_key=f"dashboard:{lead_id}:{datetime.now(UTC).isoformat()}",
+            )
         else:  # booked
             # Stride is not connected, so nobody can confirm an appointment from
             # our side: the front desk moving the card here is the booking. It is

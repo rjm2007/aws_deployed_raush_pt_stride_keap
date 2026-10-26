@@ -2462,3 +2462,9 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   (Processing / Retrying) are left to recovery.
 - Commands now match ignoring case as well as extra spaces ("restart cadence", "booked" run).
 - No migration. Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`.
+
+### 2026-10-26 — Board move to Closed updates the Sheet (owner-approved)
+- Dragging a card to Closed sent no Outcome Status, so the Sheet kept the old text (e.g. "Needs review: name
+  changed") next to Lead Status "Closed". The move now queues a Sheet update (`board_closed`, like Booked's
+  `lead_booked`); Outcome Status reads "Closed on the dashboard", Lead Status "Closed". Action is not written.
+- No migration. Tests: `test_lead_review_integration.py`, `test_n8n_integration.py`.
