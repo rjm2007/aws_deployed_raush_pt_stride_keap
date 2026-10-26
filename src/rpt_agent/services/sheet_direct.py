@@ -530,6 +530,8 @@ def _refusal_text(body: dict[str, Any]) -> str | None:
         retry_at = datetime.fromisoformat(str(body.get("retry_at"))).astimezone(SHEET_TZ)
     except ValueError:  # a refusal stored before retry_at was sent
         return TOO_SOON_NO_TIME.format(minutes=RESTART_COOLDOWN_MINUTES)
+    if retry_at.second or retry_at.microsecond:  # round up: picking at the shown minute is accepted
+        retry_at = retry_at.replace(second=0, microsecond=0) + timedelta(minutes=1)
     clock = retry_at.strftime("%I:%M %p").lstrip("0") + " PT"
     return TOO_SOON.format(minutes=RESTART_COOLDOWN_MINUTES, time=clock)
 

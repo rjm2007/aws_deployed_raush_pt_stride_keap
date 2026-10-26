@@ -170,7 +170,7 @@ def test_an_impossible_date_gets_a_readable_error_not_request_rejected():
     (409, {"detail": "Request is still processing"}, ("", None, True)),
     # Refusals staff fix by picking the command again later say so (owner, 2026-10-25).
     (409, {"code": "restart_too_soon", "detail": "Wait", "retry_at": "2026-10-25T22:52:30+00:00"},
-     ("Error: restarted less than 10 minutes ago. Pick Restart cadence again after 3:52 PM PT.",
+     ("Error: restarted less than 10 minutes ago. Pick Restart cadence again after 3:53 PM PT.",
       None, False)),
     (409, {"code": "restart_too_soon", "detail": "Wait"},  # stored before retry_at was sent
      ("Error: restarted less than 10 minutes ago. Pick Restart cadence again in 10 minutes.",
@@ -842,3 +842,16 @@ def test_a_start_row_with_a_wrong_email_starts_with_a_warning(old, monkeypatch):
     assert sheet.cell(number, "outcome_status") == (
         "Cadence started; email looks wrong, please fix it")
     assert sheet.cell(number, "lead_status") == "In cadence"
+
+
+@pytest.mark.parametrize(("retry_at", "clock"), [
+    ("2026-10-26T10:14:50+00:00", "3:15 AM PT"),  # restarted 3:04:50 -> next full minute
+    ("2026-10-26T10:15:00+00:00", "3:15 AM PT"),  # exact minute stays
+    ("2026-10-26T10:14:00.000001+00:00", "3:15 AM PT"),
+    ("2026-10-26T10:59:30+00:00", "4:00 AM PT"),
+])
+def test_restart_too_soon_time_rounds_up_to_the_next_minute(retry_at, clock):
+    # Picking Restart at the shown time must not be refused again (owner, 2026-10-26).
+    text = sheet_direct._refusal_text({"code": "restart_too_soon", "retry_at": retry_at})
+    assert text == ("Error: restarted less than 10 minutes ago. "
+                    f"Pick Restart cadence again after {clock}.")
