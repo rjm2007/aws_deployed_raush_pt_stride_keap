@@ -72,6 +72,18 @@ def test_booking_prompt_never_promises_a_text_when_the_booking_was_not_made():
     assert "You'll get a text with the details." in prompt
 
 
+def test_booking_prompt_asks_last_name_first_and_never_books_without_it():
+    # Owner, 2026-10-26: a one-word name on file got booked with last_name "" (MISSING_NAME).
+    prompt = " ".join(Path("config/vapi_booking_assistant_prompt.md").read_text(
+        encoding="utf-8").split())
+    name_step = prompt[prompt.index("3f. **"):prompt.index("3g. **")]
+    ask = name_step.index("\"And what's your last name?\"")
+    assert ask < name_step.index("- Birthday:")
+    assert "one word" in name_step and "wait for the answer" in name_step
+    book_step = prompt[prompt.index("3g. **"):prompt.index("3h. **")]
+    assert "Never call it with an empty or missing `last_name`" in book_step
+
+
 def test_booking_replies_tell_the_agent_to_use_the_front_desk_line():
     import inspect
 
