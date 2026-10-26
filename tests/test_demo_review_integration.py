@@ -19,6 +19,7 @@ from psycopg.types.json import Jsonb
 from test_stride_import_integration import (  # noqa: F401 - the shared Stride fixture
     APPOINTMENT_HEADER,
     _book_then_change,
+    _import_patient_with_appointment,
     appointment,
     csv_bytes,
     env,
@@ -28,6 +29,7 @@ from test_stride_import_integration import (  # noqa: F401 - the shared Stride f
 from rpt_agent.api import app
 from rpt_agent.config import get_settings
 from rpt_agent.observability import WorkflowTrace
+from rpt_agent.routes.dashboard import BOOKED_IS_FINAL_DETAIL
 from rpt_agent.services import slot_booking
 from rpt_agent.services.delivery import process_pending_integrations
 from rpt_agent.services.lead_status import mark_booked
@@ -220,3 +222,60 @@ def test_calls_only_also_stops_the_booking_confirmation_text(denv):
     process_pending_integrations(WorkflowTrace("worker", "test"), NoProviders())
     note = denv.one("select status,error from notification_log where lead_id=%s", lead)
     assert note["status"] == "skipped" and "calls only" in note["error"]
+
+
+# Booked is final (owner, 2026-10-26): staff never move a booked lead out on the board. The only way
+# out is the visit cancelled in Stride, which brings the lead back as an Appointment review.
+def _snapshot(denv, lead):
+    row = denv.one("select status,cadence_state,needs_review from leads where id=%s", lead)
+    history = denv.one("select count(*) n from lead_status_history where lead_id=%s", lead)["n"]
+    return row["status"], row["cadence_state"], row["needs_review"], history
+
+
+@pytest.mark.parametrize("target", ["new", "cadence", "attention", "closed"])
+def test_a_stride_booked_lead_cannot_be_moved_out_on_the_board(denv, target):
+    lead = denv.lead("Final Test")
+    assert _import_patient_with_appointment(denv, first="Final", last="Test")["leads_booked"] == 1
+    before = _snapshot(denv, lead)
+    assert before[0] == "booked"
+    refused = _post(f"leads/{lead}/stage", {"stage": target})
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == BOOKED_IS_FINAL_DETAIL == (
+        "This lead is booked. To change it, cancel the visit in Stride; "
+        "the lead comes back for review by itself.")
+    assert _snapshot(denv, lead) == before
+    assert denv.one("select count(*) n from outreach_events where lead_id=%s and status='planned'",
+                    lead)["n"] == 0
+
+
+@pytest.mark.parametrize("target", ["new", "cadence", "attention", "closed"])
+def test_a_board_booked_lead_cannot_be_moved_out_either(denv, target):
+    lead = denv.lead("Board Test")
+    assert _post(f"leads/{lead}/stage", {"stage": "booked"}).status_code == 200
+    refused = _post(f"leads/{lead}/stage", {"stage": target})
+    assert (refused.status_code, refused.json()["detail"]) == (409, BOOKED_IS_FINAL_DETAIL)
+    assert denv.one("select status from leads where id=%s", lead)["status"] == "booked"
+
+
+def test_do_not_contact_on_a_booked_lead_is_still_allowed(denv):
+    lead = denv.lead("Safety Test")
+    mark_booked(denv.db, str(lead), "voice_booking")
+    response = _post(f"leads/{lead}/contact-rules", {"do_not_contact": True})
+    assert response.status_code == 200, response.json()
+    assert denv.one("select status from leads where id=%s", lead)["status"] == "do_not_contact"
+
+
+def test_a_stride_cancel_still_brings_a_booked_lead_back_for_review(denv):
+    lead = denv.lead("Way Out")
+    day = future_day()
+    _import_patient_with_appointment(denv, day=day, first="Way", last="Out")
+    assert _post(f"leads/{lead}/stage", {"stage": "attention"}).status_code == 409
+    denv.drop("appointments_20261001110000.csv", csv_bytes(APPOINTMENT_HEADER, [
+        appointment("9001", "101", "7001", day, modified="2026-10-01 11:00:00", status="Cancel")]))
+    denv.tick()
+    row = denv.one("select status,needs_review,review_reason from leads where id=%s", lead)
+    assert (row["status"], row["needs_review"], row["review_reason"]) == (
+        "needs_attention", True, "Cancelled in Stride")
+    assert [(r["code"], r["source"]) for r in _reviews(denv, lead)] == [("appointment_cancelled", "stride")]
+    # Out of Booked, the board works on it again.
+    assert _post(f"leads/{lead}/stage", {"stage": "closed"}).status_code == 200

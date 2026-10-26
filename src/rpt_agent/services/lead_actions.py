@@ -40,7 +40,7 @@ NUMBER_BLOCKED_REASON = "Number blocked: this number asked not to be contacted. 
 # undoes a decision made on the dashboard. A lead in review is restarted from its review card; a
 # booked or closed lead is reopened on the dashboard. (n8n mode keeps the old rules.)
 RESTART_REVIEW_DETAIL = "This lead needs review. Resolve it on the dashboard; you can restart it from there."
-RESTART_BOOKED_DETAIL = "This lead is booked. Reopen it on the dashboard if needed."
+RESTART_BOOKED_DETAIL = "This lead is booked. To start again, cancel the visit in Stride, or add a new row."
 RESTART_CLOSED_DETAIL = "This lead is closed ({why}). Use the dashboard."
 
 

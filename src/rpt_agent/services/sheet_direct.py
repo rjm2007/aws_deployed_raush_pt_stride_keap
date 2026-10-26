@@ -110,7 +110,7 @@ TOO_SOON_NO_TIME = ("Error: restarted less than {minutes} minutes ago. Pick Rest
 # a dashboard decision, and a lead in review is restarted from its review card.
 REVIEW_REFUSED = ("Error: this lead needs review. Resolve it on the dashboard; you can restart it "
                   "from there.")
-BOOKED_REFUSED = "Error: this lead is booked. Reopen it on the dashboard if needed."
+BOOKED_REFUSED = "Error: this lead is booked. To start again, cancel the visit in Stride, or add a new row."
 CLOSED_REFUSED = "Error: this lead is closed ({why}). Use the dashboard."
 # Start cadence on a row that already has a Lead ID would create nothing (the phone is taken): it was
 # ignored without a word; now Action empties, so the row says why.

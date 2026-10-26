@@ -861,7 +861,7 @@ def test_a_restart_picked_on_a_booked_row_is_refused(env):
     lead_id = _command(env, number, "Booked")
     _command(env, number, "Restart cadence")
     assert env.cell(number, "outcome_status") == (
-        "Error: this lead is booked. Reopen it on the dashboard if needed.")
+        "Error: this lead is booked. To start again, cancel the visit in Stride, or add a new row.")
     assert env.cell(number, "lead_status") == "Booked"
     assert env.lead(lead_id)["status"] == "booked"
     assert _requests(env, lead_id, "restart_cadence") == 0

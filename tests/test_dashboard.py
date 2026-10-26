@@ -1685,7 +1685,7 @@ def test_resuming_a_wrong_number_lead_confirms_the_number(monkeypatch):
 
 
 @pytest.mark.parametrize(("status", "message"), [
-    ("booked", "A booked lead cannot be resumed"),
+    ("booked", dashboard_routes.BOOKED_IS_FINAL_DETAIL),
     ("declined", "This patient declined; the cadence cannot be resumed"),
     ("do_not_contact", "A Do Not Contact lead cannot be resumed"),
 ])

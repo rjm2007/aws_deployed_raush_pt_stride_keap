@@ -2516,3 +2516,17 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   Locations view, and the union of all clinics otherwise.
 - No migration. Tests: `test_dashboard_calendar.py`, `test_appointment_views_integration.py`
   (`test_practitioners_carry_a_role_ours_first_then_strides`, open slots per clinic).
+
+### 2026-10-26 — Booked is final (owner-approved)
+- A booked lead (any source: Elliot, Sheet Booked, Stride import, board) can no longer be moved out of Booked
+  on the dashboard board: `POST /leads/{id}/stage` to New / In cadence / Needs review / Closed returns 409
+  "This lead is booked. To change it, cancel the visit in Stride; the lead comes back for review by itself."
+  (`BOOKED_IS_FINAL_DETAIL`). Resume on a booked lead (already refused) now gives the same text.
+- Sheet Restart on a booked lead (`restart_booked`) now says "Error: this lead is booked. To start again, cancel
+  the visit in Stride, or add a new row."
+- Unchanged: the only way out is the visit cancelled in Stride -> Stride's export -> Appointment review; the
+  Sheet Booked command; Do Not Contact on a booked lead (safety). Review choices never apply to a booked lead
+  (a booked lead is never flagged, `flag_lead_for_review` skips final statuses).
+- Dashboard: Booked cards are not draggable and show a hint; a 409 still shows its detail.
+- No migration. Tests: `test_demo_review_integration.py` (board moves refused for every column, DNC allowed,
+  Stride cancel still reviews), `test_dashboard.py`, `test_sheet_direct*.py`.

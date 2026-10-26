@@ -30,6 +30,10 @@ The staff assistant router (`/api/v1/dashboard/assistant`) lives in `../agent/ro
 - `_require_super_admin` guards global cadence/template writes and deletes (call it before opening a
   transaction).
 - `POST /leads/{id}/stage` drives board drag-and-drop (including restart from Day 0 when moved to New).
+  Booked is final (owner, 2026-10-26): a booked lead (status `booked`, any source) moved to any other column
+  gets 409 `BOOKED_IS_FINAL_DETAIL`; Resume on a booked lead gives the same text. The only way out is the
+  visit cancelled in Stride (`stride_leads.flag_cancelled_bookings` -> Appointment review). Do Not Contact
+  (`/contact-rules`) on a booked lead stays allowed.
 
 A lead with an open review (`needs_review`) cannot be resumed or moved to In cadence (409): it goes through
 `resolve_review` (`services/lead_review.py`), which records who chose what.

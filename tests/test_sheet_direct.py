@@ -185,7 +185,7 @@ def test_an_impossible_date_gets_a_readable_error_not_request_rejected():
      ("Error: this lead needs review. Resolve it on the dashboard; you can restart it from there.",
       None, False)),
     (409, {"code": "restart_booked", "detail": "x"},
-     ("Error: this lead is booked. Reopen it on the dashboard if needed.", None, False)),
+     ("Error: this lead is booked. To start again, cancel the visit in Stride, or add a new row.", None, False)),
     (409, {"code": "restart_closed", "detail": "x", "closed_reason": "handled by front desk"},
      ("Error: this lead is closed (handled by front desk). Use the dashboard.", None, False)),
     (409, {"code": "restart_closed", "detail": "x", "closed_reason": "a newer row has this phone number"},

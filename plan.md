@@ -219,8 +219,10 @@ Behavior:
 - Action must be chosen from the drop-down (owner, 2026-10-26). Any other text (e.g. "please call", or
   "restart cadence" / "booked" typed in another case) runs nothing: after the same 60 s settle the row says
   `Error: action must be chosen from the drop-down.` and Action empties. Only extra spaces are forgiven.
-- A lead in Needs Review, booked or closed is handled on the dashboard (Resolve review offers restart from
-  Day 0); the Sheet's Restart refuses it and says why.
+- A lead in Needs Review or closed is handled on the dashboard (Resolve review offers restart from
+  Day 0); the Sheet's Restart refuses it and says why. Booked is final (owner, 2026-10-26): the dashboard
+  board cannot move a booked lead either; cancel the visit in Stride (the lead comes back for review), or
+  add a new row.
 - Don't delete rows, don't copy-paste whole rows (the hidden Lead ID / Action Request ID would come along),
   and don't edit the hidden columns (Lead ID, Action Request ID, Action Started At). A new patient, or a new
   phone number, goes in a new row.
@@ -300,7 +302,8 @@ states and inbound replies. These endpoints update Supabase first; they never ca
    in review. Restart guardrails (owner, 2026-10-25): the Sheet never undoes a dashboard decision. Refusals say
    what to do:
    - `Error: this lead needs review. Resolve it on the dashboard; you can restart it from there.`
-   - `Error: this lead is booked. Reopen it on the dashboard if needed.` (n8n mode still restarts a booked lead)
+   - `Error: this lead is booked. To start again, cancel the visit in Stride, or add a new row.` (2026-10-26;
+     n8n mode still restarts a booked lead)
    - `Error: this lead is closed (<why>). Use the dashboard.` where <why> is `handled by front desk`,
      `a newer row has this phone number`, `not interested` or `closed on the dashboard` (moved to Closed on the
      board). Do Not Contact, wrong number / different person and phone changed keep their own refusals. A

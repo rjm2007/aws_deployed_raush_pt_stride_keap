@@ -1189,8 +1189,12 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
     }
 
 
+BOOKED_IS_FINAL_DETAIL = (
+    "This lead is booked. To change it, cancel the visit in Stride; "
+    "the lead comes back for review by itself."
+)
 RESUME_REFUSED = {
-    "booked": "A booked lead cannot be resumed",
+    "booked": BOOKED_IS_FINAL_DETAIL,
     "declined": "This patient declined; the cadence cannot be resumed",
     "do_not_contact": "A Do Not Contact lead cannot be resumed",
 }
@@ -1450,6 +1454,10 @@ def move_lead_stage(lead_id: UUID, payload: StageMove, actor: Actor):
             )
         if payload.stage in {"new", "cadence"} and (closed := closed_for_good(conn, lead)):
             raise HTTPException(status_code=409, detail=closed)
+        # Booked is final (owner, 2026-10-26): staff never move a booked lead out on the board.
+        # The only way out is the visit cancelled in Stride, which flags it for review by itself.
+        if lead["status"] == "booked" and payload.stage != "booked":
+            raise HTTPException(status_code=409, detail=BOOKED_IS_FINAL_DETAIL)
         # Dragging a flagged card to In cadence used to clear the review without restoring its
         # steps or saying why. The choices (and their record) live on Resolve review.
         if payload.stage == "cadence" and lead["needs_review"]:
