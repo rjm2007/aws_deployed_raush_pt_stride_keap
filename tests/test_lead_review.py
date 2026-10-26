@@ -266,3 +266,25 @@ def test_restart_choices_say_what_they_do():
                       "starts from Day 0")
     effect = _effect("keep_old_value", {"old_value": "Dana Point"}, LEAD, "details", "location_changed")
     assert effect == "The location stays Dana Point; the Sheet cell is set back to it"
+
+
+def test_a_booking_that_failed_on_the_call_is_a_front_desk_card():
+    # Owner, 2026-10-26: Elliot told the patient the front desk will take care of it; the card says
+    # so, offers only "Front desk will handle" (the patient is not booked) and never mentions a text.
+    card = describe(_review("booking_failed", on_call=True,
+                            why="ran out of time before the case step"), LEAD)
+    assert card["group"] == "booking" and card["title"] == "Booking did not go through"
+    assert "could not book a visit on the call (ran out of time before the case step)" in card["reason"]
+    assert "front desk team will take care of the appointment" in card["reason"]
+    assert "by text" not in card["reason"]
+    assert [o["choice"] for o in card["options"]] == ["front_desk"]
+    assert sheet_open_status("booking_failed", {"on_call": True}) == \
+        "Needs review: booking did not go through"
+    # The unclear-booking check's own card (no on_call) keeps its Stride wording.
+    assert "Stride still shows that time as open" in describe(_review("booking_failed"), LEAD)["reason"]
+
+
+def test_booking_cards_and_sheet_words_name_what_happened():
+    assert sheet_open_status("booking_patient_exists", {}) == \
+        "Needs review: patient already in Stride, book by hand"
+    assert "front desk team will take care" in describe(_review("booking_unclear"), LEAD)["reason"]

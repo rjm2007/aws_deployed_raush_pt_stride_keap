@@ -596,11 +596,18 @@ _SELECT_ROWS = (
 )
 
 
-def plan_changes(conn, practice_id: int, *, full: bool = False, limit: int | None = None) -> dict[str, int]:
-    """Recompute desired for changed people and queue the rows whose hash changed."""
+def plan_changes(
+    conn, practice_id: int, *, full: bool = False, limit: int | None = None, attach: bool = True
+) -> dict[str, int]:
+    """Recompute desired for changed people and queue the rows whose hash changed.
+
+    ``attach=False`` when the caller already ran ``attach_people`` in its own, committed transaction
+    (the keap-worker does, see run_keap_sync_tick).
+    """
     batch = limit or get_settings().keap_plan_batch
     counts = {"recomputed": 0, "queued": 0, "skipped": 0, "failed": 0, "frozen": 0}
-    counts.update(attach_people(conn, practice_id))
+    if attach:
+        counts.update(attach_people(conn, practice_id))
     settings = load_settings(conn, practice_id)
     if not settings:
         return counts

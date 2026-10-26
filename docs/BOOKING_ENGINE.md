@@ -66,8 +66,31 @@ otherwise the default case type is used.
 - Server fills phone, case title (the lead's case), default address, appointment type, clinician,
   location, start/end.
 - Replies: `BOOKED`, `ALREADY_BOOKED`, `TAKEN` / `NOT_AVAILABLE` (with 3 new openings),
-  `PATIENT_EXISTS` (lead flagged; team calls back), `UNCONFIRMED` (unclear Stride result; lead flagged,
-  never retried), `FOLLOW_UP` (could not finish in time), `IN_PROGRESS`, `BAD_*`.
+  `PATIENT_EXISTS` (lead flagged), `UNCONFIRMED` (unclear Stride result; lead flagged, never retried),
+  `FOLLOW_UP` (could not finish in time, or Stride refused for another reason; lead flagged),
+  `IN_PROGRESS` (an earlier request for this patient
+  is still finishing; the agent says nothing (the tool's own waiting message plays) and books again with the same details, at most
+  twice, then the UNCONFIRMED line; a repeat after the first request finished answers `ALREADY_BOOKED`;
+  the same patient meeting its own hold on the slot also gets `IN_PROGRESS`, only another patient's hold is
+  `TAKEN`), `BAD_*`.
+- A request that finds this patient's attempt still running first waits for it (`IN_PROGRESS_WAIT_SECONDS`
+  = 12, polled every second in short transactions, no locks held; the tool deadline still counts from the
+  request's start). Then: booked → `ALREADY_BOOKED` with day, time, therapist and clinic; unclear →
+  `UNCONFIRMED`; failed as taken → the normal flow (that time is gone: other openings, or this request's
+  own different time is booked); failed otherwise → `FOLLOW_UP` (lead flagged); still running →
+  `IN_PROGRESS`, marked on the patient's running attempt (`in_progress_reply_at`, by lead). Before this an
+  instant `IN_PROGRESS` made the agent retry at once (the waiting message three times in a few seconds).
+- `ALREADY_BOOKED` names day, time, therapist and clinic so the agent's closing (3h) is right.
+- Not booked (owner, 2026-10-26): for `PATIENT_EXISTS`, `UNCONFIRMED`, `FOLLOW_UP` and a twice-failed tool
+  the agent says "Our front desk team will take care of your appointment and reach out to you shortly"
+  (never "we'll text you"), and the lead is always in Needs Review, "Booking" group (front desk only).
+  `FOLLOW_UP` uses code `booking_failed` with `details.on_call` ("Booking did not go through on the call;
+  book with the patient (why)"). `TAKEN` / `NOT_AVAILABLE` and validation replies are not flagged (the agent
+  offers other times / asks again), except a `TAKEN` on an attempt that already answered `IN_PROGRESS`
+  (`appointments.in_progress_reply_at`, migration 052): the patient may have heard the front desk line.
+  Voice agent only; a staff calendar booking shows its error to staff. A booking later on the call (or in
+  Stride's next file) settles the review (`mark_booked` clears it). The route's own unexpected-error reply
+  flags `booking_unclear` and starts with `UNCONFIRMED:`.
 
 Both always answer HTTP 200 with `{"results":[{"toolCallId","result"|"error"}]}`, one line. `error` is
 used only when the tool itself failed (no lead on the call, booking switched off, Stride down).
@@ -83,6 +106,9 @@ used only when the tool itself failed (no lead on the call, booking switched off
 6. Timeout after Stride may have saved → `unknown`, lead flagged, never retried.
 7. On success: lead booked (calls/texts stop), confirmation SMS queued, Sheet updated, Keap handoff
    queued (not for test leads).
+8. Lock order: lead, then the call's outreach event (as `_finish_booking`, `report_lead_status`,
+   `apply_call_outcome` and the end-of-call no-outcome fallback do since 2026-10-26). An end-of-call report
+   arriving while the booking finishes waits for it; the booking wins (the call stays Booked, no review).
 
 Speed: Stride is called with a 6 s timeout and no retries inside a call; the tool stops before 24 s.
 

@@ -121,7 +121,14 @@ def record_status(conn, lead_id: str, old: str | None, new: str, source: str, re
 
 
 def mark_booked(conn, lead_id: str, source: str) -> None:
-    lead = conn.execute("select status from leads where id=%s for update", (lead_id,)).fetchone()
+    # FOR NO KEY UPDATE still makes status writers wait for each other, but not for rows being
+    # inserted elsewhere that point at this lead (foreign keys take a key-share lock until they
+    # commit). FOR UPDATE waited 58 s behind the keap-worker's hourly plan, which had just added
+    # this lead's keap_sync row: past Vapi's tool timeout, so the agent told a booked patient the
+    # system wasn't responding (demo 2026-10-26). Nothing here changes a key column of leads.
+    lead = conn.execute(
+        "select status from leads where id=%s for no key update", (lead_id,)
+    ).fetchone()
     if not lead:
         raise ValueError("lead not found")
     conn.execute(
@@ -518,13 +525,17 @@ def apply_call_outcome(
         raise ValueError("invalid call outcome")
     with transaction() as conn:
         trace.log("database_operation_started", operation="lock_lead_event")
+        # Lead first, then the event: the order report_lead_status and the voice booking
+        # (_finish_booking: mark_booked, then this call's event) use. Event-then-lead could deadlock
+        # with a booking finishing as the end-of-call report arrives, and Postgres would abort one
+        # side; losing the booking's save leaves a visit in Stride our records do not show.
+        lead = conn.execute(
+            "select id,status,phone_e164 from leads where id=%s for update", (lead_id,)
+        ).fetchone()
         event = conn.execute(
             "select id,lead_id,channel,status,outcome,vapi_call_id from outreach_events "
             "where id=%s for update",
             (event_id,),
-        ).fetchone()
-        lead = conn.execute(
-            "select id,status,phone_e164 from leads where id=%s for update", (lead_id,)
         ).fetchone()
         if not lead or not event or str(event["lead_id"]) != str(lead_id):
             trace.log("validation_failed", reason="lead_event_mismatch")

@@ -388,6 +388,9 @@ def _settle_from_structured_output(
     result = _structured_outcome(message)
     if not result:
         with transaction() as conn:
+            # Lead before event, as apply_call_outcome and the voice booking lock them (a booking
+            # finishing now locks the lead, then this event): the other order can deadlock.
+            conn.execute("select id from leads where id=%s for update", (lead_id,))
             conn.execute(
                 "update outreach_events set status='delivered',settled_at=now(),"
                 "settled_by='webhook',outcome='manual',failure_reason=%s,updated_at=now() "

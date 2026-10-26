@@ -470,6 +470,53 @@ def test_rate_limit_during_a_tick_releases_the_rest_without_using_attempts(env):
     assert all(r["next_attempt_at"] > datetime.now(UTC) + timedelta(seconds=800) for r in rows)
 
 
+def test_a_booking_does_not_wait_for_an_uncommitted_keap_sync_row_on_its_lead(env):
+    # Demo 2026-10-26: the keap-worker's hourly plan had inserted this lead's keap_sync row (the
+    # foreign key holds a key-share lock on the lead until commit, ~3 min); mark_booked's FOR UPDATE
+    # waited 58 s behind it, past Vapi's 20 s tool timeout. FOR NO KEY UPDATE does not wait.
+    from rpt_agent.services.lead_status import mark_booked
+
+    lead = env.lead()
+    url = os.environ["TEST_DATABASE_URL"]
+    with psycopg.connect(url) as planner, psycopg.connect(
+        url, row_factory=dict_row, options="-c lock_timeout=2000"
+    ) as booking:
+        planner.execute("insert into keap_sync(practice_id,lead_id) values(%s,%s)",
+                        (env.practice_id, lead))  # left uncommitted, like the long plan
+        # the old lock really is blocked in this setup
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            booking.execute("select id from leads where id=%s for update", (lead,))
+        booking.rollback()
+        with booking.transaction():
+            mark_booked(booking, str(lead), "voice_booking")
+        planner.rollback()
+    assert env.db.execute("select status from leads where id=%s", (lead,)).fetchone()["status"] == "booked"
+
+
+def test_worker_commits_new_keap_sync_rows_before_planning(env, monkeypatch):
+    # Same incident: while the (long) planning transaction runs, a new lead's keap_sync row is
+    # already committed, so nothing holds a lock on the lead and the row is visible to others.
+    lead = env.lead()
+    url = os.environ["TEST_DATABASE_URL"]
+    seen = {}
+    real_load_mapping = keap_desired.load_mapping
+
+    def load_mapping(conn, practice_id):  # runs inside plan_changes, after people are attached
+        with psycopg.connect(url, row_factory=dict_row, options="-c lock_timeout=2000") as other:
+            seen["row"] = other.execute("select id from keap_sync where lead_id=%s",
+                                        (lead,)).fetchone()
+            other.execute("select id from leads where id=%s for update nowait", (lead,))
+            seen["lead_free"] = True
+            other.rollback()
+        return real_load_mapping(conn, practice_id)
+
+    monkeypatch.setattr(keap_desired, "load_mapping", load_mapping)
+    counts = worker.run_keap_sync_tick(env.client())
+    assert seen["row"] is not None and seen["lead_free"]
+    assert counts["plan_leads_added"] == 1 and counts["plan_recomputed"] == 1
+    assert counts["synced"] == 1
+
+
 def test_a_second_worker_cannot_start(env):
     url = os.environ["TEST_DATABASE_URL"]
     with (

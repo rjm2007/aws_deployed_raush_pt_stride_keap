@@ -209,7 +209,10 @@ Every `KEAP_SYNC_POLL_SECONDS` (30):
    `reauthorization_required`.
 2. Take a session advisory lock (as `worker.py` does) so only one keap-worker ever runs.
 3. Reset rows stuck in `syncing` for over 15 minutes to `retrying` (worker died mid-sync).
-4. Phase 2A: `keap_desired.plan_changes(conn, practice_id)`; with `full=True` once an hour.
+4. Phase 2A: `keap_desired.attach_people` in its own short transaction (committed at once: an uncommitted
+   keap_sync insert holds a key-share lock on its lead, which made a voice booking wait 58 s behind the
+   hourly plan, demo 2026-10-26), then `keap_desired.plan_changes(conn, practice_id, attach=False)`; with
+   `full=True` once an hour.
 5. Ensure a valid access token (`keap_oauth.access_token`).
 6. Claim up to `KEAP_SYNC_BATCH_SIZE` (20) rows: `status in ('pending','retrying') and next_attempt_at<=now()
    order by next_attempt_at, id for update skip locked`, set `status='syncing', attempts=attempts+1`.

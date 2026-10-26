@@ -304,7 +304,7 @@ Load the lead (if any), the patient (if any), the patient's counting appointment
 Never raise for one bad person: catch, mark that row `failed` with a PHI-free reason, continue.
 
 ### 6.3 `plan_changes` (what the worker calls every tick)
-1. `attach_people`.
+1. `attach_people` (skipped with `attach=False`: the keap-worker attaches in its own committed transaction first).
 2. Pick rows to recompute (`full=False`): rows whose sources changed since `desired_at` —
    `leads.updated_at`, `stride_patients.updated_at`, any of the patient's `stride_appointments.updated_at`,
    or `desired_at is null`; plus rows with any appointment whose `start_utc` passed since `desired_at`

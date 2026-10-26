@@ -84,7 +84,7 @@
       "async": false,
       "function": {
         "name": "book_appointment",
-        "description": "Book the time the patient just chose from the open-times tool. Call it once, right after they pick a time. The reply starts with a code: BOOKED means it is done; TAKEN or NOT_AVAILABLE lists other openings; PATIENT_EXISTS, UNCONFIRMED or FOLLOW_UP mean the team will follow up. Never call it again after BOOKED, UNCONFIRMED or FOLLOW_UP.",
+        "description": "Book the time the patient just chose from the open-times tool. Call it right after they pick a time. The reply starts with a code: BOOKED or ALREADY_BOOKED means it is done; TAKEN or NOT_AVAILABLE lists other openings; IN_PROGRESS means an earlier request for this patient is still finishing: call it again with the same details, at most twice. PATIENT_EXISTS, UNCONFIRMED or FOLLOW_UP mean the booking was not made: our front desk team will take care of it. Never call it again after BOOKED, ALREADY_BOOKED, PATIENT_EXISTS, UNCONFIRMED or FOLLOW_UP.",
         "parameters": {
           "type": "object",
           "properties": {

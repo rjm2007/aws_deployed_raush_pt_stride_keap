@@ -2481,3 +2481,64 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   staff fix it the email is applied ("Email changed in Google Sheet" in Activity) and the warning goes
   ("Cadence started" stays; the edit warning empties). Outreach results may overwrite the warning text.
 - No migration. Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`.
+
+### 2026-10-26 — Booking waited 58 s behind the keap-worker
+- Seen on demo: a voice booking's last step (`slot_booking._finish_booking` → `lead_status.mark_booked`,
+  `select ... for update` on the lead) waited 58 s, past Vapi's 20 s tool timeout; the agent said "our booking
+  system isn't responding" although Stride had booked. Cause: the keap-worker's planning transaction first
+  inserts keap_sync rows for new leads (`attach_people`); the foreign key holds a key-share lock on each such
+  lead until commit, and the hourly full plan (~314 rows, DB in Seoul) runs ~3 minutes.
+- Fixes: `run_keap_sync_tick` runs `attach_people` in its own short transaction (committed at once), then plans
+  with `plan_changes(..., attach=False)`; counts (`plan_leads_added`, `plan_merged`, ...) are reported as before.
+  `plan_changes` attaches by default, so the CLI (`rpt keap-plan`, `keap-sync-once`) is unchanged.
+  `mark_booked` locks the lead `for no key update` (still serialises status writers; no key column of leads is
+  changed there). Booking prompt (local file, not pushed to Vapi): `IN_PROGRESS` → say nothing (rule 4
+  forbids "one moment"; the tool's own waiting message plays) and book again with the same details, at most twice, then the UNCONFIRMED line; never
+  "isn't responding" after an IN_PROGRESS, also when a timed-out first try is retried.
+- No migration. Tests: `test_keap_sync_worker.py` (new, no DB), `test_keap_sync_integration.py` (the lock
+  scenario on a real Postgres), `test_vapi_tool_config.py` (prompt).
+
+### 2026-10-26 — Failed bookings go to Needs Review; report/booking lock order; same patient's retry
+Owner's decisions: a booking that did not go through (or is unclear) never promises a text; Elliot says
+"Our front desk team will take care of your appointment and reach out to you shortly. Thank you, and have a
+wonderful day. Goodbye!" and the lead is always in Needs Review. A patient who confirms and hangs up stays
+Booked when the booking worked (the booking wins over the end-of-call report).
+- Prompt (local file, not pushed to Vapi): PATIENT_EXISTS, UNCONFIRMED / FOLLOW_UP and the "isn't responding"
+  line end with that front desk sentence (PATIENT_EXISTS keeps "It looks like you're already in our system."
+  in front; "isn't responding" keeps "I'm sorry, our booking system isn't responding right now."). The
+  BOOKED / ALREADY_BOOKED close is unchanged (the confirmation text really is sent).
+- `slot_booking.book_slot`: reply codes unchanged; their texts now say "Tell the caller our front desk team
+  will take care of their appointment and reach out to them shortly" (`FRONT_DESK_LINE`), also the route's
+  unexpected-error reply. Every FOLLOW_UP on a voice call (tool deadline before patient / case / appointment,
+  any other Stride refusal) now flags the lead (`_flag_not_made`): code `booking_failed` (Booking group, front
+  desk only), message "Booking did not go through on the call; book with the patient (<why>)", details
+  `on_call` + `why`; the card says the patient was told the front desk will reach out; Sheet "Needs review:
+  booking did not go through". TAKEN / NOT_AVAILABLE and validation errors are not flagged, except TAKEN on
+  an attempt that already answered IN_PROGRESS (`appointments.in_progress_reply_at`, migration 052, set by
+  every IN_PROGRESS reply, cleared when a failed attempt is reused). Staff calendar bookings (`source=staff`)
+  are not flagged. The route's unexpected-error path flags `booking_unclear`. A booking later on the same
+  call clears the review (`mark_booked`; migration 048's trigger resolves it as "booked").
+- Same patient: a hold conflict on the slot answers IN_PROGRESS when this lead holds it or has an attempt in
+  'booking'; only another patient's hold is TAKEN. Nothing is booked twice.
+- Lock order: `apply_call_outcome` locks the lead, then the outreach event (it was event, then lead: the
+  opposite of `_finish_booking` = `mark_booked` then the event, so an end-of-call report arriving as a
+  booking finished could deadlock and Postgres could abort the booking's save). The end-of-call fallback
+  for "answered, no outcome" (`delivery._settle_from_structured_output`) also locks the lead first now.
+  `report_lead_status` already did. The worker's claim locks only events (no lead update) and was left alone.
+- Migration 052 (demo-only; apply on demo before deploying this code: the IN_PROGRESS path writes the
+  column). Tests: `test_slot_booking_integration.py` (FOLLOW_UP flags + later booking settles, Stride error
+  flags, TAKEN / bad details / staff not flagged, TAKEN after IN_PROGRESS flags, same patient's hold =
+  IN_PROGRESS, real-Postgres report-vs-booking no deadlock), `test_call_outcome_lock_order.py` (new, no DB),
+  `test_lead_review.py` (card), `test_vapi_tool_config.py` (prompt and reply wording).
+- Tester follow-ups (same day): (1) IN_PROGRESS is marked on the patient's running attempt by lead (the
+  loser of two simultaneous requests for different times marked its own booking key, matching no row, so a
+  later TAKEN was not flagged). (2) A request meeting the patient's running attempt waits up to 12 s
+  (`IN_PROGRESS_WAIT_SECONDS`, polling every 1 s in separate transactions) instead of answering IN_PROGRESS at
+  once (the patient heard the waiting message three times, then the front desk line, while the first request
+  booked): booked → ALREADY_BOOKED (day, time, therapist, clinic; also for an older booking), unclear →
+  UNCONFIRMED, failed as taken → normal flow, failed otherwise → FOLLOW_UP (flagged if not already), still
+  running → IN_PROGRESS. (3) The route's unexpected-error reply starts with `UNCONFIRMED:`. (4) Sheet text
+  for `booking_patient_exists` "Needs review: patient already in Stride, book by hand"; the `booking_unclear`
+  card says the patient was told the front desk will reach out. (5) `config/vapi_booking_tools.json`
+  book_appointment description (local only, not pushed): IN_PROGRESS → call again with the same details, at
+  most twice.

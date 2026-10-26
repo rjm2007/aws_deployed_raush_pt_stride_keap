@@ -1,7 +1,8 @@
 """A second look at a booking the agent could not confirm (appointments.state='unknown').
 
 Owner, 2026-10-22: when Stride does not answer clearly during book_slot (a timeout), the patient is
-told our team will confirm by text and the lead goes to review. Instead of waiting for staff:
+told our front desk team will take care of the appointment (before 2026-10-26: "our team will confirm by
+text") and the lead goes to review. Instead of waiting for staff:
 
 1. Our imported Stride data first (stride_appointments, from the CSV files): the patient (by the saved
    Stride patient or case id, or by name + date of birth) has a visit at that start time with that
@@ -186,7 +187,7 @@ def confirm_booking(conn, appointment_id: int, stride_appointment_id: int) -> bo
     mark_booked(conn, lead_id, "stride_check")
     record_status(conn, lead_id, "booked", "booked", "stride_check",
                   f"Booking confirmed in Stride (appointment {stride_appointment_id})")
-    # The patient was told our team would confirm by text. delivery skips it for calls only / STOP.
+    # The usual confirmation text for a booking. delivery skips it for calls only / STOP.
     conn.execute(
         "insert into notification_log(lead_id,appointment_id,notification_type,channel,status,payload) "
         "values(%s,%s,'sms_appointment_booked','sms','queued',%s) on conflict do nothing",

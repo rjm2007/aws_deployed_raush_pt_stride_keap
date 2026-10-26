@@ -18,10 +18,12 @@ from starlette.concurrency import run_in_threadpool
 from ..providers import ProviderError
 from ..security import vapi_secret_scheme
 from ..services.slot_booking import (
+    FRONT_DESK_LINE,
     WHEN_VALUES,
     BookingToolError,
     book_slot,
     find_slots,
+    flag_booking_error,
     list_providers,
 )
 from ..vapi_contract import _single_line, tool_error, tool_success
@@ -169,13 +171,15 @@ async def list_providers_tool(request: Request):
 async def book_appointment_tool(request: Request):
     trace = None
     tool_call_id = None
+    lead_id = None
     try:
         trace, parsed = await authenticated_tool_request(request, "book_appointment")
         tool_call_id = parsed.tool_call_id
+        lead_id = _lead_id(parsed.arguments)
         message = await run_in_threadpool(
             book_slot,
             trace,
-            lead_id=_lead_id(parsed.arguments),
+            lead_id=lead_id,
             call_id=parsed.call_id,
             arguments=parsed.arguments,
         )
@@ -194,9 +198,17 @@ async def book_appointment_tool(request: Request):
     except Exception as exc:  # noqa: BLE001 - never end a live call on a tool failure
         if trace:
             trace.fail(exc)
+        if lead_id:
+            # The agent is told not to try again, so the patient hears the front desk line:
+            # the lead must reach Needs Review (owner, 2026-10-26).
+            try:
+                await run_in_threadpool(flag_booking_error, lead_id)
+            except Exception as flag_exc:  # noqa: BLE001 - the reply to the live call matters more
+                if trace:
+                    trace.log("booking_review_flag_failed",
+                              error_category=type(flag_exc).__name__)
         return _reply(
             tool_call_id,
-            "Something went wrong while booking. Do not try again; tell the caller our team will "
-            "call them back to finish booking.",
+            f"UNCONFIRMED: something went wrong while booking. Do not try again. {FRONT_DESK_LINE}",
             failed=True,
         )

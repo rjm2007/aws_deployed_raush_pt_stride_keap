@@ -262,6 +262,10 @@ def sheet_open_status(code: str | None, details: dict | None) -> str:
     if group == "appointment":
         return "Needs review: " + TITLES.get(code or "", "appointment changed in Stride").lower().replace(
             "stride", "Stride")
+    if code == "booking_failed":
+        return "Needs review: booking did not go through"
+    if code == "booking_patient_exists":
+        return "Needs review: patient already in Stride, book by hand"
     if group == "booking":
         return "Needs review: booking not confirmed in Stride"
     return "Needs review"
@@ -491,10 +495,18 @@ def _plain_reason(row: dict, lead: dict) -> str:
         return (f"This lead was booked, but the appointment {what} in Stride. Outreach stays stopped "
                 "until staff choose. If Stride's next file shows a new appointment, the lead is "
                 "marked Booked again by itself.")
+    if code == "booking_failed" and details.get("on_call"):
+        # Owner, 2026-10-26: every booking that fails on the call comes here, never "we'll text you".
+        why = f" ({details['why']})" if details.get("why") else ""
+        return (f"The booking agent could not book a visit on the call{why}. The patient was told our "
+                "front desk team will take care of the appointment and reach out shortly: call the "
+                "patient and book by hand. Calls and texts stay stopped. If Stride's next file shows "
+                "an appointment, the lead is marked Booked and this review closes by itself.")
     if code == "booking_failed":
         return ("The booking agent's booking did not go through: Stride still shows that time as open "
-                "(checked automatically). The patient was told our team would confirm by text, so the "
-                "front desk books by hand. Calls and texts stay stopped.")
+                "(checked automatically). The patient was told our front desk team would take care of "
+                "the appointment and reach out, so the front desk books by hand. Calls and texts stay "
+                "stopped.")
     if group_of(code) == "booking":
         what = {
             "booking_patient_exists": "Stride says this patient already exists, so the booking agent "
@@ -504,7 +516,8 @@ def _plain_reason(row: dict, lead: dict) -> str:
             "booking_not_recorded": "The appointment was made in Stride, but our records did not "
                                     "update.",
         }.get(code, "The booking agent could not confirm whether the appointment was saved in "
-                    "Stride, so it did not try again.")
+                    "Stride, so it did not try again. The patient was told our front desk team will "
+                    "take care of the appointment and reach out.")
         return (f"{what} If Stride's next file (about every 30 minutes) shows the appointment, the "
                 "lead is marked Booked and this review closes by itself. Calls and texts stay "
                 "stopped, so a booked patient is never called again.")

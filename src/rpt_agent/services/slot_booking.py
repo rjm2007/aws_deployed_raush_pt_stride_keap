@@ -833,14 +833,89 @@ def _existing_booking(conn, lead_id: str) -> dict[str, Any] | None:
     ).fetchone()
 
 
+IN_PROGRESS = "IN_PROGRESS: a booking for this patient is already being made. Wait a moment."
+# What the agent says whenever a booking did not go through or is unclear (owner, 2026-10-26: never
+# promise a text for a booking that was not made; the lead always goes to Needs Review instead).
+FRONT_DESK_LINE = ("Tell the caller our front desk team will take care of their appointment and reach "
+                   "out to them shortly.")
+
+
+# A request that finds this patient's earlier attempt still running waits for it this long (no locks
+# held) before answering IN_PROGRESS. An instant IN_PROGRESS made the agent retry at once, so the
+# patient heard "One moment, please, while I confirm your appointment" three times in a few seconds,
+# then the front desk line, while the first request went on to book (tester, 2026-10-26). Kept well
+# under the book_appointment tool's 30 s timeout; the tool deadline (24 s) still bounds the request.
+IN_PROGRESS_WAIT_SECONDS = 12.0
+IN_PROGRESS_POLL_SECONDS = 1.0
+# stride_error of an attempt that failed because the time was taken (the agent offers other times).
+SLOT_GONE_ERROR = "slot no longer open in Stride"
+SLOT_REFUSED_ERROR = "Stride refused the slot"
+
+
+def _in_progress(conn, lead_id: str) -> str:
+    """Answer IN_PROGRESS and remember it on this patient's attempt still running.
+
+    After IN_PROGRESS the agent books again at most twice and may then tell the patient the front
+    desk will take care of it; if that attempt ends failed, also as "taken", the lead must reach
+    Needs Review (owner, 2026-10-26). Marked by lead, not by this request's own booking key: two
+    requests for different times meet on the one-active-booking-per-lead index, and the key of the
+    request that lost matched no row (tester, 2026-10-26).
+    """
+    conn.execute(
+        "update appointments set in_progress_reply_at=now() where lead_id=%s and state='booking'",
+        (lead_id,),
+    )
+    return IN_PROGRESS
+
+
+def _attempt_after_wait(lead_id: str) -> dict[str, Any] | None:
+    """This patient's newest attempt, once it has left 'booking' or the wait is over.
+
+    Polls in short separate transactions, so the running attempt is never blocked by us.
+    """
+    until = time.monotonic() + IN_PROGRESS_WAIT_SECONDS
+    while True:
+        with transaction() as conn:
+            row = conn.execute(
+                "select id,state,stride_error from appointments where lead_id=%s "
+                "order by updated_at desc,id desc limit 1",
+                (lead_id,),
+            ).fetchone()
+        if not row or row["state"] != "booking" or time.monotonic() + IN_PROGRESS_POLL_SECONDS > until:
+            return row
+        time.sleep(IN_PROGRESS_POLL_SECONDS)
+
+
+def _already_booked(conn, appointment_id: int) -> str:
+    """ALREADY_BOOKED with what the agent's closing needs: day, time, therapist, clinic."""
+    row = conn.execute(
+        "select a.start_utc,bl.name as location_name,bl.timezone,c.display_name "
+        "from appointments a left join booking_locations bl on bl.id=a.booking_location_id "
+        "left join clinicians c on c.practice_id=a.practice_id and c.stride_user_id=a.clinician_id "
+        "where a.id=%s limit 1",
+        (appointment_id,),
+    ).fetchone()
+    text = "an appointment"
+    if row and row["start_utc"] is not None and row["timezone"]:
+        local = row["start_utc"].astimezone(ZoneInfo(row["timezone"]))
+        text = f"{_spoken_date(local.date())} at {_spoken_time(local.time())}"
+        if row["display_name"]:
+            text += f" with {row['display_name']}"
+        if row["location_name"]:
+            text += f" at our {row['location_name']} clinic"
+    return (f"ALREADY_BOOKED: this patient already has {text}. Do not book again; confirm it to the "
+            "caller with the short closing from your instructions.")
+
+
 def _close_attempt(appointment_id: int, hold_id: int, *, state: str, error: str,
-                   slot_id: int | None = None, slot_gone: bool = False) -> None:
+                   slot_id: int | None = None, slot_gone: bool = False) -> bool:
+    """End a booking attempt; returns whether the agent was told IN_PROGRESS about it."""
     with transaction() as conn:
-        conn.execute(
+        closed = conn.execute(
             "update appointments set state=%s,stride_error=%s,needs_staff_review=%s,"
-            "updated_at=now() where id=%s",
+            "updated_at=now() where id=%s returning in_progress_reply_at is not null as told",
             (state, error[:500], state == "unknown", appointment_id),
-        )
+        ).fetchone()
         conn.execute(
             "update slot_holds set status='released',released_at=now() "
             "where id=%s and status='active'",
@@ -852,6 +927,7 @@ def _close_attempt(appointment_id: int, hold_id: int, *, state: str, error: str,
                 "where id=%s and status='open'",
                 (slot_id,),
             )
+    return bool(closed and closed["told"])
 
 
 # Who booked: the voice agent on a call, or staff from the dashboard calendar. It is stored on the
@@ -894,6 +970,45 @@ def _flag(lead_id: str, reason: str) -> None:
                              source="booking")
 
 
+def flag_booking_error(lead_id: str) -> None:
+    """The book-appointment route failed outright: unclear whether anything reached Stride."""
+    _flag(lead_id, "Unexpected error during voice booking; confirm in Stride")
+
+
+NOT_MADE_REASON = "Booking did not go through on the call; book with the patient"
+
+
+def _flag_not_made(lead_id: str, why: str) -> None:
+    # The booking surely was not made (Stride refused, or we stopped before the appointment
+    # step), but the patient heard "our front desk team will take care of your appointment"
+    # (owner, 2026-10-26): Needs Review, "Booking" group (front desk only). A booking later on this
+    # call, or in Stride's next file, settles it (mark_booked clears the review).
+    with transaction() as conn:
+        flag_lead_for_review(conn, lead_id, f"{NOT_MADE_REASON} ({why})", code="booking_failed",
+                             source="booking", details={"on_call": True, "why": why})
+
+
+def _after_running_attempt(lead_id: str, *, voice: bool, again) -> str:
+    """Wait for this patient's running attempt, then answer as if it had just finished.
+
+    Booked, unclear or still running: `again()` (this request once more, without waiting) gives
+    ALREADY_BOOKED, UNCONFIRMED or IN_PROGRESS through the usual checks. Failed because the time was
+    taken: also `again()`, the normal flow (that time is no longer offered, so other openings; or
+    this request's own, different time is booked). Failed otherwise (Stride error, out of time):
+    that attempt already sent the lead to review; the patient hears the front desk line.
+    """
+    row = _attempt_after_wait(lead_id)
+    error = (row or {}).get("stride_error") or ""
+    if not row or row["state"] != "failed" or error.startswith((SLOT_GONE_ERROR, SLOT_REFUSED_ERROR)):
+        return again()
+    if voice:
+        with transaction() as conn:
+            lead = conn.execute("select needs_review from leads where id=%s", (lead_id,)).fetchone()
+        if not (lead and lead["needs_review"]):
+            _flag_not_made(lead_id, "booking did not go through while the caller waited")
+    return f"FOLLOW_UP: I could not finish the booking just now. {FRONT_DESK_LINE}"
+
+
 def book_slot(
     trace: WorkflowTrace,
     *,
@@ -903,11 +1018,21 @@ def book_slot(
     settings: Settings | None = None,
     providers: ProviderClients | None = None,
     source: str = "voice_agent",
+    _deadline: _Deadline | None = None,
 ) -> str:
     stored_source, history_source, label = BOOKING_SOURCES[source]
     settings = settings or get_settings()
     providers = providers or _fast_providers(settings)
-    deadline = _Deadline(settings)
+    # Set only when book_slot runs again after waiting for a running attempt: then it never waits
+    # twice, and the tool deadline still counts from the start of the request.
+    may_wait = _deadline is None
+    deadline = _deadline or _Deadline(settings)
+    voice = source == "voice_agent"
+
+    def again() -> str:
+        return book_slot(trace, lead_id=lead_id, call_id=call_id, arguments=arguments,
+                         settings=settings, providers=providers, source=source, _deadline=deadline)
+
     call_key = call_id or f"direct:{lead_id}"
     raw_date = str(arguments.get("date") or "").strip()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date):
@@ -920,6 +1045,7 @@ def book_slot(
         raise ValueError("BAD_SLOT: the slot id must be a number.")
     slot_id = int(raw_slot) if raw_slot not in (None, "") else None
 
+    running = False
     with transaction() as conn:
         context = load_context(conn, lead_id, location_name=arguments.get("location"),
                                case_type_name=arguments.get("case_type"), settings=settings)
@@ -927,25 +1053,25 @@ def book_slot(
         if not context.booking_enabled:
             raise BookingToolError("Booking is switched off for this practice.")
         existing = _existing_booking(conn, lead_id)
-        if existing:
+        if existing and existing["state"] == "booking" and may_wait:
+            running = True
+        elif existing:
             if existing["state"] == "scheduled":
-                when = existing["start_utc"]
-                text = "an appointment"
-                if when is not None and existing["timezone"]:
-                    local = when.astimezone(ZoneInfo(existing["timezone"]))
-                    text = f"{_spoken_date(local.date())} at {_spoken_time(local.time())}"
-                return f"ALREADY_BOOKED: this patient already has {text}. Do not book again."
+                return _already_booked(conn, existing["id"])
             if existing["state"] == "booking":
-                return "IN_PROGRESS: a booking for this patient is already being made. Wait a moment."
+                return _in_progress(conn, lead_id)
             return (
                 "UNCONFIRMED: an earlier booking for this patient needs staff to confirm it. "
-                "Tell the caller our team will confirm their appointment by text."
+                f"{FRONT_DESK_LINE}"
             )
-        elsewhere = _booked_elsewhere(conn, lead_id)
-        if elsewhere:
-            return f"ALREADY_BOOKED: this patient already has {elsewhere}. Do not book again."
-        slot = _find_slot_for_booking(conn, context, call_key, wanted_date, wanted_time,
-                                      clinician_name, slot_id=slot_id)
+        else:
+            elsewhere = _booked_elsewhere(conn, lead_id)
+            if elsewhere:
+                return f"ALREADY_BOOKED: this patient already has {elsewhere}. Do not book again."
+            slot = _find_slot_for_booking(conn, context, call_key, wanted_date, wanted_time,
+                                          clinician_name, slot_id=slot_id)
+    if running:
+        return _after_running_attempt(lead_id, voice=voice, again=again)
     if slot is None:
         return (
             f"NOT_AVAILABLE: {_spoken_time(wanted_time)} on {_spoken_date(wanted_date)} is not "
@@ -964,10 +1090,25 @@ def book_slot(
             "values(%s,%s,%s,now()+%s) on conflict do nothing returning id",
             (slot["id"], lead_id, call_id, timedelta(seconds=settings.booking_hold_seconds)),
         ).fetchone()
+        taken = False
         if not hold:
-            taken = True
+            # The same patient's second request (the agent retried while the first was still
+            # booking) must not hear "someone is booking that time": only another patient's
+            # hold is TAKEN. Nothing is booked here either way.
+            mine = conn.execute(
+                "select (select id from appointments where lead_id=%s and state='booking' "
+                "order by id desc limit 1) as appointment_id,"
+                "exists(select 1 from slot_holds where slot_id=%s and lead_id=%s "
+                "and status='active') as holds",
+                (lead_id, slot["id"], lead_id),
+            ).fetchone()
+            if mine["appointment_id"] and may_wait:
+                running = True
+            elif mine["appointment_id"] or mine["holds"]:
+                return _in_progress(conn, lead_id)
+            else:
+                taken = True
         else:
-            taken = False
             start_utc = slot["start_utc"]
             booking_key = f"{lead_id}:{start_utc.isoformat()}"
             reuse = conn.execute(
@@ -982,8 +1123,8 @@ def book_slot(
             if reuse:
                 conn.execute(
                     "update appointments set state='booking',stride_error=null,"
-                    "needs_staff_review=false,slot_id=%s,slot_hold_id=%s,case_type_id=%s,"
-                    "booking_location_id=%s,call_id=%s,clinician_id=%s,location_id=%s,"
+                    "needs_staff_review=false,in_progress_reply_at=null,slot_id=%s,slot_hold_id=%s,"
+                    "case_type_id=%s,booking_location_id=%s,call_id=%s,clinician_id=%s,location_id=%s,"
                     "appointment_type_id=%s,updated_at=now() where id=%s",
                     (*values, reuse["id"]),
                 )
@@ -999,15 +1140,22 @@ def book_slot(
                      slot["start_utc"], slot["end_utc"]),
                 ).fetchone()
                 if not created:
+                    # This patient already has an attempt running (one active booking per lead).
                     conn.execute(
                         "update slot_holds set status='released',released_at=now() where id=%s",
                         (hold["id"],),
                     )
-                    return "IN_PROGRESS: a booking for this patient is already being made. Wait a moment."
-                appointment_id = created["id"]
-            # The date the patient confirmed on the call; compared with the Sheet's for staff.
-            conn.execute("update appointments set patient_dob=%s where id=%s",
-                         (patient.date_of_birth, appointment_id))
+                    if not may_wait:
+                        return _in_progress(conn, lead_id)
+                    running = True
+                else:
+                    appointment_id = created["id"]
+            if not running:
+                # The date the patient confirmed on the call; compared with the Sheet's for staff.
+                conn.execute("update appointments set patient_dob=%s where id=%s",
+                             (patient.date_of_birth, appointment_id))
+    if running:
+        return _after_running_attempt(lead_id, voice=voice, again=again)
     if taken:
         return (
             f"TAKEN: someone is booking {_spoken_time(wanted_time)} on {_spoken_date(wanted_date)} "
@@ -1016,14 +1164,25 @@ def book_slot(
     hold_id = hold["id"]
     trace.log("slot_held", appointment_id=appointment_id, slot_id=slot["id"])
 
-    def give_up(state: str, error: str, *, gone: bool = False) -> None:
-        _close_attempt(appointment_id, hold_id, state=state, error=error,
-                       slot_id=slot["id"], slot_gone=gone)
+    def give_up(state: str, error: str, *, gone: bool = False) -> bool:
+        return _close_attempt(appointment_id, hold_id, state=state, error=error,
+                              slot_id=slot["id"], slot_gone=gone)
 
-    team_follow_up = (
-        "FOLLOW_UP: I could not finish the booking just now. Tell the caller our team will "
-        "call them back to book."
-    )
+    # Only the voice agent promises the front desk (`voice`); a staff booking from the calendar
+    # shows its error to the staff member who is booking.
+    def time_taken(error: str) -> str:
+        # Elliot offers other times, so no review: unless this attempt already answered
+        # IN_PROGRESS, after which the patient may have heard "the front desk will take care".
+        if give_up("failed", error, gone=True) and voice:
+            _flag_not_made(lead_id, "time taken while the caller waited")
+        return f"TAKEN: that time was just taken. {_alternatives(trace, context, call_key, wanted_date)}"
+
+    def follow_up(error: str, why: str) -> str:
+        give_up("failed", error)
+        if voice:
+            _flag_not_made(lead_id, why)
+        return f"FOLLOW_UP: I could not finish the booking just now. {FRONT_DESK_LINE}"
+
     stage = "availability"
     try:
         # 2. Live re-check of this one slot.
@@ -1038,19 +1197,15 @@ def book_slot(
         wanted_clock = slot["local_time"].strftime("%H:%M:%S")
         if not any(item.local_date == slot["local_date"].isoformat()
                    and item.local_time == wanted_clock for item in live):
-            give_up("failed", "slot no longer open in Stride", gone=True)
-            return (
-                "TAKEN: that time was just taken. "
-                f"{_alternatives(trace, context, call_key, wanted_date)}"
-            )
+            return time_taken(SLOT_GONE_ERROR)
 
         # 3a. Patient (reused when an earlier attempt already created it).
         lead = context.lead
         patient_id = lead["stride_patient_id"]
         if not patient_id:
             if not deadline.allows_another_call():
-                give_up("failed", "tool deadline reached before patient creation")
-                return team_follow_up
+                return follow_up("tool deadline reached before patient creation",
+                                 "ran out of time before the patient step")
             stage = "patient"
             patient_id = providers.stride_create(trace, "patients", {
                 "first_name": patient.first_name,
@@ -1104,8 +1259,8 @@ def book_slot(
 
         if not case_id:
             if not deadline.allows_another_call():
-                give_up("failed", "tool deadline reached before case creation")
-                return team_follow_up
+                return follow_up("tool deadline reached before case creation",
+                                 "ran out of time before the case step")
             stage = "case"
             case_id = create_case()
         else:
@@ -1126,8 +1281,8 @@ def book_slot(
             "place_of_service": "O",
         }
         if not deadline.allows_another_call():
-            give_up("failed", "tool deadline reached before appointment creation")
-            return team_follow_up
+            return follow_up("tool deadline reached before appointment creation",
+                             "ran out of time before the appointment step")
         stage = "appointment"
         try:
             stride_appointment_id = providers.stride_create(trace, "appointments",
@@ -1138,8 +1293,8 @@ def book_slot(
                 stage = "case"
                 case_id = create_case()
                 if not deadline.allows_another_call():
-                    give_up("failed", "tool deadline reached after replacing the case")
-                    return team_follow_up
+                    return follow_up("tool deadline reached after replacing the case",
+                                     "ran out of time before the appointment step")
                 stage = "appointment"
                 stride_appointment_id = providers.stride_create(
                     trace, "appointments", {**appointment_payload, "case_id": case_id}
@@ -1153,31 +1308,23 @@ def book_slot(
             _flag(lead_id, f"Stride {stage} result unclear during {label}; confirm in Stride")
             trace.log("booking_unknown", stage=stage)
             return (
-                "UNCONFIRMED: the booking system did not answer clearly. Do not try again. Tell "
-                "the caller our team will confirm their appointment by text."
+                "UNCONFIRMED: the booking system did not answer clearly. Do not try again. "
+                f"{FRONT_DESK_LINE}"
             )
         if stage == "patient" and "already exists" in detail:
             give_up("failed", "Stride: patient already exists")
             _flag(lead_id, "Stride says this patient already exists; staff must book manually")
-            return (
-                "PATIENT_EXISTS: this patient is already in our system. Tell the caller our team "
-                "will call them back shortly to finish booking."
-            )
+            return f"PATIENT_EXISTS: this patient is already in our system. {FRONT_DESK_LINE}"
         if stage == "appointment" and ("overlap" in detail or "already exists" in detail):
-            give_up("failed", f"Stride refused the slot: {exc}", gone=True)
-            return (
-                "TAKEN: that time was just taken. "
-                f"{_alternatives(trace, context, call_key, wanted_date)}"
-            )
-        give_up("failed", f"{stage}: {exc}")
+            return time_taken(f"{SLOT_REFUSED_ERROR}: {exc}")
         trace.log("booking_failed", stage=stage, error_code=exc.code)
-        return team_follow_up
+        return follow_up(f"{stage}: {exc}", f"Stride error at the {stage} step")
     except Exception as exc:  # noqa: BLE001 - Stride may have saved something
         give_up("unknown", f"{stage}: unexpected {type(exc).__name__}")
         _flag(lead_id, f"Unexpected error during {label}; confirm in Stride")
         return (
-            "UNCONFIRMED: something went wrong while booking. Do not try again. Tell the caller "
-            "our team will confirm their appointment by text."
+            "UNCONFIRMED: something went wrong while booking. Do not try again. "
+            f"{FRONT_DESK_LINE}"
         )
 
     # 4. Record the booking. Stride is the source of truth from here on.

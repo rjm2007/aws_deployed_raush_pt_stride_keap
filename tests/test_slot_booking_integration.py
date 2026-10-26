@@ -7,6 +7,8 @@ Each test builds its own practice, clinic, case type, clinicians and 555 lead.
 """
 
 import os
+import threading
+import time
 from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 
@@ -87,6 +89,10 @@ def env(monkeypatch):
         monkeypatch.setenv(key, value)
     # A sync makes one Stride request per 31-day chunk; skip the rate-limit pause between them.
     monkeypatch.setattr(availability_sync, "STRIDE_REQUEST_GAP_SECONDS", 0)
+    # A request meeting this patient's running attempt waits for it; short here (tests that
+    # need the real wait set it themselves).
+    monkeypatch.setattr(slot_booking, "IN_PROGRESS_WAIT_SECONDS", 0.3)
+    monkeypatch.setattr(slot_booking, "IN_PROGRESS_POLL_SECONDS", 0.05)
     get_settings.cache_clear()
     get_pool.cache_clear()
     conn = psycopg.connect(url, row_factory=dict_row, autocommit=True)
@@ -1122,3 +1128,267 @@ def test_without_a_pinned_day_only_the_limits_note_moves(env):
     assert earliest.startswith(named) and "Last bookable day: " in earliest
     far = find("c", when="specific_date", specific_date=today + timedelta(days=95))
     assert "too far ahead" in far and "Last bookable day: " in far
+
+
+# ------------------------------------------- failed bookings reach Needs Review (owner, 2026-10-26)
+
+def review_of(env, lead):
+    return env.one("select l.needs_review,l.status,r.code,r.message,r.details,r.source,r.resolution,"
+                   "r.resolved_at from leads l left join lead_reviews r on r.lead_id=l.id "
+                   "where l.id=%s order by r.id desc limit 1", lead)
+
+
+def test_follow_up_flags_the_lead_and_a_later_booking_settles_it(env):
+    # FOLLOW_UP used to end the call with "our team will call you back" and nothing in Needs
+    # Review. Now the patient hears the front desk line and the front desk sees the lead.
+    lead = booked_setup(env)
+    tight = env.settings(booking_tool_deadline_seconds=5.0, booking_stride_timeout_seconds=6.0)
+    message = env.book(lead, settings=tight, date=DAY1, time="9:00 AM")
+    assert message.startswith("FOLLOW_UP") and "front desk team will take care" in message
+    assert "text" not in message
+    review = review_of(env, lead)
+    assert review["needs_review"] and review["status"] == "needs_attention"
+    assert review["code"] == "booking_failed" and review["source"] == "booking"
+    assert review["details"]["on_call"] is True and review["resolved_at"] is None
+    assert "Booking did not go through on the call" in review["message"]
+    # The patient then picks another time on the same call: booked, review settled.
+    assert env.book(lead, date=DAY1, time="10:00 AM").startswith("BOOKED")
+    review = review_of(env, lead)
+    assert not review["needs_review"] and review["status"] == "booked"
+    assert review["resolved_at"] is not None and review["resolution"] == "booked"
+
+
+def test_stride_error_flags_the_lead(env):
+    lead = booked_setup(env)
+    env.stride.script["cases"] = [stride_error("500", "stride returned HTTP 500")]
+    message = env.book(lead, date=DAY1, time="9:00 AM")
+    assert message.startswith("FOLLOW_UP")
+    review = review_of(env, lead)
+    assert review["needs_review"] and review["code"] == "booking_failed"
+    assert review["details"]["why"] == "Stride error at the case step"
+
+
+def test_taken_and_bad_details_do_not_flag(env):
+    lead = booked_setup(env)
+    open_days(env, c5981={DAY1: ["10:00:00"], DAY2: ["08:00:00"]})  # 9 AM gone in Stride
+    assert env.book(lead, date=DAY1, time="9:00 AM").startswith("TAKEN")
+    with pytest.raises(ValueError, match="BAD_DATE_OF_BIRTH"):
+        env.book(lead, date=DAY1, time="10:00 AM", date_of_birth="26/04/1990")
+    review = review_of(env, lead)
+    assert not review["needs_review"] and review["code"] is None
+
+
+def test_staff_calendar_follow_up_does_not_flag(env):
+    lead = booked_setup(env)
+    tight = env.settings(booking_tool_deadline_seconds=5.0, booking_stride_timeout_seconds=6.0)
+    message = slot_booking.book_slot(env.trace, lead_id=lead, call_id=None,
+                                     arguments={**PATIENT, "date": DAY1, "time": "9:00 AM"},
+                                     providers=env.stride, settings=tight, source="staff")
+    assert message.startswith("FOLLOW_UP")
+    assert not review_of(env, lead)["needs_review"]
+
+
+def test_taken_after_an_in_progress_reply_flags_the_lead(env):
+    # Vapi gave up on the first request; the agent's retry heard IN_PROGRESS (and after two of
+    # those the patient hears the front desk line). If the first request then finds the time
+    # taken, nobody hears the other times: the lead must go to Needs Review.
+    lead = booked_setup(env)
+    real = env.stride.stride_availability
+    replies = []
+
+    def availability(trace, **kwargs):
+        replies.append(env.book(lead, call_id="call-1", date=DAY1, time="9:00 AM"))
+        env.stride.open = {5981: {DAY1: ["10:00:00"]}}  # 9 AM went meanwhile
+        return real(trace, **kwargs)
+
+    env.stride.stride_availability = availability
+    first = env.book(lead, date=DAY1, time="9:00 AM")
+    assert replies and replies[0].startswith("IN_PROGRESS")
+    assert first.startswith("TAKEN")
+    review = review_of(env, lead)
+    assert review["needs_review"] and review["code"] == "booking_failed"
+    assert review["details"]["why"] == "time taken while the caller waited"
+
+
+def test_same_patients_second_request_hears_in_progress_not_taken(env):
+    # Both requests passed the "booking already running?" check; the second then meets the
+    # first one's hold on the slot. Same patient: IN_PROGRESS. Nothing is booked twice.
+    lead = booked_setup(env)
+    slot = env.one("select id from availability_slots where booking_location_id=%s and "
+                   "local_date=%s and local_time='09:00'", env.location_id, DAY1)
+    env.db.execute("insert into slot_holds(slot_id,lead_id,call_id,expires_at) "
+                   "values(%s,%s,'call-1',now()+interval '5 minutes')", (slot["id"], lead))
+    message = env.book(lead, date=DAY1, time="9:00 AM")
+    assert message == slot_booking.IN_PROGRESS
+    assert env.stride.count("patients") == 0 and env.stride.count("appointments") == 0
+    assert env.one("select count(*) n from appointments where lead_id=%s", lead)["n"] == 0
+    # Another patient's hold is still TAKEN, and is no reason for review.
+    other = env.lead()
+    env.find(other, call_id="call-2")
+    taken = env.book(other, call_id="call-2", date=DAY1, time="9:00 AM")
+    assert taken.startswith(("TAKEN", "NOT_AVAILABLE"))
+    assert not review_of(env, other)["needs_review"]
+
+
+def test_end_of_call_report_waits_for_the_booking_instead_of_deadlocking(env):
+    # The booking's last step (_finish_booking) locks the lead (mark_booked), then this call's
+    # outreach event. apply_call_outcome locked the event, then the lead: the opposite order, so a
+    # report arriving just then could deadlock and Postgres could abort the booking's save (the
+    # visit in Stride, not in our records). It now locks the lead first and simply waits.
+    import threading
+
+    from rpt_agent.services.lead_status import apply_call_outcome, mark_booked
+
+    lead = env.lead()
+    event = env.db.execute(
+        "insert into outreach_events(lead_id,channel,scheduled_for,status) "
+        "values(%s,'call',now(),'in_flight') returning id", (lead,),
+    ).fetchone()["id"]
+    url = os.environ["TEST_DATABASE_URL"]
+    result = {}
+    with psycopg.connect(url, row_factory=dict_row) as booking:
+        booking.execute("set deadlock_timeout='200ms'")
+        mark_booked(booking, lead, "voice_booking")  # holds the lead, as _finish_booking does
+
+        def report():
+            try:
+                result["reply"] = apply_call_outcome(env.trace, lead_id=lead, event_id=event,
+                                                     outcome="no_answer", source="webhook")
+            except Exception as exc:  # noqa: BLE001 - inspected below
+                result["error"] = exc
+
+        worker = threading.Thread(target=report)
+        worker.start()
+        for _ in range(50):  # until the report is waiting on a lock
+            waiting = env.one("select count(*) n from pg_stat_activity where wait_event_type='Lock' "
+                              "and query like '%%for update%%'")["n"]
+            if waiting:
+                break
+            threading.Event().wait(0.05)
+        booking.execute(
+            "update outreach_events set status='delivered',settled_at=now(),settled_by='tool',"
+            "outcome='booked' where id=%s and lead_id=%s and channel='call' "
+            "and status not in ('delivered','failed','skipped')", (event, lead),
+        )
+        booking.commit()
+        worker.join(10)
+    assert not worker.is_alive()
+    # The booking won: the report finds the call already settled as booked.
+    assert isinstance(result.get("error"), ValueError), result
+    assert "already settled" in str(result["error"])
+    assert env.one("select status from leads where id=%s", lead)["status"] == "booked"
+    assert env.one("select outcome from outreach_events where id=%s", event)["outcome"] == "booked"
+
+
+def test_in_progress_for_another_time_marks_the_patients_running_attempt(env, monkeypatch):
+    # Tester 2026-10-26: two requests at once for DIFFERENT times. The loser met the
+    # one-active-booking-per-lead index and marked IN_PROGRESS on its own booking key (no such
+    # row), so when the winner then found its time taken the lead was not flagged.
+    open_days(env, c5981={DAY1: ["09:00:00", "10:00:00"]})
+    env.sync()
+    lead = env.lead()
+    env.find(lead)
+    real = env.stride.stride_availability
+    real_existing = slot_booking._existing_booking
+    replies = []
+
+    def availability(trace, **kwargs):
+        if not replies:
+            # The second request got past the "already booking?" check before the first saved.
+            monkeypatch.setattr(slot_booking, "_existing_booking", lambda conn, lead_id: None)
+            replies.append(env.book(lead, date=DAY1, time="10:00 AM"))
+            monkeypatch.setattr(slot_booking, "_existing_booking", real_existing)
+            env.stride.open = {5981: {DAY1: ["10:00:00"]}}  # 9 AM went meanwhile
+        return real(trace, **kwargs)
+
+    env.stride.stride_availability = availability
+    first = env.book(lead, date=DAY1, time="9:00 AM")
+    assert replies == [slot_booking.IN_PROGRESS] and first.startswith("TAKEN")
+    assert env.one("select count(*) n from appointments where lead_id=%s", lead)["n"] == 1
+    review = review_of(env, lead)
+    assert review["needs_review"] and review["details"]["why"] == "time taken while the caller waited"
+
+
+class Gate:
+    """Holds the first request at Stride's appointment step until released."""
+
+    def __init__(self, env):
+        self.entered, self.release = threading.Event(), threading.Event()
+        real = env.stride.stride_create
+
+        def create(trace, resource, payload):
+            if resource == "appointments" and not self.entered.is_set():
+                self.entered.set()
+                assert self.release.wait(15)
+            return real(trace, resource, payload)
+
+        env.stride.stride_create = create
+
+
+def race_in_progress(env, monkeypatch, *, release_after=None, second_time="9:00 AM"):
+    """First request books 9 AM and stops at Stride; the second arrives while it runs."""
+    monkeypatch.setattr(slot_booking, "IN_PROGRESS_WAIT_SECONDS", 3.0)
+    open_days(env, c5981={DAY1: ["09:00:00", "10:00:00"]})
+    env.sync()
+    lead = env.lead()
+    env.find(lead)
+    gate = Gate(env)
+    first = {}
+    worker = threading.Thread(target=lambda: first.update(
+        reply=env.book(lead, date=DAY1, time="9:00 AM")))
+    worker.start()
+    assert gate.entered.wait(10)
+    if release_after is not None:
+        threading.Timer(release_after, gate.release.set).start()
+    started = time.monotonic()
+    second = env.book(lead, date=DAY1, time=second_time)
+    waited = time.monotonic() - started
+    gate.release.set()
+    worker.join(15)
+    return lead, first["reply"], second, waited
+
+
+def test_retry_waits_and_hears_already_booked_when_the_first_request_books(env, monkeypatch):
+    # Tester 2026-10-26: an instant IN_PROGRESS made the agent retry at once ("One moment,
+    # please..." three times), then say the front desk line while the first request booked.
+    lead, first, second, waited = race_in_progress(env, monkeypatch, release_after=0.4)
+    assert first.startswith("BOOKED")
+    assert second.startswith("ALREADY_BOOKED: this patient already has Tuesday, June 16 at 9:00 AM "
+                             "with Thao Nguyen at our Laguna Niguel clinic.")
+    assert 0.3 < waited < 3.0
+    assert env.stride.count("appointments") == 1
+    assert not review_of(env, lead)["needs_review"]
+
+
+def test_retry_waits_and_hears_the_front_desk_when_the_first_request_fails(env, monkeypatch):
+    env.stride.script["appointments"] = [stride_error("500", "stride returned HTTP 500")]
+    lead, first, second, _ = race_in_progress(env, monkeypatch, release_after=0.4)
+    assert first.startswith("FOLLOW_UP") and second.startswith("FOLLOW_UP")
+    assert "front desk team will take care" in second
+    assert review_of(env, lead)["needs_review"]
+    assert env.one("select count(*) n from lead_reviews where lead_id=%s and resolved_at is null",
+                   lead)["n"] == 1
+    assert env.stride.count("appointments") == 1
+
+
+def test_retry_after_the_time_was_taken_offers_other_times(env, monkeypatch):
+    env.stride.script["appointments"] = [stride_error("400", "overlapping appointment")]
+    lead, first, second, _ = race_in_progress(env, monkeypatch, release_after=0.4)
+    assert first.startswith("TAKEN")
+    assert second.startswith("NOT_AVAILABLE") and "10:00 AM" in second
+    assert not review_of(env, lead)["needs_review"]
+
+
+def test_retry_for_another_time_books_it_once_the_first_was_taken(env, monkeypatch):
+    env.stride.script["appointments"] = [stride_error("400", "overlapping appointment")]
+    _lead, first, second, _ = race_in_progress(env, monkeypatch, release_after=0.4,
+                                              second_time="10:00 AM")
+    assert first.startswith("TAKEN") and second.startswith("BOOKED") and "10:00 AM" in second
+
+
+def test_retry_still_running_after_the_wait_hears_in_progress(env, monkeypatch):
+    lead, first, second, waited = race_in_progress(env, monkeypatch, release_after=None)
+    assert second == slot_booking.IN_PROGRESS and waited >= 2.5
+    assert first.startswith("BOOKED")
+    assert env.one("select in_progress_reply_at from appointments where lead_id=%s",
+                   lead)["in_progress_reply_at"] is not None

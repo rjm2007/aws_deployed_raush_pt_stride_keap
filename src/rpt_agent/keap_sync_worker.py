@@ -144,14 +144,22 @@ def run_keap_sync_tick(client: KeapClient | None = None) -> dict[str, Any]:
         _state["last_full"] is None
         or time.monotonic() - _state["last_full"] >= FULL_PLAN_EVERY_SECONDS
     )
+    # New keap_sync rows are committed on their own, before planning. Inserting a row that points at
+    # a lead takes a key-share lock on that lead (foreign key) until commit; inside the hourly full
+    # plan (~3 min with the DB in Seoul) that held a voice booking's lock on the lead for 58 s, past
+    # Vapi's 20 s tool timeout, and the agent said the system wasn't responding although Stride had
+    # booked (demo 2026-10-26).
+    with transaction() as conn:
+        attached = keap_desired.attach_people(conn, practice_id)
     with transaction() as conn:
         conn.execute(
             "update keap_sync set status='retrying' where practice_id=%s and status='syncing' "
             f"and updated_at<now()-interval '{STUCK_AFTER}'",
             (practice_id,),
         )
-        counts.update({f"plan_{k}": v for k, v in
-                       keap_desired.plan_changes(conn, practice_id, full=full).items()})
+        plan = keap_desired.plan_changes(conn, practice_id, full=full, attach=False)
+        plan.update(attached)
+        counts.update({f"plan_{k}": v for k, v in plan.items()})
     if full:
         _state["last_full"] = time.monotonic()
 
