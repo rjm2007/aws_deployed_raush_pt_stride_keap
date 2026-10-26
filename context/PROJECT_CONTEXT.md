@@ -2530,3 +2530,21 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
 - Dashboard: Booked cards are not draggable and show a hint; a 409 still shows its detail.
 - No migration. Tests: `test_demo_review_integration.py` (board moves refused for every column, DNC allowed,
   Stride cancel still reviews), `test_dashboard.py`, `test_sheet_direct*.py`.
+
+### 2026-10-26 — One phone = one active lead on every path; "restarted" wording (owner-approved)
+- Demo: three rows on one phone, staff moved the OLDEST to New on the board; the newer lead was closed
+  "replaced by a newer referral on this number" (wrong), and a board move to In cadence did not take the
+  number at all (two leads on one phone could both be called).
+- `review.hand_over_number(..., reason=)`: `REPLACED_REASON` ("replaced by a newer referral on this number")
+  for a new lead (Sheet Start, dashboard Add lead: unchanged); `RESTARTED_REASON` ("replaced: another lead with
+  this phone was restarted") when an existing lead starts again: Sheet Restart, board New, board In cadence
+  (now hands over), review-card restart choices, review resume choices, unblock (continue / restart), lead
+  page Resume. It also closes the stopped lead's open review as `replaced` (migration 048's trigger only
+  knows the old words). Booked is final, Do Not Contact and a blocked number are unchanged.
+- Sheet Outcome Status: "Closed: another row with this phone number was restarted" (new row case still
+  "Closed: a newer row has this phone number"); board / lead page next step the same; the lead page banner
+  (rpt_frontend) and the closed-review message say it too. A Sheet Restart on such a lead is refused:
+  "Error: this lead is closed (another row with this phone number was restarted). Use the dashboard."
+- Phone-change close reason has no digits now: "Phone number changed in the Sheet on Oct 26, 2026. Add the
+  new number as a new row." (the masked numbers stay in the review's details; Sheet text unchanged).
+- No migration. Tests: `test_one_lead_per_phone_integration.py`.

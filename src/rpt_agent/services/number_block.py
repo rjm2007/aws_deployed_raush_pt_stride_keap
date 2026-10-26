@@ -23,7 +23,7 @@ from uuid import uuid4
 from ..worker import materialize_cadence
 from .lead_review import close_open_reviews, closed_for_good
 from .lead_status import record_status
-from .review import REPLACED_REASON, hand_over_number, skip_remaining_planned
+from .review import REPLACED_REASONS, RESTARTED_REASON, hand_over_number, skip_remaining_planned
 from .sheet_sync import enqueue_sheet_update
 
 AfterUnblock = Literal["continue", "restart"]
@@ -87,8 +87,8 @@ def _remaining_steps(conn, lead_id: str, blocked_at: datetime) -> list[dict]:
     return conn.execute(
         "select id,scheduled_for from outreach_events where lead_id=%s and ("
         "status='planned' or (status='skipped' and updated_at>=%s "
-        "and coalesce(failure_reason,'')<>%s)) order by scheduled_for,id",
-        (lead_id, blocked_at, REPLACED_REASON),
+        "and coalesce(failure_reason,'')<>all(%s))) order by scheduled_for,id",
+        (lead_id, blocked_at, list(REPLACED_REASONS)),
     ).fetchall()
 
 
@@ -168,7 +168,10 @@ def unblock_number(conn, lead: dict, after: AfterUnblock, staff_name: str) -> di
             raise NumberBlockError(409, "no active cadence is configured")
 
     if phone:
-        hand_over_number(conn, practice_id=lead["practice_id"], phone=phone, lead_id=lead_id)
+        hand_over_number(
+            conn, practice_id=lead["practice_id"], phone=phone, lead_id=lead_id,
+            reason=RESTARTED_REASON,
+        )
     new_status = conn.execute("select status from leads where id=%s", (lead_id,)).fetchone()["status"]
     record_status(
         conn, lead_id, lead["status"], new_status, "dashboard",

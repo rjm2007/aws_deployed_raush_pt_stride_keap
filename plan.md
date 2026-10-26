@@ -223,6 +223,10 @@ Behavior:
   Day 0); the Sheet's Restart refuses it and says why. Booked is final (owner, 2026-10-26): the dashboard
   board cannot move a booked lead either; cancel the visit in Stride (the lead comes back for review), or
   add a new row.
+- One phone number = one active lead (owner, 2026-10-26). Restarting an older row (Sheet Restart, board New /
+  In cadence, Resolve review, unblock, Resume) closes the newer lead on that number: its row says
+  `Closed: another row with this phone number was restarted`. A new row on the number still closes the older
+  one with `Closed: a newer row has this phone number`.
 - Don't delete rows, don't copy-paste whole rows (the hidden Lead ID / Action Request ID would come along),
   and don't edit the hidden columns (Lead ID, Action Request ID, Action Started At). A new patient, or a new
   phone number, goes in a new row.

@@ -34,6 +34,7 @@ from .lead_status import _practice_clock, clamp_to_business_hours, record_status
 from .review import (
     PAUSE_SKIP_REASON,
     REPLACED_REASON,
+    RESTARTED_REASON,
     restore_pause_skipped,
     skip_remaining_planned,
 )
@@ -766,6 +767,9 @@ OUTCOME_LABELS = {
 REPLACED_REVIEW_MESSAGE = (
     "This lead was closed: a newer Sheet row uses the same phone number. Its history is kept."
 )
+RESTARTED_REVIEW_MESSAGE = (
+    "This lead was closed: another row with this phone number was restarted. Its history is kept."
+)
 CLOSED_REVIEW_MESSAGE = "This review is already closed."
 
 
@@ -787,6 +791,8 @@ def closed_review(conn, lead: dict) -> dict[str, str]:
         "and resolved_at is not null order by resolved_at desc,id desc limit 1",
         (lead["id"],),
     ).fetchone()
+    if lead.get("status_reason") == RESTARTED_REASON:
+        return {"reason": "replaced", "message": RESTARTED_REVIEW_MESSAGE}
     if lead.get("status_reason") == REPLACED_REASON or (latest and latest["resolution"] == "replaced"):
         return {"reason": "replaced", "message": REPLACED_REVIEW_MESSAGE}
     label = resolution_label(latest["resolution"], latest.get("code")) if latest else None
@@ -942,6 +948,12 @@ def _resume(conn, lead: dict, rows: list[dict], choice: str, now: datetime) -> d
         "where id=%s",
         (f"review resolved: {choice_label(choice, rows[0].get('code'))}"[:500], lead_id),
     )
+    if lead.get("phone_e164"):
+        # One active lead per phone on every path that sets a lead going again (2026-10-26).
+        from .review import hand_over_number
+
+        hand_over_number(conn, practice_id=lead["practice_id"], phone=lead["phone_e164"],
+                         lead_id=lead_id, reason=RESTARTED_REASON)
     return {"restored_steps": restored, "shifted_steps": shifted}
 
 
@@ -1032,7 +1044,8 @@ def _restart(conn, lead: dict) -> dict:
     planned = materialize_cadence(conn, lead_id, lead["practice_id"], datetime.now(UTC).date())
     if not planned:
         raise ReviewError(409, "No active cadence is configured.")
-    hand_over_number(conn, practice_id=lead["practice_id"], phone=lead["phone_e164"], lead_id=lead_id)
+    hand_over_number(conn, practice_id=lead["practice_id"], phone=lead["phone_e164"], lead_id=lead_id,
+                     reason=RESTARTED_REASON)
     return {"planned_steps": planned}
 
 
@@ -1196,8 +1209,9 @@ def close_for_phone_change(
     if seen:
         return False
     tz, _, _ = _practice_clock(conn, lead_id)
-    message = (f"Phone number changed in the Sheet from {old_mask} to {new_mask} on "
-               f"{_clinic_date(now, tz)}. Add the new number as a new row.")
+    # No digits in the words (owner, 2026-10-26): the masks stay in details.
+    message = (f"Phone number changed in the Sheet on {_clinic_date(now, tz)}. "
+               "Add the new number as a new row.")
     details: dict[str, Any] = {"old_phone": old_mask, "new_phone": new_mask}
     if new_name and new_name.strip() != str(lead.get("full_name") or "").strip():
         details.update(old_name=lead.get("full_name"), new_name=new_name.strip())

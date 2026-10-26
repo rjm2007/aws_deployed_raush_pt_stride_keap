@@ -42,6 +42,7 @@ from ..services.number_block import (
 from ..services.provider_http import ProviderError
 from ..services.review import (
     REPLACED_REASON,
+    RESTARTED_REASON,
     flag_lead_for_review,
     hand_over_number,
     record_review,
@@ -234,6 +235,8 @@ def _closed_reason(row: dict) -> str:
     reason = str(row.get("status_reason") or "")
     if reason == REPLACED_REASON:
         return "Replaced: a newer Sheet row has this phone number"
+    if reason == RESTARTED_REASON:
+        return "Closed: another row with this phone number was restarted"
     if reason == FRONT_DESK_REASON:
         return FRONT_DESK_REASON
     if row["status"] == "invalid_phone" and row.get("cadence_state") == "terminated":
@@ -1275,6 +1278,15 @@ def update_lead_cadence(lead_id: UUID, payload: CadenceAction, actor: Actor):
                     ).fetchall()
                 )
         conn.execute("update leads set cadence_state=%s where id=%s", (new_state, lead_id))
+        phone = conn.execute(
+            "select phone_e164 from leads where id=%s", (lead_id,)
+        ).fetchone() if payload.action == "resume" else None
+        if phone and phone["phone_e164"]:
+            # A resumed lead is the one working its number (2026-10-26).
+            hand_over_number(
+                conn, practice_id=lead["practice_id"], phone=phone["phone_e164"],
+                lead_id=str(lead_id), reason=RESTARTED_REASON,
+            )
         _audit(
             conn, actor, lead["practice_id"], f"cadence.{payload.action}", "lead", str(lead_id),
             {"shifted_events": shifted} if shifted else None,
@@ -1495,14 +1507,23 @@ def move_lead_stage(lead_id: UUID, payload: StageMove, actor: Actor):
                 "select phone_e164 from leads where id=%s", (lead_id,)
             ).fetchone()["phone_e164"]
             hand_over_number(
-                conn, practice_id=lead["practice_id"], phone=phone, lead_id=str(lead_id)
+                conn, practice_id=lead["practice_id"], phone=phone, lead_id=str(lead_id),
+                reason=RESTARTED_REASON,
             )
         elif payload.stage == "cadence":
-            conn.execute(
+            phone = conn.execute(
                 "update leads set status='in_progress',cadence_state='active',needs_review=false,"
-                "review_reason=null,review_flagged_at=null,status_changed_at=now() where id=%s",
+                "review_reason=null,review_flagged_at=null,status_changed_at=now() where id=%s "
+                "returning phone_e164",
                 (lead_id,),
-            )
+            ).fetchone()["phone_e164"]
+            # In cadence sets the lead going again, so it takes the number like New does: two
+            # active leads on one phone would both be called (owner, 2026-10-26).
+            if phone:
+                hand_over_number(
+                    conn, practice_id=lead["practice_id"], phone=phone, lead_id=str(lead_id),
+                    reason=RESTARTED_REASON,
+                )
         elif payload.stage == "attention":
             conn.execute(
                 "update leads set needs_review=true,review_reason=coalesce(review_reason,%s),"
