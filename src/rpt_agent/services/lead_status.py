@@ -691,4 +691,13 @@ def explicit_opt_out(trace: WorkflowTrace, phone: str, channel: str, source: str
                     source,
                     "all outreach channels opted out",
                 )
+            if other_opted_out:
+                # Do Not Contact always blocks the number (owner, 2026-10-26), as every other path does.
+                conn.execute(
+                    "insert into suppressed_numbers(phone_e164,reason,source,list_type) "
+                    "values(%s,'all outreach channels opted out',%s,'internal') "
+                    "on conflict(phone_e164) do update set reason=excluded.reason,"
+                    "source=excluded.source,last_verified_at=now()",
+                    (phone, source),
+                )
     trace.log("state_transition_applied", transition="explicit_opt_out", channel=channel)

@@ -340,3 +340,99 @@ def test_unblocking_a_closed_do_not_contact_number_tells_the_sheet(db, as_test_p
     reasons, _ = _snapshot(db, lead)
     assert "number_unblocked" in reasons
     db["conn"].execute("delete from dashboard_audit_log where action='number.unblocked'")
+
+
+# --- Do Not Contact always blocks the number (owner, 2026-10-26) ---------------------------------
+# Administration releases a number but leaves its lead Do Not Contact. Picking Do Not Contact again
+# on that lead used to change nothing, so a new row with the number was called.
+
+
+def _blocks(db, phone):
+    return db["conn"].execute(
+        "select count(*) as n from suppressed_numbers where phone_e164=%s", (phone,)).fetchone()["n"]
+
+
+def _new_row_on(db, monkeypatch, phone):
+    """A new Sheet row (another patient) on the number, through the Sheet's Start cadence."""
+    from datetime import date
+
+    from rpt_agent.services.lead_actions import execute_lead_action
+
+    slug = db["conn"].execute("select slug from practices where id=%s", (db["practice"],)).fetchone()["slug"]
+    monkeypatch.setenv("N8N_PRACTICE_SLUG", slug)
+    get_settings.cache_clear()
+    request_id = uuid4()
+    try:
+        return execute_lead_action(request_id=request_id, action="start_cadence", lead_id=None, lead={
+            "full_name": "Other Patient", "phone": phone, "email": "other@example.test",
+            "date_of_birth": date(1991, 2, 3), "location": "Dana Point", "title": "Ortho",
+            "lead_type": "Ortho"})
+    finally:
+        db["conn"].execute("delete from lead_action_requests where practice_id=%s", (str(db["practice"]),))
+
+
+def _admin_unblock(db, phone):
+    from rpt_agent.services.number_block import unblock_number_only
+
+    with db["conn"].transaction():
+        unblock_number_only(db["conn"], phone)
+    assert _blocks(db, phone) == 0
+    assert db["conn"].execute("select status from leads where phone_e164=%s",
+                              (phone,)).fetchone()["status"] == "do_not_contact"
+
+
+def test_sheet_do_not_contact_blocks_again_after_an_administration_unblock(db, monkeypatch):
+    from rpt_agent.services.lead_actions import execute_lead_action
+
+    phone = _phone()
+    lead = _lead(db, phone)
+    _sheet_block(db, lead, phone, datetime.now(UTC) - timedelta(days=1))
+    _admin_unblock(db, phone)
+    slug = db["conn"].execute("select slug from practices where id=%s", (db["practice"],)).fetchone()["slug"]
+    monkeypatch.setenv("N8N_PRACTICE_SLUG", slug)
+    get_settings.cache_clear()
+    try:
+        for _ in range(2):  # picked twice: still one block
+            result = execute_lead_action(request_id=uuid4(), action="do_not_contact", lead_id=lead,
+                                         lead={"phone": phone})
+            assert result.body["result"] == "do_not_contact_applied"
+            assert _blocks(db, phone) == 1
+    finally:
+        db["conn"].execute("delete from lead_action_requests where practice_id=%s", (str(db["practice"]),))
+    row = db["conn"].execute("select status,call_opt_out,sms_opt_out from leads where id=%s",
+                             (lead,)).fetchone()
+    assert (row["status"], row["call_opt_out"], row["sms_opt_out"]) == ("do_not_contact", True, True)
+    assert _new_row_on(db, monkeypatch, phone).body["result"] == "number_blocked_needs_review"
+
+
+def test_dashboard_do_not_contact_blocks_again_after_an_administration_unblock(db, monkeypatch):
+    phone = _phone()
+    lead = _lead(db, phone)
+    _sheet_block(db, lead, phone, datetime.now(UTC) - timedelta(days=1))
+    _admin_unblock(db, phone)
+    for _ in range(2):  # switched on twice: still one block
+        response = _post(lead, {"do_not_contact": True}, role="employee")
+        assert response.status_code == 200, response.text
+        assert response.json()["do_not_contact"] is True
+        assert _blocks(db, phone) == 1
+    block = db["conn"].execute("select source from suppressed_numbers where phone_e164=%s",
+                               (phone,)).fetchone()
+    assert block["source"] == "dashboard"
+    row = db["conn"].execute("select status,call_opt_out,sms_opt_out from leads where id=%s",
+                             (lead,)).fetchone()
+    assert (row["status"], row["call_opt_out"], row["sms_opt_out"]) == ("do_not_contact", True, True)
+    assert _new_row_on(db, monkeypatch, phone).body["result"] == "number_blocked_needs_review"
+
+
+def test_a_stop_text_that_ends_all_contact_blocks_the_number(db):
+    from rpt_agent.observability import WorkflowTrace
+    from rpt_agent.services.lead_status import explicit_opt_out
+
+    phone = _phone()
+    lead = _lead(db, phone)
+    db["conn"].execute("update leads set call_opt_out=true where id=%s", (lead,))
+    for _ in range(2):  # STOP sent twice: still one block
+        explicit_opt_out(WorkflowTrace("test", "test"), phone, "sms", "twilio_inbound")
+        assert _blocks(db, phone) == 1
+    assert db["conn"].execute("select status from leads where id=%s",
+                              (lead,)).fetchone()["status"] == "do_not_contact"

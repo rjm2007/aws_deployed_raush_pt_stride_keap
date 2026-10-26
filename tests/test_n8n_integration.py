@@ -847,6 +847,42 @@ def test_sheet_team_can_mark_booked_without_an_appointment():
     assert not any("from appointments" in query for query in statements)
 
 
+@pytest.mark.parametrize("status", ["in_progress", "do_not_contact"])
+def test_sheet_do_not_contact_always_blocks_the_number(status):
+    """Owner, 2026-10-26: an Administration unblock leaves the lead Do Not Contact; the Sheet's
+    Do Not Contact picked again must block the number again, not only on a first block."""
+    lead_id = UUID("00000000-0000-0000-0000-000000000002")
+
+    class Connection:
+        def __init__(self):
+            self.queries = []
+
+        def execute(self, query, params=None):
+            normalized = " ".join(query.split())
+            self.queries.append((normalized, params))
+            if normalized.startswith("select id,practice_id,status"):
+                return _Rows(one={
+                    "id": lead_id, "practice_id": 1, "status": status, "cadence_state": "terminated",
+                    "call_opt_out": False, "sms_opt_out": False, "phone_e164": "+15555550100",
+                    "status_reason": None, "needs_review": False,
+                })
+            return _Rows()
+
+    conn = Connection()
+    result = lead_actions._do_not_contact(
+        conn,
+        request_id=UUID("00000000-0000-0000-0000-000000000001"),
+        practice={"id": 1},
+        lead_id=lead_id,
+        phone="+15555550100",
+    )
+
+    assert result.body["result"] == "do_not_contact_applied"
+    blocks = [p for q, p in conn.queries if q.startswith("insert into suppressed_numbers")]
+    assert blocks == [("+15555550100",)]
+    assert any("call_opt_out=true" in q and "sms_opt_out=true" in q for q, _ in conn.queries)
+
+
 class _RestartConnection:
     def __init__(self, cadence_state: str):
         self.cadence_state = cadence_state

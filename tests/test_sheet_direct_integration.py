@@ -738,6 +738,30 @@ def test_an_unblock_never_blocks_again_and_do_not_contact_picked_again_does(env,
     assert _requests(env, lead_id, "do_not_contact") == 2
 
 
+def test_do_not_contact_picked_again_after_an_administration_unblock_blocks_the_number(env):
+    # Owner, 2026-10-26: Administration releases the number and leaves the lead Do Not Contact.
+    # Do Not Contact picked again used to say "applied" without blocking, so a new row was called.
+    from rpt_agent.services.number_block import unblock_number_only
+
+    number = env.start_row()
+    env.tick()
+    lead_id = _command(env, number, "Do Not Contact")
+    phone = env.lead(lead_id)["phone_e164"]
+    with env.db.transaction():
+        unblock_number_only(env.db, phone)
+    env.tick()
+    blocks = "select count(*) as n from suppressed_numbers where phone_e164=%s"
+    assert env.db.execute(blocks, (phone,)).fetchone()["n"] == 0
+    for _ in range(2):
+        _command(env, number, "Do Not Contact")
+        assert env.cell(number, "outcome_status") == "Do Not Contact applied"
+        assert env.db.execute(blocks, (phone,)).fetchone()["n"] == 1
+    assert env.lead(lead_id)["status"] == "do_not_contact"
+    other = env.start_row(phone=phone[2:], name="Ravi Rao")
+    env.tick()
+    assert env.cell(other, "outcome_status") == "Number blocked; needs review"
+
+
 def _stride_cancel(env, lead_id):
     """What stride_leads does when the booked visit is cancelled in Stride."""
     from rpt_agent.services.review import record_review

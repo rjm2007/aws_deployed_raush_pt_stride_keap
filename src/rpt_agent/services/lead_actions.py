@@ -590,17 +590,24 @@ def _do_not_contact(
             ("Do Not Contact selected in Google Sheets", lead_id),
         )
         conn.execute(
-            "insert into suppressed_numbers(phone_e164,reason,source,list_type) "
-            "values(%s,'staff selected Do Not Contact','n8n_sheet','internal') "
-            "on conflict(phone_e164) do update set reason=excluded.reason,source=excluded.source,"
-            "last_verified_at=now()",
-            (lead["phone_e164"],),
-        )
-        conn.execute(
             "insert into lead_status_history(lead_id,from_status,to_status,source,reason) "
             "values(%s,%s,'do_not_contact','n8n_sheet','Do Not Contact selected in Google Sheets')",
             (lead_id, lead["status"]),
         )
+    else:
+        # Already Do Not Contact, but an Administration unblock may have released the number (and
+        # its opt-outs) while the lead stayed closed: block it again (owner, 2026-10-26).
+        conn.execute(
+            "update leads set call_opt_out=true,sms_opt_out=true where id=%s", (lead_id,)
+        )
+    # Do Not Contact always blocks the number, whatever the lead's status was (idempotent).
+    conn.execute(
+        "insert into suppressed_numbers(phone_e164,reason,source,list_type) "
+        "values(%s,'staff selected Do Not Contact','n8n_sheet','internal') "
+        "on conflict(phone_e164) do update set reason=excluded.reason,source=excluded.source,"
+        "last_verified_at=now()",
+        (lead["phone_e164"],),
+    )
     # Intake/recovery writes Action Status for the Sheet DNC command.
     return ActionExecution(
         200,

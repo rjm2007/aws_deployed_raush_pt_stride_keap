@@ -1240,7 +1240,10 @@ def set_contact_rules(lead_id: UUID, payload: ContactRules, actor: Actor):
                 "select 1 from suppressed_numbers where phone_e164=%s", (lead["phone_e164"],)
             ).fetchone())
             currently = number_blocked or lead["status"] == "do_not_contact"
-            if payload.do_not_contact and not currently:
+            # Do Not Contact always blocks the number: a Do Not Contact lead whose number an
+            # admin released from Administration is blocked again (owner, 2026-10-26).
+            reblock = bool(lead["phone_e164"]) and not number_blocked
+            if payload.do_not_contact and (not currently or reblock):
                 block_number(conn, lead, staff_name)
                 changes["do_not_contact"] = True
             elif not payload.do_not_contact and currently:

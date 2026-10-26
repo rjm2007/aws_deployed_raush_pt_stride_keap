@@ -1366,6 +1366,21 @@ def test_switch_reads_on_for_a_number_the_sheet_blocked(monkeypatch):
     get_settings.cache_clear()
 
 
+def test_do_not_contact_blocks_again_after_an_administration_unblock(monkeypatch):
+    """Owner, 2026-10-26: Administration releases the number but leaves the lead Do Not Contact.
+    Picking Do Not Contact again used to change nothing, so a new row on that number was called."""
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+    connection = ContactRulesConnection(status="do_not_contact", blocked=False)
+    response = _set_rules(connection, monkeypatch, {"do_not_contact": True}, role="employee")
+
+    assert response.status_code == 200
+    assert response.json()["do_not_contact"] is True
+    assert any(sql.startswith("insert into suppressed_numbers") for sql in connection.statements)
+    assert any("call_opt_out=true" in sql and "sms_opt_out=true" in sql for sql in connection.statements)
+    get_settings.cache_clear()
+
+
 def test_continue_with_nothing_left_asks_for_start_over(monkeypatch):
     monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
     get_settings.cache_clear()
