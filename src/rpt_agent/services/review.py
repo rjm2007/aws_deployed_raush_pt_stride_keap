@@ -136,10 +136,19 @@ def flag_lead_for_review(
 
 
 REPLACED_REASON = "replaced by a newer referral on this number"
+# An older lead on the number was restarted (board New / In cadence, Sheet Restart, review restart,
+# unblock, resume) and took the number back (owner, 2026-10-26): "a newer referral" was wrong there.
+RESTARTED_REASON = "replaced: another lead with this phone was restarted"
+REPLACED_REASONS = (REPLACED_REASON, RESTARTED_REASON)
 
 
-def hand_over_number(conn, *, practice_id: int, phone: str, lead_id: str) -> str | None:
+def hand_over_number(
+    conn, *, practice_id: int, phone: str, lead_id: str, reason: str = REPLACED_REASON
+) -> str | None:
     """Make `lead_id` the one lead working this phone number.
+
+    `reason` says why the others stop: REPLACED_REASON when `lead_id` is a new lead (a new Sheet
+    row, a lead added on the dashboard), RESTARTED_REASON when an existing lead is (re)started.
 
     Repeat patients come back for another body region and reuse their number, so
     several leads may share it - but only one cadence may run, or the patient is
@@ -160,18 +169,27 @@ def hand_over_number(conn, *, practice_id: int, phone: str, lead_id: str) -> str
         return None
     for other in others:
         if other["cadence_state"] in {"pending", "active", "paused"}:
+            # Its open review closes as "replaced" here: migration 048's clear trigger only knows
+            # REPLACED_REASON's words and would record the restarted case as plain "closed".
+            conn.execute(
+                "update lead_reviews set resolved_at=now(),resolved_by=coalesce(resolved_by,'system'),"
+                "resolved_by_name=coalesce(resolved_by_name,'System'),"
+                "resolution=coalesce(resolution,'replaced'),updated_at=now() "
+                "where lead_id=%s and resolved_at is null",
+                (other["id"],),
+            )
             # needs_review goes too: the board shows any flagged lead in Needs
             # Attention first, and a replaced lead has nothing left to act on.
             conn.execute(
                 "update leads set cadence_state='terminated',status_reason=%s,"
                 "needs_review=false,status_changed_at=now() where id=%s",
-                (REPLACED_REASON, other["id"]),
+                (reason, other["id"]),
             )
-            skip_remaining_planned(conn, str(other["id"]), REPLACED_REASON)
+            skip_remaining_planned(conn, str(other["id"]), reason)
             conn.execute(
                 "insert into lead_status_history(lead_id,from_status,to_status,source,reason) "
                 "values(%s,%s,%s,'system',%s)",
-                (other["id"], other["status"], other["status"], REPLACED_REASON),
+                (other["id"], other["status"], other["status"], reason),
             )
     conn.execute(
         "update leads set call_opt_out=call_opt_out or %s,sms_opt_out=sms_opt_out or %s "

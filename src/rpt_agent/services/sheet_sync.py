@@ -73,6 +73,7 @@ def enqueue_sheet_update(
 
 
 SHEET_REPLACED = "Closed: a newer row has this phone number"
+SHEET_RESTARTED = "Closed: another row with this phone number was restarted"
 
 
 def _action_label(lead: dict[str, Any]) -> str | None:
@@ -83,7 +84,7 @@ def _action_label(lead: dict[str, Any]) -> str | None:
     like the status webhook owned start/Lead ID. Only emit labels that outreach can
     set after the fact (completed cadence, voice/tool DNC).
     """
-    from .review import REPLACED_REASON  # review imports this module
+    from .review import REPLACED_REASON, RESTARTED_REASON  # review imports this module
 
     if lead["status"] == "booked":
         return "Booked"
@@ -91,6 +92,9 @@ def _action_label(lead: dict[str, Any]) -> str | None:
         # One lead per phone number: a newer row on the same number took over. Without this the cell
         # kept its last words ("Resolved: old name kept") under "Closed" (demo test 2026-10-22).
         return SHEET_REPLACED
+    if lead["cadence_state"] == "terminated" and lead.get("status_reason") == RESTARTED_REASON:
+        # An older row on the same number was restarted and took it back (owner, 2026-10-26).
+        return SHEET_RESTARTED
     if lead["status"] == "do_not_contact":
         return "Do Not Contact applied"  # same words as the Sheet command's own result
     if _stride_problem(lead):

@@ -2610,3 +2610,23 @@ Booked when the booking worked (the booking wins over the end-of-call report).
 - No migration. Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`,
   `test_lead_review_integration.py` (the shared Sheet fixture switches the check off for other tests: no worker
   runs there, so Day 0 would stay due in calling hours).
+
+### 2026-10-26 — One phone = one active lead on every path; "restarted" wording (owner-approved)
+- Demo: three rows on one phone, staff moved the OLDEST to New on the board; the newer lead was closed
+  "replaced by a newer referral on this number" (wrong), and a board move to In cadence did not take the
+  number at all (two leads on one phone could both be called).
+- `review.hand_over_number(..., reason=)`: `REPLACED_REASON` ("replaced by a newer referral on this number")
+  for a new lead (Sheet Start, dashboard Add lead: unchanged); `RESTARTED_REASON` ("replaced: another lead with
+  this phone was restarted") when an existing lead starts again: Sheet Restart, board New, board In cadence
+  (now hands over), review-card restart choices, review resume choices, unblock (continue / restart), lead
+  page Resume. It also closes the stopped lead's open review as `replaced` (migration 048's trigger only
+  knows the old words). Booked is final, Do Not Contact and a blocked number are unchanged.
+- Sheet Outcome Status: "Closed: another row with this phone number was restarted" (new row case still
+  "Closed: a newer row has this phone number"); board / lead page next step the same; the lead page banner
+  (rpt_frontend) and the closed-review message say it too. A Sheet Restart on such a lead is refused:
+  "Error: this lead is closed (another row with this phone number was restarted). Use the dashboard."
+- Phone-change close reason has no digits now: "Phone number changed in the Sheet on Oct 26, 2026. Add the
+  new number as a new row." (the masked numbers stay in the review's details; Sheet text unchanged).
+- Activity label for a review closed as `replaced` is neutral now: "Replaced by another lead with this
+  phone number" (was "Replaced by a newer referral", wrong for a restart).
+- No migration. Tests: `test_one_lead_per_phone_integration.py`.

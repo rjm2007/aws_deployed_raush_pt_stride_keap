@@ -327,8 +327,8 @@ def test_phone_change_closes_the_lead_at_once_and_never_resumes(review_env):
     lead = senv.lead(lead_id)
     assert (lead["status"], lead["cadence_state"], lead["needs_review"]) == ("invalid_phone", "terminated", False)
     assert lead["phone_e164"] == old_phone
-    assert lead["status_reason"].startswith(f"Phone number changed in the Sheet from …{old_phone[-4:]} "
-                                            f"to …{new_phone[-4:]} on ")
+    assert lead["status_reason"].startswith("Phone number changed in the Sheet on ")
+    assert "…" not in lead["status_reason"]
     assert lead["status_reason"].endswith("Add the new number as a new row.")
     assert not any(event["status"] == "planned" for event in _events(senv, lead_id))
     [review] = _reviews(senv, lead_id)

@@ -401,7 +401,7 @@ def test_sheet_sync_changed_phone_closes_the_lead(monkeypatch, incoming_name):
     assert "cadence_state='terminated'" in close and "needs_review=false" in close
     assert any(q.startswith("update outreach_events set status='skipped'") for q in sql)
     review = next(params for query, params in queries if query.startswith("insert into lead_reviews"))
-    assert "from …8847 to …1234" in review[1]
+    assert review[1].startswith("Phone number changed in the Sheet on ") and "…" not in review[1]
     assert review[2].obj["old_phone"] == "…8847" and review[2].obj["new_phone"] == "…1234"
     # Only the last four digits are kept on the record.
     assert "5555551234" not in str(review)

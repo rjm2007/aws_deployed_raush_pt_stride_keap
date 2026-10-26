@@ -22,7 +22,7 @@ from .lead_review import (
     last_review_restart,
 )
 from .lead_status import record_status
-from .review import REPLACED_REASON, flag_lead_for_review, hand_over_number
+from .review import REPLACED_REASON, RESTARTED_REASON, flag_lead_for_review, hand_over_number
 from .sheet_sync import enqueue_sheet_update
 
 TERMINAL_START_STATUSES = {
@@ -402,6 +402,8 @@ def _closed_by_decision(lead: dict[str, Any]) -> str | None:
         return "handled by front desk"
     if reason == REPLACED_REASON:
         return "a newer row has this phone number"
+    if reason == RESTARTED_REASON:
+        return "another row with this phone number was restarted"
     if lead["status"] == "declined":
         return "closed on the dashboard" if reason == "closed from the board" else "not interested"
     return None
@@ -550,7 +552,8 @@ def _restart_cadence(
         (lead_id, lead["status"]),
     )
     warning = hand_over_number(
-        conn, practice_id=practice["id"], phone=lead["phone_e164"], lead_id=str(lead_id)
+        conn, practice_id=practice["id"], phone=lead["phone_e164"], lead_id=str(lead_id),
+        reason=RESTARTED_REASON,
     )
     blocked = _hold_if_number_blocked(conn, str(lead_id), lead["phone_e164"])
     enqueue_sheet_update(
