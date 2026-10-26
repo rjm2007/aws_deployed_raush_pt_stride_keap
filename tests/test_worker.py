@@ -330,7 +330,7 @@ def test_cadence_completion_does_not_depend_on_the_calendar():
 
     source = inspect.getsource(worker.run_safety_checks)
     start = source.index("update leads l set status='closed_no_response'")
-    statement = source[start : source.index("returning id", start)]
+    statement = source[start : source.index("returning l.id", start)]
 
     # No calendar arithmetic of any kind: no day count, no now(), no current_date.
     assert "cadence_started_on" not in statement

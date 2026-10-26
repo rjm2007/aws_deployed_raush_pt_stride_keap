@@ -418,9 +418,58 @@ def _sheet_command_entry(row: dict) -> dict:
     )
 
 
+# Every activity on a lead, with who or what made it (owner, 2026-10-26: "make sure every activity
+# gets noted, so it's easy and accountable"). Who made an automated change, by its source.
+ELLIOT, STRIDE, SYSTEM = "Elliot", "Stride", "System"
+SOURCE_ACTORS = {
+    "tool": ELLIOT, "call summary": ELLIOT, "webhook": ELLIOT, "call": ELLIOT,
+    "voice_booking": ELLIOT, "stride_booking": ELLIOT,
+    "stride": STRIDE, "stride_check": STRIDE,
+    "twilio_inbound": "Patient", "sheet": SHEET, "n8n_sheet": SHEET,
+}
+STATUS_WORDS = {
+    "new": "New lead", "in_progress": "In cadence", "callback_scheduled": "Callback scheduled",
+    "booking_link_sent": "Booking link sent", "booked": "Booked", "declined": "Not interested",
+    "transferred_human": "Transferred to staff", "needs_attention": "Needs review",
+    "invalid_phone": "Invalid phone number", "closed_no_response": "Closed, no response",
+    "do_not_contact": "Do Not Contact",
+}
+CALL_OUTCOME_WORDS = {
+    "booked": "booked", "not_interested": "not interested", "no_answer": "no answer",
+    "voicemail": "voicemail", "callback": "callback requested", "transferred": "transferred to staff",
+    "manual": "needs review", "booking_link": "booking link sent",
+    "call_opt_out": "asked not to be called", "do_not_contact": "Do Not Contact",
+}
+EVENT_STATUS_WORDS = {
+    "in_flight": "in progress", "attempted": "awaiting result",
+    "unknown": "result unknown", "undelivered": "not delivered",
+}
+# Elliot's bookings and staff calendar bookings have a row in appointments (shown on its own).
+BOOKING_ACTORS = {"voice_agent": ELLIOT, "call": ELLIOT}
+
+
+def _actor(source) -> str:
+    return SOURCE_ACTORS.get(str(source or ""), SYSTEM)
+
+
+def _sentence(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
+def _contact_rules_title(details: dict) -> str:
+    if details.get("do_not_contact") is True:
+        return "Do Not Contact: number blocked"
+    if details.get("do_not_contact") is False:
+        return "Number unblocked"
+    return "Contact rules updated"
+
+
 def _build_activity(audits, events, status_history, appointments, reviews=(),
                     sheet_commands=()) -> list[dict]:
     entries: list[dict] = [_sheet_command_entry(row) for row in sheet_commands]
+    # A review is raised in the same transaction as the status line it explains (same now()): the
+    # flag says it, so that status line is not shown again.
+    flagged_at = {review["flagged_at"] for review in reviews}
     for review in reviews:
         title = TITLES.get(review["code"], TITLES["other"])
         entries.append(_activity_entry(
@@ -428,8 +477,7 @@ def _build_activity(audits, events, status_history, appointments, reviews=(),
             action="review.flagged",
             occurred_at=review["flagged_at"],
             actor_type="employee" if review["source"] == "dashboard" else "automation",
-            actor_name=(review.get("details") or {}).get("by")
-            or (SHEET if review["source"] == "sheet" else "Automation"),
+            actor_name=(review.get("details") or {}).get("by") or _actor(review["source"]),
             category="review",
             title=f"Flagged: {title}",
         ))
@@ -461,6 +509,7 @@ def _build_activity(audits, events, status_history, appointments, reviews=(),
         "cadence.version_activated": "Cadence activated",
         "cadence.local_updated": "Cadence step updated",
         "contact_rules.updated": "Contact rules updated",
+        "appointment.booking_requested": "Appointment booking requested",
         "review.resolved": "Review resolved",
         "sms_template.local_updated": "Lead message updated",
         "sms_template.local_reset": "Lead message reset",
@@ -486,31 +535,58 @@ def _build_activity(audits, events, status_history, appointments, reviews=(),
             actor_type="employee",
             actor_name=row.get("actor_name") or "Employee",
             category=category,
-            title=titles.get(action, action.replace(".", " ").replace("_", " ").title()),
+            title=(_contact_rules_title(row.get("metadata") or {}) if action == "lead.contact_rules"
+                   else titles.get(action, action.replace(".", " ").replace("_", " ").title())),
             details=dict(row.get("metadata") or {}),
         ))
+    # A call's outcome is settled in the same transaction as the lead's status line: the call's own
+    # line names the outcome, so that status line is not shown again.
+    call_settled_at = set()
     for event in events:
-        if event["status"] == "planned":
+        # planned: not done yet. skipped: a step cancelled by another event (booked, restart, ...),
+        # which has its own line.
+        if event["status"] in {"planned", "skipped"}:
             continue
-        channel = "Call" if event["channel"] == "call" else "SMS"
-        status = event.get("delivery_status") or event["status"]
+        is_call = event["channel"] == "call"
+        if is_call and event.get("settled_at") and event.get("outcome"):
+            call_settled_at.add(event["settled_at"])
+        # A text's carrier status (sms_messages) is the honest one; the step's own 'delivered' only
+        # means the message was handed over.
+        carrier = None if is_call else event.get("delivery_status")
+        status = str(carrier or event["status"])
+        if is_call and event.get("outcome"):
+            outcome = str(event["outcome"])
+            title = f"Call: {CALL_OUTCOME_WORDS.get(outcome, outcome.replace('_', ' '))}"
+        else:
+            words = ("made" if is_call else "sent") if status == "delivered" and not carrier else (
+                EVENT_STATUS_WORDS.get(status, status.replace("_", " ")) if status != "delivered"
+                else "delivered")
+            title = f"{'Call' if is_call else 'Text'} {words}"
         entries.append(_activity_entry(
             entry_id=f"outreach-{event['id']}",
             action=f"outreach.{status}",
             occurred_at=event.get("executed_at") or event.get("created_at"),
             actor_type="automation",
-            actor_name="Automation",
-            category="calls" if event["channel"] == "call" else "messages",
-            title=f"{channel} {str(status).replace('_', ' ')}",
+            actor_name=ELLIOT if is_call else SYSTEM,
+            category="calls" if is_call else "messages",
+            title=title,
             details={
                 "cadence": event.get("cadence_version_name"),
                 "step": event.get("description"),
             },
         ))
     for index, row in enumerate(status_history):
-        if row.get("source") == "dashboard":
+        source = row.get("source")
+        reason = str(row.get("reason") or "")
+        if source == "dashboard":
+            continue  # the staff member's own line (audit log or review) says it
+        if source != "n8n_sheet" and (
+            row["changed_at"] in flagged_at or row["changed_at"] in call_settled_at
+            or (source == "system" and reason.startswith("Flagged for review:"))
+            or (reason == "appointment confirmed" and appointments)
+        ):
             continue
-        if row.get("source") == "n8n_sheet":
+        if source == "n8n_sheet":
             if row.get("reason") in SHEET_COMMAND_REASONS:
                 continue  # the command's own entry (sheet_commands) says it
             # Phone changed, email changed, a command the Sheet worker refused itself, ...
@@ -528,15 +604,20 @@ def _build_activity(audits, events, status_history, appointments, reviews=(),
                                               "to": row.get("to_status")} if moved else {})},
             ))
             continue
+        to_status = row.get("to_status")
+        moved = row.get("from_status") != to_status
+        actor = _actor(source)
         entries.append(_activity_entry(
             entry_id=f"status-{index}-{row['changed_at']}",
             action="lead.status_changed",
             occurred_at=row["changed_at"],
             actor_type="automation",
-            actor_name="Automation",
-            category="cadence",
-            title="Lead status updated",
-            details={"from": row.get("from_status"), "to": row.get("to_status")},
+            actor_name=actor,
+            category="calls" if actor == ELLIOT else "appointments" if actor == STRIDE else "cadence",
+            title=(STATUS_WORDS.get(to_status, str(to_status).replace("_", " ").capitalize())
+                   if moved or not reason else _sentence(reason)),
+            details={**({"reason": reason} if reason and moved else {}),
+                     **({"from": row.get("from_status"), "to": to_status} if moved else {})},
         ))
     for row in appointments:
         entries.append(_activity_entry(
@@ -544,7 +625,7 @@ def _build_activity(audits, events, status_history, appointments, reviews=(),
             action=f"appointment.{row['state']}",
             occurred_at=row.get("booked_at") or row.get("start_utc"),
             actor_type="automation",
-            actor_name="Automation",
+            actor_name=BOOKING_ACTORS.get(str(row.get("booking_source") or ""), SYSTEM),
             category="appointments",
             title=f"Appointment {str(row['state']).replace('_', ' ')}",
             details={"start": row.get("start_utc")},
@@ -978,7 +1059,8 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
             # minutes later. Without this join the timeline shows "Completed" for a
             # text the patient never received.
             "select oe.id,oe.cadence_step_id,oe.cadence_version_id,oe.channel,oe.day_offset,"
-            "oe.status,oe.scheduled_for,oe.created_at,oe.executed_at,oe.outcome,cs.description,"
+            "oe.status,oe.scheduled_for,oe.created_at,oe.executed_at,oe.settled_at,oe.outcome,"
+            "cs.description,"
             "cv.name as cadence_version_name,"
             "(select count(*) from cadence_steps expected "
             "where expected.cadence_version_id=oe.cadence_version_id and expected.is_active) "
@@ -1005,7 +1087,8 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
         ).fetchall()
         appointments = conn.execute(
             "select id,state,start_utc,end_utc,booked_at,location_id,appointment_type_id,"
-            "needs_staff_review from appointments where lead_id=%s order by booked_at desc",
+            "needs_staff_review,booking_source from appointments where lead_id=%s "
+            "order by booked_at desc",
             (lead_id,),
         ).fetchall()
         booking = appointment_views.booking_card(conn, row["practice_id"], lead_id, datetime.now(UTC))

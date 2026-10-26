@@ -1365,3 +1365,57 @@ def test_every_sheet_command_shows_in_the_activity_with_refusals_and_reasons(rev
     # The status lines of these commands are not shown twice.
     assert not any(e["title"] == "Lead status updated" and e["actor_name"] == "Google Sheet"
                    for e in activity)
+
+
+# --- every activity on a lead, once, with who made it (owner, 2026-10-26) ------------------------
+
+
+def _call(senv, lead_id, status, notes=None):
+    event = senv.db.execute(
+        "update outreach_events set status='attempted',executed_at=now(),vapi_call_id=%s "
+        "where id=(select id from outreach_events where lead_id=%s and channel='call' "
+        "and status='planned' order by day_offset,id limit 1) returning id,vapi_call_id",
+        (f"call-{uuid4().hex}", lead_id)).fetchone()
+    report_lead_status(WorkflowTrace("t", "test"), lead_id=lead_id, status=status,
+                       call_id=event["vapi_call_id"], event_id=event["id"], notes=notes)
+
+
+def test_a_call_outcome_is_one_line_by_elliot_and_cancelled_steps_are_not_listed(review_env):
+    senv = review_env
+    _, lead_id = _started(senv)
+    _call(senv, lead_id, "not_interested")
+    assert senv.lead(lead_id)["status"] == "declined"
+    activity = _get(f"leads/{lead_id}").json()["activity"]
+    titles = [e["title"] for e in activity]
+    assert titles.count("Call: not interested") == 1
+    assert "Not interested" not in titles  # the status line of that same call
+    assert not any("skipped" in t for t in titles)  # the steps the decline cancelled
+    assert "Lead status updated" not in titles
+    call = next(e for e in activity if e["title"] == "Call: not interested")
+    assert (call["actor_name"], call["category"]) == ("Elliot", "calls")
+    assert {e["actor_name"] for e in activity} <= {"Google Sheet", "Elliot", "System"}
+
+
+def test_a_flag_is_one_line_and_names_who_raised_it(review_env):
+    senv = review_env
+    _, lead_id = _started(senv)
+    _call(senv, lead_id, "wrong_person", notes="Said this is Bob's number")
+    activity = _get(f"leads/{lead_id}").json()["activity"]
+    titles = [e["title"] for e in activity]
+    flagged = [e for e in activity if e["action"] == "review.flagged"]
+    assert len(flagged) == 1 and flagged[0]["actor_name"] == "Elliot"
+    assert not any(t.startswith("Flagged for review:") for t in titles)
+    assert "Invalid phone number" not in titles  # the status line of that same flag
+
+
+def test_a_finished_cadence_shows_in_the_activity(review_env):
+    senv = review_env
+    _, lead_id = _started(senv)
+    senv.db.execute("update outreach_events set status='skipped' where lead_id=%s", (lead_id,))
+    run_safety_checks(WorkflowTrace("t", "test"))
+    assert senv.lead(lead_id)["status"] == "closed_no_response"
+    activity = _get(f"leads/{lead_id}").json()["activity"]
+    entry = next(e for e in activity if e["title"] == "Closed, no response")
+    assert entry["actor_name"] == "System"
+    assert entry["details"]["reason"] == "cadence finished with no response"
+    assert entry["details"]["to"] == "closed_no_response"

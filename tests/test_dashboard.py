@@ -65,9 +65,56 @@ def test_activity_feed_attributes_people_without_message_bodies():
     assert {entry["actor_name"] for entry in activity} == {
         "Alex Morgan",
         "Sarah Johnson",
-        "Automation",
+        "System",
     }
     assert "body" not in str(activity).lower()
+
+
+def test_activity_feed_names_the_source_and_shows_each_event_once():
+    t0, t1, t2, t3, t4 = (datetime(2026, 10, 26, 9, minute, tzinfo=UTC) for minute in range(5))
+    events = [
+        {"id": 1, "status": "delivered", "channel": "call", "created_at": t0, "executed_at": t0,
+         "settled_at": t1, "outcome": "callback", "description": "Day 0 call"},
+        {"id": 2, "status": "skipped", "channel": "sms", "created_at": t0, "executed_at": None},
+        {"id": 3, "status": "delivered", "channel": "sms", "created_at": t2, "executed_at": t2,
+         "delivery_status": "undelivered"},
+        {"id": 4, "status": "attempted", "channel": "call", "created_at": t3, "executed_at": t3},
+    ]
+    history = [
+        {"from_status": "in_progress", "to_status": "callback_scheduled", "source": "tool",
+         "reason": "callback requested", "changed_at": t1},
+        {"from_status": "in_progress", "to_status": "in_progress", "source": "system",
+         "reason": "Flagged for review: cadence SMS was not delivered", "changed_at": t2},
+        {"from_status": "booked", "to_status": "needs_attention", "source": "stride",
+         "reason": "cancelled in Stride", "changed_at": t4},
+        {"from_status": "in_progress", "to_status": "do_not_contact", "source": "twilio_inbound",
+         "reason": "STOP", "changed_at": t3},
+        {"from_status": "in_progress", "to_status": "booked", "source": "voice_booking",
+         "reason": "appointment confirmed", "changed_at": t4},
+        {"from_status": "in_progress", "to_status": "declined", "source": "dashboard",
+         "reason": "moved to closed from the board", "changed_at": t4},
+    ]
+    reviews = [{"id": 9, "code": "booking_cancelled", "source": "stride", "flagged_at": t4,
+                "details": {}}]
+    audits = [{"id": 5, "action": "lead.contact_rules", "metadata": {"do_not_contact": False},
+               "created_at": t4, "actor_name": "Emma"}]
+    appointments = [{"id": 7, "state": "scheduled", "booked_at": t4, "start_utc": t4,
+                     "booking_source": "voice_agent"}]
+    activity = dashboard_routes._build_activity(audits, events, history, appointments, reviews)
+    lines = {(e["title"], e["actor_name"]) for e in activity}
+    assert lines == {
+        ("Call: callback requested", "Elliot"),
+        ("Text not delivered", "System"),
+        ("Call awaiting result", "Elliot"),
+        ("Do Not Contact", "Patient"),
+        ("Flagged: " + dashboard_routes.TITLES.get("booking_cancelled",
+                                                   dashboard_routes.TITLES["other"]), "Stride"),
+        ("Number unblocked", "Emma"),
+        ("Appointment scheduled", "Elliot"),
+    }
+    assert len(activity) == len(lines)  # one line per event
+    stop = next(e for e in activity if e["actor_name"] == "Patient")
+    assert stop["details"] == {"reason": "STOP", "from": "in_progress", "to": "do_not_contact"}
 
 
 class Result:

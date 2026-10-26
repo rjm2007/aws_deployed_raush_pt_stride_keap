@@ -584,12 +584,18 @@ def run_safety_checks(trace: WorkflowTrace) -> dict[str, int]:
         # whether the cadence took thirteen minutes or thirteen days.
         exhausted = conn.execute(
             "update leads l set status='closed_no_response',cadence_state='completed',status_changed_at=now() "
-            "where l.cadence_state='active' "
+            "from leads old where old.id=l.id and l.cadence_state='active' "
             "and exists(select 1 from outreach_events oe where oe.lead_id=l.id) "
             "and not exists(select 1 from outreach_events oe where oe.lead_id=l.id "
-            "and oe.status in ('planned','in_flight','attempted')) returning id"
+            "and oe.status in ('planned','in_flight','attempted')) returning l.id,old.status as old_status"
         ).fetchall()
         for row in exhausted:
+            # The lead's Activity shows the cadence finishing (owner, 2026-10-26: every activity).
+            conn.execute(
+                "insert into lead_status_history(lead_id,from_status,to_status,source,reason) "
+                "values(%s,%s,'closed_no_response','system','cadence finished with no response')",
+                (row["id"], row["old_status"]),
+            )
             enqueue_sheet_update(
                 conn,
                 lead_id=str(row["id"]),
