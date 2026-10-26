@@ -284,6 +284,19 @@ def test_a_booking_that_failed_on_the_call_is_a_front_desk_card():
     assert "Stride still shows that time as open" in describe(_review("booking_failed"), LEAD)["reason"]
 
 
+def test_yes_then_hang_up_card_asks_the_front_desk_to_book_by_hand():
+    # Owner, 2026-10-27: the patient said yes to the confirmation and hung up; the backend could
+    # not book it, so the front desk does.
+    card = describe(_review("booking_said_yes", confirmed="Tuesday, June 16 at 9:00 AM with Thao",
+                            why="that time was no longer free"), LEAD)
+    assert card["group"] == "booking" and card["title"] == "Patient said yes, then hung up"
+    assert "said yes to Tuesday, June 16 at 9:00 AM with Thao and hung up" in card["reason"]
+    assert "(that time was no longer free)" in card["reason"] and "book by hand" in card["reason"]
+    assert [o["choice"] for o in card["options"]] == ["front_desk"]
+    assert sheet_open_status("booking_said_yes", {}) == \
+        "Needs review: patient said yes to a time, book by hand"
+
+
 def test_booking_cards_and_sheet_words_name_what_happened():
     assert sheet_open_status("booking_patient_exists", {}) == \
         "Needs review: patient already in Stride, book by hand"

@@ -10,6 +10,7 @@ from ..providers import ProviderClients, ProviderError
 from ..retry import retry_delay_seconds
 from ..usage_report import record_test_usage
 from ..vapi_contract import extract_vapi_context, outcome_from_ended_reason
+from .hang_up_booking import book_confirmed_time_after_hang_up
 from .lead_status import apply_call_outcome
 from .review import flag_lead_for_review
 from .sheet_sync import dashboard_call_link, enqueue_sheet_update
@@ -339,27 +340,96 @@ def _call_turns(message: dict) -> list[tuple[str, str]]:
     return turns
 
 
-def _patient_replied_after(message: dict, *, introduction: bool) -> bool:
-    """Whether the patient said anything after Sarah's first line, or - with
-    introduction=True - said more than a yes after she said why she was calling
-    (her first line that names Rausch). "Yes" to "Am I speaking with ...?" and
-    then silence is not an answer to anything, so it cannot be a refusal."""
+def _patient_lines(message: dict, *, introduction: bool) -> list[str]:
+    """What the patient said after Sarah's first line, or - with introduction=True - after she
+    said why she was calling (her first line that names Rausch)."""
     turns = _call_turns(message)
     bot_lines = [i for i, (role, _) in enumerate(turns) if role == "bot"]
     if not bot_lines:
-        return False
+        return []
     start = bot_lines[0]
     if introduction:
         start = next(
             (i for i in bot_lines if "rausch" in turns[i][1].lower()), bot_lines[0]
         )
-    replies = [words for role, words in turns[start + 1 :] if role == "user" and words.strip()]
+    return [words for role, words in turns[start + 1 :] if role == "user" and words.strip()]
+
+
+def _patient_replied_after(message: dict, *, introduction: bool) -> bool:
+    """Whether the patient said anything after Sarah's first line, or - with
+    introduction=True - said more than a yes after she said why she was calling.
+    "Yes" to "Am I speaking with ...?" and then silence is not an answer to
+    anything, so it cannot be a refusal."""
+    replies = _patient_lines(message, introduction=introduction)
     if not introduction:
         return bool(replies)
     # "Sure" to the introduction and then a hang-up is not a refusal either: the
     # summary has called exactly that "declined" (21 Oct, demo). A refusal needs
     # at least one reply that is more than a yes or a hello.
     return any(_words(reply) - _AGREEMENT_WORDS for reply in replies)
+
+
+# A "declined" from the post-call summary is accepted only when the patient's own lines contain
+# one of these (owner, 2026-10-27: never "declined" unless the patient actually said no). Demo
+# call 01a1795f: "Yep", "Yes", "Bone works for me" ("both work for me"), then a hang-up while
+# times were being checked; the summary invented "said they are all set" and the lead was closed.
+# Word-boundary, case-insensitive, apostrophes and punctuation ignored ("don't" = "dont"); a phrase
+# inside a question ("Is Thursday all set up?") does not count.
+REFUSAL_PHRASES = (
+    "not interested", "no thanks", "no thank you", "dont need", "do not need", "not now",
+    "not right now", "not at this time", "maybe later", "not really", "no longer",
+    "already have", "already found", "already got", "found someone else", "going somewhere else",
+    "going elsewhere", "not looking", "stop calling", "dont call", "do not call", "remove me",
+    "remove my number", "take me off", "cancel it",
+    "no im good", "nah im good", "im good thanks", "im good thank you", "im all good",
+    "no im fine", "im fine thanks", "im fine thank you", "no im okay", "were fine", "were good",
+    "ill pass", "changed my mind",
+    # Not when a time or a detail follows: "I'm all set for nine", "no need to call my wife",
+    # "I don't want Thursday", "I don't want to miss work".
+    r"all set(?! for\b)",
+    r"no need(?! to call my\b)",
+    (r"i (?:dont|do not) want(?! (?:to miss|on|that day|that time|the|mornings?|afternoons?|"
+     r"evenings?|early|late|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d)\b)"),
+)
+# A reply made only of these words is a plain "no" ("No.", "Nope", "No, no", "No. Bye."). It is a
+# refusal only as the answer to Sarah's / Elliot's introduction ("... from Rausch ... Do you have a
+# moment?"): a "no" to the clinic, a time or the booking confirmation means "not that one". "Stop"
+# alone and "I'm busy" are not refusals.
+_BARE_NO = frozenset({"no", "nope", "nah"})
+_BARE_NO_FILLER = frozenset({"uh", "um", "oh", "sorry", "bye", "goodbye", "thanks", "thank", "you"})
+_REFUSAL = re.compile(r"\b(?:" + "|".join(p.replace(" ", r"\s+") for p in REFUSAL_PHRASES) + r")\b")
+
+
+def _refusal_words(sentence: str) -> str:
+    # "No, thanks." -> "no thanks"; "don't" -> "dont".
+    return re.sub(r"[^a-z]+", " ", sentence.lower().replace("\u2019", "").replace("'", "")).strip()
+
+
+def _patient_refused(message: dict) -> bool:
+    """Whether the patient themselves said no after Sarah said why she was calling."""
+    turns = _call_turns(message)
+    bot_lines = [i for i, (role, words) in enumerate(turns) if role == "bot" and words.strip()]
+    if not bot_lines:
+        return False
+    intro = next((i for i in bot_lines if "rausch" in turns[i][1].lower()), bot_lines[0])
+    last_bot = intro
+    for i in range(intro + 1, len(turns)):
+        role, reply = turns[i]
+        if role == "bot":
+            if reply.strip():
+                last_bot = i
+            continue
+        if role != "user" or not reply.strip():
+            continue
+        whole = set(_refusal_words(reply).split())
+        if (last_bot == intro and "?" not in reply and whole & _BARE_NO
+                and whole <= _BARE_NO | _BARE_NO_FILLER):
+            return True
+        # Sentence by sentence, each with its own end mark: a question is never a refusal.
+        for sentence, mark in re.findall(r"([^.?!]+)([.?!]*)", reply):
+            if "?" not in mark and _REFUSAL.search(_refusal_words(sentence)):
+                return True
+    return False
 
 
 _AGREEMENT_WORDS = frozenset(
@@ -415,7 +485,7 @@ def _settle_from_structured_output(
     # Closing a lead is only allowed on the patient's own answer, which the
     # transcript shows or does not - an AI's reading of it is not enough.
     answered = (
-        _patient_replied_after(message, introduction=True)
+        _patient_refused(message)
         if status == "declined"
         else _patient_replied_after(message, introduction=False)
         if status in {"do_not_contact", "call_opt_out"}
@@ -496,11 +566,19 @@ def process_vapi_end_report(trace: WorkflowTrace, body: dict) -> str:
                 trace, lead_id=lead_id, event_id=int(event_id), outcome=outcome, source="webhook"
             )
         elif event["status"] in {"in_flight", "attempted"}:
-            # The tool never reported. Fall back to the structured output so a
-            # callback the patient was promised is not silently lost.
-            outcome = _settle_from_structured_output(
-                trace, message, lead_id=lead_id, event_id=int(event_id), call_id=call_id
+            # The patient said yes to "So that's ... Shall I book it?" and hung up before the
+            # booking tool ran: that yes is a booking (owner, 2026-10-27). Demo booking engine
+            # only; returns None (nothing done) otherwise.
+            outcome = book_confirmed_time_after_hang_up(
+                trace, message, _call_turns(message), lead_id=lead_id, event_id=int(event_id),
+                call_id=call_id,
             )
+            if outcome is None:
+                # The tool never reported. Fall back to the structured output so a
+                # callback the patient was promised is not silently lost.
+                outcome = _settle_from_structured_output(
+                    trace, message, lead_id=lead_id, event_id=int(event_id), call_id=call_id
+                )
             outcome_source = "webhook" if outcome else None
         else:
             raise ValueError("answered call report cannot settle this outreach event")

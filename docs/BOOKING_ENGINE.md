@@ -95,6 +95,56 @@ otherwise the default case type is used.
 Both always answer HTTP 200 with `{"results":[{"toolCallId","result"|"error"}]}`, one line. `error` is
 used only when the tool itself failed (no lead on the call, booking switched off, Stride down).
 
+## Yes, then a hang-up (owner, 2026-10-27)
+
+A "yes" to Elliot's confirmation books the visit even if the patient hangs up before the booking tool
+ran. The confirmation question is in `config/vapi_booking_assistant_prompt_confirm.md` (test assistant
+copy, step 3f2): "So that's [day] the [date] at [time] with [therapist first name] at our [clinic]
+office. Shall I book it?"
+
+`services/hang_up_booking.py` (`book_confirmed_time_after_hang_up`) runs from the end-of-call report
+(`delivery.process_vapi_end_report`) for an answered call whose event is unsettled, before the post-call
+summary.
+- Elliot's last line (the tool's own "One moment, please, while I ..." line ignored) must be a
+  confirmation: "(so) that's / that is ..." plus "shall / should / can I (go ahead and) book it / that
+  (for you)", "(do you) want me to book it" or "would you like me to book it". Case and punctuation
+  ignored.
+- The patient's first real reply decides, with farewells and filler dropped (bye, goodbye, thanks,
+  thank you, hello, I have to go, ma'am, sir, Elliot). Only yes words (yes, yeah, yep, sure, okay,
+  alright, absolutely, definitely, perfect, please, correct, great, fine, uh huh, mhm, let's do it,
+  book it, that works, sure thing, go for it, of course, go ahead, sounds good, please do, do it) ->
+  book. A yes word plus other words, no no / change / question word ("Yes, Tuesday at nine is fine")
+  -> Needs Review. After a yes, every later line is checked too (Vapi splits speech at pauses): a no,
+  change word or question there -> Needs Review, never a booking. A "but", a question or a trailing
+  "so" / "um" with a yes -> Needs Review. A no or change word (instead, actually, wait, another, let me
+  check, call you back, ...) in the first reply, or no yes word -> nothing happens, the cadence continues.
+  "No problem" is not a no; "why not" is a yes.
+- Whether the booking already ran is decided from the database: an appointment for the lead in booking /
+  scheduled / unknown (or booked elsewhere) -> nothing here. A `book_appointment` call in the report
+  (`artifact.messages` role `tool_calls` / `tool_call_result`, `artifact.messagesOpenAIFormatted`
+  `tool_calls`) is only logged: Vapi lists calls that never reached us when the patient hung up.
+- Practice booking enabled (production: never runs).
+- The spoken day / date / time / therapist must match exactly one slot this call was offered
+  (`slot_offers` by the Vapi call id); the name is the lead's (a missing last name from the reply to
+  "And what's your last name?", kept as spoken, e.g. "O'Brien", only when clear); Elliot checked the
+  birthday on file and the patient said yes.
+
+Then `book_slot` (voice_agent, call id, slot id, event id), so every normal rule applies. ALREADY_BOOKED /
+IN_PROGRESS with a booking now on the lead (two reports at once) -> that booking stands, no card. Anything
+else after a yes (a cut-short confirmation, a "maybe" reply, no single slot, no last name, birthday
+changed, TAKEN, any reply but BOOKED): the call settles `manual` and the lead goes to Needs Review, code
+`booking_said_yes`, Booking group: "Patient said yes to <day time> and hung up before the booking
+finished; book by hand", with the reason in plain words ("that time was no longer free"). A re-sent
+report books nothing more.
+
+Check it all before a deploy: `uv run --frozen python scripts/check_hangup_rule.py` (16 cases, PASS / FAIL,
+own throwaway Postgres on 127.0.0.1; see `../Hang-up-Booking-Tests.md`).
+
+A post-call summary's `declined` is applied only when the patient's own lines contain a refusal
+(`delivery.REFUSAL_PHRASES`; not inside a question), or a bare "no" / "nope" / "nah" as the answer to the
+introduction ("Do you have a moment?"). A bare "no" to the clinic, a time or the confirmation means "not
+that one". Otherwise the call counts as no answer and outreach goes on.
+
 ## Booking rules
 
 1. Hold the slot (unique index: two calls cannot hold one slot).

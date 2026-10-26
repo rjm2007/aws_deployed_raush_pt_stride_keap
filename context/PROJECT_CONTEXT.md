@@ -2646,3 +2646,67 @@ Booked when the booking worked (the booking wins over the end-of-call report).
   the lead's Activity title is the replaced / restarted reason, not "Closed, no response".
 - No migration. Older replaced leads in the database keep their old status until a one-off fix.
   Tests: `test_one_lead_per_phone_integration.py`.
+
+### 2026-10-27 — A "yes" to the booking confirmation books; "declined" needs a real no (owner-approved)
+Owner's rule: the patient says yes to Elliot's booking confirmation -> the visit is booked, even if they
+hang up a second later. No yes -> not booked and the cadence continues; never "declined" unless the
+patient actually said no.
+- Trigger (demo, call 01a1795f): "Yep", "Yeah", "Yes", "Bone works for me" ("both work for me"), then a
+  hang-up while Elliot checked times. No booking tool call. The post-call summary said `declined` ("said
+  they are all set", invented); "Bone works for me" passed the old "more than a yes" check, so the lead
+  was closed.
+- `delivery._settle_from_structured_output`: an extracted `declined` is applied only if the patient's
+  own lines after the introduction contain a refusal (`delivery.REFUSAL_PHRASES`: not interested, no
+  thanks, no thank you, all set, don't/do not need, no need, not now, no longer, already have/found/got,
+  not looking, stop calling, don't/do not call, remove me, take me off; or a reply that is just
+  no / nope / nah). Otherwise `no_answer` with "No answer from the patient; outreach continues."
+  do_not_contact / call_opt_out unchanged.
+- New `config/vapi_booking_assistant_prompt_confirm.md` (copy of the booking prompt for a separate test
+  assistant; not pushed to Vapi, main prompt unchanged): step 3f2 asks "So that's [day] the [date] at
+  [time] with [therapist first name] at our [clinic] office. Shall I book it?" after name and birthday;
+  yes -> book (3g), no / change -> choose a time again; never book before this yes (also a new time after
+  TAKEN). The happy-path example shows it.
+- New `services/hang_up_booking.py`, `book_confirmed_time_after_hang_up`, called by
+  `process_vapi_end_report` for an answered call whose event is unsettled, before the structured output.
+  It acts only when Elliot's last line is that confirmation and the patient's reply is a plain yes, the
+  report has no `book_appointment` tool call (`artifact.messages` role `tool_calls` /
+  `tool_call_result`, `artifact.messagesOpenAIFormatted` `tool_calls`), the lead has no booking
+  (booking / scheduled / unknown, or booked elsewhere) and the practice has booking enabled (production:
+  no-op). The time must match exactly one slot this call was offered (`slot_offers` by Vapi call id:
+  weekday / date / time / therapist from the confirmation line); name from the lead (a missing last name
+  from the reply to "And what's your last name?" only when clear); the birthday on file only if Elliot
+  checked it and the patient said yes. Then `slot_booking.book_slot` (voice_agent, the call id, slot id,
+  the event id), so the normal hold / live re-check / Stride / mark_booked / text / Keap path runs.
+  Otherwise (no single slot, no last name, birthday changed, TAKEN, any non-BOOKED reply) the event
+  settles `manual` and the lead goes to Needs Review, code `booking_said_yes` (Booking group, front desk
+  only): "Patient said yes to <day time> and hung up before the booking finished; book by hand" (not
+  added when book_slot already flagged it, e.g. UNCONFIRMED). A re-sent report finds the event settled
+  (and the booking) and books nothing.
+- No migration. Tests: `test_hang_up_booking_integration.py` (new, local Postgres + fake Stride),
+  `test_delivery.py` (refusal list, demo transcript, confirmation / slot matching, tool-call detection,
+  last name), `test_lead_review.py` (card).
+- Tester follow-ups (same day): (1) the patient's first reply after the confirmation decides, farewells
+  dropped ("Yes. Bye." books; uh huh, mhm, let's do it, book it, that works, sure thing, go for it, of
+  course, ma'am / sir accepted); a yes with other words but no no / change / question -> Needs Review,
+  never nothing. (2) Confirmation wording: "that is", no "so", "should / can I (go ahead and) book it /
+  that (for you)", "want me to", "would you like me to"; a line cut short but naming a time -> Needs
+  Review. The tool's waiting line after a logged tool call is skipped. (3) A bare "no" declines only as
+  the answer to the introduction; refusal phrases inside a question do not count. (4) More refusals: no
+  I'm good, I'm good thanks, I'll pass, not right now, not at this time, maybe later, I don't want,
+  changed my mind, we're fine, I'm fine thanks, no I'm fine / okay. (5) ALREADY_BOOKED / IN_PROGRESS from
+  book_slot with a booking now on the lead -> kept, no card, call settled booked. (6) "Already booked"
+  is decided from the database only (any booking / scheduled / unknown appointment for the lead); the
+  report's tool calls are a log hint (Vapi logs calls that never reached us). (7) Last name kept as
+  spoken ("O'Brien"); card reasons in plain words. (8) Prompt copy: TAKEN / NOT_AVAILABLE re-pick asks
+  the 3f2 confirmation first; the confirmation is exempt from "never repeat a sentence".
+- Tester round 2 (same day): after a first-reply yes every later patient line is checked too (Vapi splits
+  speech at pauses: "Yes." + "Wait, actually make it eleven." -> review, not booked; farewells still fine);
+  "why not", "no problem" (not a no), "I'll take it", "sounds great" read as yes, a leading "Hello?" is
+  dropped; "let me check / think / ask", "call you back" -> nothing (cadence continues); a yes with "but",
+  a question or a trailing "so" / "um" -> review. A line with another question (an offer "Would that
+  work?", the birthday check) is never a cut-short confirmation. Refusals added: nah I'm good, I'm all
+  good, not really, remove my number, going somewhere else / elsewhere, found someone else, cancel it;
+  "all set for <time>", "no need to call my ...", "I don't want <day / time / to miss>" are not refusals;
+  "No. Bye." / "No, sorry." to the introduction are. New `scripts/check_hangup_rule.py`: the owner's
+  one-command PASS / FAIL check of 16 cases on a throwaway local Postgres (see
+  `../Hang-up-Booking-Tests.md`).

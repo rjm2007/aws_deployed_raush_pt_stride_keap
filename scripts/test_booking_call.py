@@ -132,6 +132,8 @@ def main() -> None:
     parser.add_argument("--case", default="Physical Therapy")
     parser.add_argument("--dob", default="1990-01-15", help="YYYY-MM-DD, stored on the lead")
     parser.add_argument("--keep", action="store_true", help="keep the test lead afterwards")
+    parser.add_argument("--assistant", default=NEW_ASSISTANT,
+                        help="Vapi assistant id to call with (default: the booking assistant)")
     args = parser.parse_args()
     if not re.fullmatch(r"\+\d{8,15}", args.phone):
         sys.exit("--phone must be in E.164 form, for example +919876543210")
@@ -147,7 +149,7 @@ def main() -> None:
     print(f"Test lead {lead_id} created.")
     try:
         call = vapi(settings, "POST", "/call", json={
-            "assistantId": NEW_ASSISTANT,
+            "assistantId": args.assistant,
             "phoneNumberId": phone_number_id or settings.vapi_phone_number_id,
             "customer": {"number": args.phone},
             "assistantOverrides": {"variableValues": {

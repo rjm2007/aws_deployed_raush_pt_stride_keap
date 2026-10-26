@@ -75,6 +75,9 @@ GROUP_OF = {
     "booking_existing_appointment": "booking",
     "booking_not_recorded": "booking",
     "booking_failed": "booking",
+    # The patient said yes to the booking confirmation and hung up before it was booked, and the
+    # backend could not book it (owner, 2026-10-27; services/hang_up_booking.py).
+    "booking_said_yes": "booking",
     "notification_unconfirmed": "technical",
     "other": "other",
 }
@@ -123,6 +126,7 @@ TITLES = {
     "booking_existing_appointment": "Stride already has an appointment",
     "booking_not_recorded": "Booked in Stride, not recorded here",
     "booking_failed": "Booking did not go through",
+    "booking_said_yes": "Patient said yes, then hung up",
     "notification_unconfirmed": "Booking text not confirmed",
     "other": "Needs review",
 }
@@ -265,6 +269,8 @@ def sheet_open_status(code: str | None, details: dict | None) -> str:
             "stride", "Stride")
     if code == "booking_failed":
         return "Needs review: booking did not go through"
+    if code == "booking_said_yes":
+        return "Needs review: patient said yes to a time, book by hand"
     if code == "booking_patient_exists":
         return "Needs review: patient already in Stride, book by hand"
     if group == "booking":
@@ -496,6 +502,13 @@ def _plain_reason(row: dict, lead: dict) -> str:
         return (f"This lead was booked, but the appointment {what} in Stride. Outreach stays stopped "
                 "until staff choose. If Stride's next file shows a new appointment, the lead is "
                 "marked Booked again by itself.")
+    if code == "booking_said_yes":
+        when = f" to {details['confirmed']}" if details.get("confirmed") else ""
+        why = f" ({details['why']})" if details.get("why") else ""
+        return (f"The patient said yes{when} and hung up before the booking agent could book it. "
+                f"It could not be booked automatically{why}: call the patient and book by hand. "
+                "Calls and texts stay stopped. If Stride's next file shows an appointment, the lead "
+                "is marked Booked and this review closes by itself.")
     if code == "booking_failed" and details.get("on_call"):
         # Owner, 2026-10-26: every booking that fails on the call comes here, never "we'll text you".
         why = f" ({details['why']})" if details.get("why") else ""
