@@ -48,11 +48,11 @@ from ..services.review import (
     restore_pause_skipped,
     skip_remaining_planned,
 )
-from ..services.sheet_direct import label_result
+from ..services.sheet_direct import label_result, pt_clock
 from ..services.sheet_sync import enqueue_sheet_update
 from ..services.stride_sync_status import stride_sync_status
 from ..services.twilio_service import TwilioService
-from ..worker import format_phone, materialize_cadence
+from ..worker import format_phone, materialize_cadence, next_due_soon
 
 router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
 Actor = Annotated[DashboardActor, Depends(require_dashboard_auth)]
@@ -1432,6 +1432,10 @@ def delete_dashboard_lead(lead_id: UUID, actor: Actor):
     return {"deleted": str(lead_id), "cascaded_events": events, **removed}
 
 
+BOARD_BUSY_DETAIL = "A call or text is going out right now. Move it to New again in a minute."
+BOARD_DUE_DETAIL = "A call or text is due in the next few minutes. Move it to New again after {time}."
+
+
 @router.post("/leads/{lead_id}/stage")
 def move_lead_stage(lead_id: UUID, payload: StageMove, actor: Actor):
     """Move a lead between board columns.
@@ -1474,6 +1478,18 @@ def move_lead_stage(lead_id: UUID, payload: StageMove, actor: Actor):
             if lead["call_opt_out"] and lead["sms_opt_out"]:
                 raise HTTPException(
                     status_code=409, detail="this lead has opted out of every channel"
+                )
+            # The same guard as a Sheet Restart (owner, 2026-10-26): a step going out now or due
+            # within minutes would ring the patient twice (the old step and the new Day 0).
+            if conn.execute(
+                "select 1 from outreach_events where lead_id=%s "
+                "and status in ('in_flight','attempted') limit 1",
+                (lead_id,),
+            ).fetchone():
+                raise HTTPException(status_code=409, detail=BOARD_BUSY_DETAIL)
+            if due_retry := next_due_soon(conn, str(lead_id)):
+                raise HTTPException(
+                    status_code=409, detail=BOARD_DUE_DETAIL.format(time=pt_clock(due_retry))
                 )
             # 'planned' and 'skipped' both mean nothing was ever sent, so neither
             # is history worth keeping. Anything dispatched stays untouched.

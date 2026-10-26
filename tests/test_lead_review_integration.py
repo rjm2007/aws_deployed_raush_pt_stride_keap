@@ -16,7 +16,12 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg.types.json import Jsonb
-from test_sheet_direct_integration import _phone, env  # noqa: F401 - the shared Sheet fixture
+from test_sheet_direct_integration import (  # noqa: F401 - the shared Sheet fixture
+    _due_guard_on,
+    _one_step_due_in,
+    _phone,
+    env,
+)
 
 from rpt_agent.api import app
 from rpt_agent.config import get_settings
@@ -1419,3 +1424,46 @@ def test_a_finished_cadence_shows_in_the_activity(review_env):
     assert entry["actor_name"] == "System"
     assert entry["details"]["reason"] == "cadence finished with no response"
     assert entry["details"]["to"] == "closed_no_response"
+
+
+# --- a restart never races a step about to go out (owner, 2026-10-26) ------------------------------
+
+
+def test_a_refused_restart_because_a_call_is_due_shows_in_the_activity(review_env, monkeypatch):
+    senv = review_env
+    _due_guard_on(monkeypatch)
+    number, lead_id = _started(senv)
+    _one_step_due_in(senv.db, lead_id, 120)
+    senv.sheet.set(number, "action", "Restart cadence")
+    senv.tick()
+    titles = [e["title"] for e in _get(f"leads/{lead_id}").json()["activity"]]
+    assert any(t.startswith("Restart cadence refused: a call or text is due in the next few minutes. "
+                            "Pick Restart cadence again after ") for t in titles), titles
+
+
+@pytest.mark.parametrize(("seconds", "refused"), [(180, True), (360, False)])
+def test_moving_a_card_to_new_waits_while_a_call_is_due(review_env, monkeypatch, seconds, refused):
+    senv = review_env
+    _due_guard_on(monkeypatch)
+    _, lead_id = _started(senv)
+    step = _one_step_due_in(senv.db, lead_id, seconds)
+    moved = _post(f"leads/{lead_id}/stage", {"stage": "new"})
+    if refused:
+        clock = sheet_direct.pt_clock(step["scheduled_for"] + timedelta(minutes=5))
+        assert moved.status_code == 409
+        assert moved.json()["detail"] == (
+            f"A call or text is due in the next few minutes. Move it to New again after {clock}.")
+        assert senv.db.execute("select status from outreach_events where id=%s",
+                               (step["id"],)).fetchone()["status"] == "planned"
+    else:
+        assert moved.status_code == 200
+
+
+def test_moving_a_card_to_new_waits_while_a_call_is_going_out(review_env):
+    senv = review_env
+    _, lead_id = _started(senv)
+    senv.db.execute("update outreach_events set status='attempted' where id=(select min(id) from "
+                    "outreach_events where lead_id=%s)", (lead_id,))
+    moved = _post(f"leads/{lead_id}/stage", {"stage": "new"})
+    assert moved.status_code == 409
+    assert moved.json()["detail"] == "A call or text is going out right now. Move it to New again in a minute."

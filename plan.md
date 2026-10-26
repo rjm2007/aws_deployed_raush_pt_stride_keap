@@ -165,6 +165,7 @@ Main responses:
 | 409 `lead_already_exists` | Blank-ID row uses a phone already present in the practice |
 | 409 `outreach_unresolved` | Restart while a call or text is still going out. Direct mode Sheet text: `Error: a call or text is going out right now. Pick Restart cadence again in a minute.` |
 | 409 `restart_needs_review` / `restart_booked` / `restart_closed` | Direct mode only (`sheet_rules`, 2026-10-25): Restart on a lead in review, booked, or closed by a decision (`closed_reason`). Sheet texts in section 5 |
+| 409 `outreach_due_soon` | Restart while a call or text is due: one the worker would send now, or one due within 5 minutes (30 s for TEST_MODE test leads), 2026-10-26; body has `retry_at` (due time, or now if late, + that window). Direct mode Sheet text: `Error: a call or text is due in the next few minutes. Pick Restart cadence again after 3:52 PM PT.` |
 | 409 `restart_too_soon` | Restart within 10 minutes of the last Sheet restart; body has `retry_at` (ISO time a new Restart is accepted). Direct mode Sheet text: `Error: restarted less than 10 minutes ago. Pick Restart cadence again after 3:52 PM PT.` (Pacific) |
 | 200 `already_booked` | Blank-ID row is the same person (phone + name + birthday) as a lead already booked; no new lead, no calls, `lead_id` empty (Sheet shows `Already booked`) |
 | 409 `name_changed_needs_review` | Linked row's name differs from its database lead |
@@ -310,6 +311,8 @@ states and inbound replies. These endpoints update Supabase first; they never ca
      cadence that only ran out (Closed, no response; booking link sent; transferred) still restarts from the
      Sheet (2026-10-20).
    - `Error: a call or text is going out right now. Pick Restart cadence again in a minute.`
+   - `Error: a call or text is due in the next few minutes. Pick Restart cadence again after <h:mm AM/PM> PT.`
+     (2026-10-26: a step due within 5 minutes, 30 s for test leads; time = due time + that window, rounded up)
    - `Error: restarted less than 10 minutes ago. Pick Restart cadence again after <h:mm AM/PM> PT.` (the 10
      minutes count from the last restart, from the Sheet or from a review card)
    - `Error: this row already has a lead. Pick Restart cadence to start the calls again.` (Start cadence on a

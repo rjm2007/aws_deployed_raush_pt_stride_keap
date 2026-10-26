@@ -855,3 +855,17 @@ def test_restart_too_soon_time_rounds_up_to_the_next_minute(retry_at, clock):
     text = sheet_direct._refusal_text({"code": "restart_too_soon", "retry_at": retry_at})
     assert text == ("Error: restarted less than 10 minutes ago. "
                     f"Pick Restart cadence again after {clock}.")
+
+
+@pytest.mark.parametrize(("retry_at", "clock"), [
+    ("2026-10-26T22:05:20+00:00", "3:06 PM PT"),  # call due 3:00:20 PM + 5 minutes -> rounded up
+    ("2026-10-26T22:05:00+00:00", "3:05 PM PT"),
+    ("2026-10-26T21:59:59.5+00:00", "3:00 PM PT"),
+])
+def test_a_restart_refused_for_a_due_call_says_when_to_pick_it_again(retry_at, clock):
+    # Owner 2026-10-26: a call or text due within 5 minutes (30 s for test leads) refuses a Restart.
+    body = {"code": "outreach_due_soon", "retry_at": retry_at}
+    assert sheet_direct._refusal_text(body) == (
+        f"Error: a call or text is due in the next few minutes. Pick Restart cadence again after {clock}.")
+    outcome = sheet_direct.label_result(ActionExecution(409, {**body, "detail": "x", "lead_id": "L1"}))
+    assert outcome.status == sheet_direct._refusal_text(body)

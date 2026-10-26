@@ -2530,3 +2530,22 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
 - Dashboard: Booked cards are not draggable and show a hint; a 409 still shows its detail.
 - No migration. Tests: `test_demo_review_integration.py` (board moves refused for every column, DNC allowed,
   Stride cancel still reviews), `test_dashboard.py`, `test_sheet_direct*.py`.
+
+### 2026-10-26 — Restart waits while a call or text is due (owner-approved)
+- A Sheet Restart picked in the same seconds a cadence call was being claimed gave the patient two calls 30 s
+  apart (the old Day-5 call, then the new Day 0). Restart already refused while a step was in flight.
+- Now a restart is also refused while a step for the lead is due soon (`worker.next_due_soon`): one the worker
+  would send right now (the same rules as `CLAIM_SQL`, whose eligibility is now `ELIGIBLE_SQL`, shared, SQL
+  unchanged), or a planned step of an active lead due within 5 minutes (30 seconds for TEST_MODE test leads).
+  A step held back (outside calling hours, paused, in review, a daily limit) never blocks a restart.
+- Sheet Restart (both modes, `_restart_cadence`): 409 `outreach_due_soon` with `retry_at` = step time (now, if
+  late) + the window. Sheet text: "Error: a call or text is due in the next few minutes. Pick Restart cadence
+  again after <h:mm AM/PM> PT." (rounded up to the minute, as the cooldown text). Action empties; Activity shows
+  "Restart cadence refused: …". Checked after the in-flight and 10-minute checks, so those keep their words.
+- Board move to New: now refused while a step is in flight ("A call or text is going out right now. Move it to
+  New again in a minute.") or due soon ("… Move it to New again after <time> PT.").
+- Not changed: review-card restarts (a lead in review is never claimed, so nothing can be due) and the
+  unblock restart (a blocked number is never claimed).
+- No migration. Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`,
+  `test_lead_review_integration.py` (the shared Sheet fixture switches the check off for other tests: no worker
+  runs there, so Day 0 would stay due in calling hours).

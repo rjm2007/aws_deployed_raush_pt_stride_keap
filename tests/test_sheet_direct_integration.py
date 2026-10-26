@@ -13,12 +13,14 @@ import psycopg
 import pytest
 from fake_sheet import FakeSheet
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
-from rpt_agent import sheet_sync_worker
+from rpt_agent import sheet_sync_worker, worker
 from rpt_agent.config import get_settings
 from rpt_agent.db import get_pool
 from rpt_agent.observability import WorkflowTrace
-from rpt_agent.services import sheet_direct
+from rpt_agent.routes import dashboard as dashboard_routes
+from rpt_agent.services import lead_actions, sheet_direct
 from rpt_agent.services.google_sheet import parse_grid
 from rpt_agent.services.lead_actions import execute_lead_action
 from rpt_agent.services.sheet_sync import enqueue_sheet_update
@@ -42,6 +44,11 @@ def env(monkeypatch):
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
     get_pool.cache_clear()
+    # A restart is refused while a step is due within minutes (2026-10-26). No worker runs here, so
+    # Day 0 would stay due in calling hours and other tests would depend on the clock: off here,
+    # the due-soon tests switch it back on (_due_guard_on).
+    monkeypatch.setattr(lead_actions, "next_due_soon", lambda conn, lead_id: None)
+    monkeypatch.setattr(dashboard_routes, "next_due_soon", lambda conn, lead_id: None)
     monkeypatch.setattr(sheet_sync_worker, "_direct_state",
                         {"last_full": 0.0, "archived_on": None, "settle": None, "profiles": None})
     conn = psycopg.connect(url, row_factory=dict_row, autocommit=True)
@@ -358,6 +365,106 @@ def test_a_restart_while_a_call_is_going_out_says_to_pick_it_again(env):
     env.tick()
     assert env.cell(number, "outcome_status") == "Cadence restarted"
 
+
+
+# --- a restart never races a step about to go out (owner, 2026-10-26) ------------------------------
+# A Restart picked the same seconds a Day-5 call was claimed rang the patient twice, 30 s apart.
+
+DUE_SOON = "Error: a call or text is due in the next few minutes. Pick Restart cadence again after {}."
+
+
+def _due_guard_on(monkeypatch):
+    monkeypatch.setattr(lead_actions, "next_due_soon", worker.next_due_soon)
+    monkeypatch.setattr(dashboard_routes, "next_due_soon", worker.next_due_soon)
+
+
+def _one_step_due_in(db, lead_id, seconds):
+    """Nothing due for a day except one step, due in `seconds` (negative: already late)."""
+    db.execute("update outreach_events set scheduled_for=now()+interval '1 day' "
+               "where lead_id=%s and status='planned'", (lead_id,))
+    return db.execute(
+        "update outreach_events set scheduled_for=now()+make_interval(secs=>%s) where id=(select id "
+        "from outreach_events where lead_id=%s and status='planned' order by id limit 1) "
+        "returning id,scheduled_for", (seconds, lead_id)).fetchone()
+
+
+def _restart_row(env, number):
+    env.sheet.set(number, "action", "Restart cadence")
+    env.tick()
+    assert env.cell(number, "action") == ""  # Action empties either way
+    return env.cell(number, "outcome_status")
+
+
+@pytest.mark.parametrize(("seconds", "refused"), [(180, True), (360, False)])
+def test_a_restart_waits_while_a_call_is_due_within_five_minutes(env, monkeypatch, seconds, refused):
+    _due_guard_on(monkeypatch)
+    number = env.start_row()
+    env.tick()
+    lead_id = env.cell(number, "lead_id")
+    step = _one_step_due_in(env.db, lead_id, seconds)
+    status = _restart_row(env, number)
+    if refused:
+        # The time to pick again: the step's time + 5 minutes, rounded up to the minute.
+        assert status == DUE_SOON.format(sheet_direct.pt_clock(step["scheduled_for"] + timedelta(minutes=5)))
+        assert _requests(env, lead_id, "restart_cadence") == 0
+        kept = env.db.execute("select status,scheduled_for from outreach_events where id=%s",
+                              (step["id"],)).fetchone()
+        assert (kept["status"], kept["scheduled_for"]) == ("planned", step["scheduled_for"])
+    else:
+        assert status == "Cadence restarted"
+
+
+@pytest.mark.parametrize(("seconds", "refused"), [(20, True), (40, False)])
+def test_a_test_lead_restart_waits_only_thirty_seconds(env, monkeypatch, seconds, refused):
+    _due_guard_on(monkeypatch)
+    number = env.start_row()
+    env.tick()
+    lead_id = env.cell(number, "lead_id")
+    monkeypatch.setenv("TEST_MODE", "true")
+    get_settings.cache_clear()
+    env.db.execute("update leads set is_test=true where id=%s", (lead_id,))
+    step = _one_step_due_in(env.db, lead_id, seconds)
+    status = _restart_row(env, number)
+    if refused:
+        assert status == DUE_SOON.format(sheet_direct.pt_clock(step["scheduled_for"] + timedelta(seconds=30)))
+    else:
+        assert status == "Cadence restarted"
+
+
+@pytest.mark.parametrize(("open_now", "refused"), [(True, True), (False, False)])
+def test_a_late_step_blocks_a_restart_only_if_the_worker_would_send_it_now(env, monkeypatch, open_now,
+                                                                           refused):
+    # Late and sendable (in calling hours): the worker takes it any second. Late but held (outside
+    # calling hours here) must not block a restart until it goes out.
+    _due_guard_on(monkeypatch)
+    day = {"open": "00:00", "close": "23:59"} if open_now else None
+    env.db.execute("update practice_settings set business_hours=%s where practice_id=%s",
+                   (Jsonb({str(d): day for d in range(1, 8)}), env.practice_id))
+    number = env.start_row()
+    env.tick()
+    lead_id = env.cell(number, "lead_id")
+    _one_step_due_in(env.db, lead_id, -60)
+    before = datetime.now(UTC)
+    status = _restart_row(env, number)
+    if refused:
+        # Due now, so: now + 5 minutes.
+        assert status in {DUE_SOON.format(sheet_direct.pt_clock(before + timedelta(minutes=5, seconds=s)))
+                          for s in (0, 30, 60)}
+    else:
+        assert status == "Cadence restarted"
+
+
+def test_a_restart_while_a_call_is_going_out_keeps_its_own_words(env, monkeypatch):
+    _due_guard_on(monkeypatch)
+    number = env.start_row()
+    env.tick()
+    lead_id = env.cell(number, "lead_id")
+    step = _one_step_due_in(env.db, lead_id, 60)
+    env.db.execute("update outreach_events set status='attempted' where lead_id=%s and status='planned' "
+                   "and id<>%s and id=(select min(id) from outreach_events where lead_id=%s and id<>%s)",
+                   (lead_id, step["id"], lead_id, step["id"]))
+    assert _restart_row(env, number) == (
+        "Error: a call or text is going out right now. Pick Restart cadence again in a minute.")
 
 def test_a_restart_with_another_phone_in_the_row_is_refused_and_emptied(env):
     number = env.start_row()
