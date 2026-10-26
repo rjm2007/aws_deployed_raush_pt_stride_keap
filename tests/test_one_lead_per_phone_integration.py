@@ -74,6 +74,10 @@ def test_board_new_on_the_oldest_row_closes_the_newer_lead_as_restarted(phone_en
     newest = senv.lead(new_id)
     assert (newest["cadence_state"], newest["status_reason"]) == ("terminated", RESTARTED_REASON)
     assert newest["needs_review"] is False
+    # A replaced lead shows as Closed (owner, 2026-10-26), on the board and in the Sheet.
+    assert newest["status"] == "closed_no_response"
+    assert _get(f"leads/{new_id}").json()["lead"]["stage"] == "closed"
+    assert senv.cell(new, "lead_status") == "Closed"
     assert senv.db.execute("select resolution from lead_reviews where lead_id=%s",
                            (new_id,)).fetchone()["resolution"] == "replaced"
     assert senv.cell(new, "outcome_status") == RESTARTED_ROW
@@ -101,6 +105,8 @@ def test_board_in_cadence_takes_the_number_too(phone_env):
     assert _active(senv, phone) == [old_id]
     assert senv.lead(new_id)["status_reason"] == RESTARTED_REASON
     assert senv.cell(new, "outcome_status") == RESTARTED_ROW
+    assert senv.lead(new_id)["status"] == "closed_no_response"
+    assert senv.cell(new, "lead_status") == "Closed"
 
 
 def test_sheet_restart_of_an_older_row_closes_the_newer_lead_as_restarted(phone_env):
@@ -164,3 +170,50 @@ def test_a_new_row_still_says_a_newer_row(phone_env):
     assert _active(senv, phone) == [new_id]
     assert senv.lead(old_id)["status_reason"] == REPLACED_REASON
     assert senv.cell(old, "outcome_status") == NEWER_ROW
+    # It used to keep "In cadence" after its calls had ended.
+    assert senv.lead(old_id)["status"] == "closed_no_response"
+    assert senv.cell(old, "lead_status") == "Closed"
+    lead = _get(f"leads/{old_id}").json()["lead"]
+    assert (lead["stage"], lead["next_step"]) == (
+        "closed", "Replaced: a newer Sheet row has this phone number")
+
+
+def test_a_replaced_lead_in_callback_or_review_closes(phone_env):
+    senv = phone_env
+    phone = _phone()
+    first = senv.start_row(phone=phone, name="Ana One")
+    senv.tick()
+    first_id = senv.cell(first, "lead_id")
+    senv.db.execute("update leads set status='callback_scheduled' where id=%s", (first_id,))
+    second = senv.start_row(phone=phone, name="Ana Two")
+    senv.tick()
+    senv.tick()
+    second_id = senv.cell(second, "lead_id")
+    assert senv.lead(first_id)["status"] == "closed_no_response"
+    history = senv.db.execute(
+        "select from_status,to_status from lead_status_history where lead_id=%s and reason=%s",
+        (first_id, REPLACED_REASON)).fetchone()
+    assert (history["from_status"], history["to_status"]) == ("callback_scheduled",
+                                                              "closed_no_response")
+    # A lead in Needs Review (status needs_attention) leaves that column too.
+    senv.db.execute("update leads set status='needs_attention',needs_review=true where id=%s",
+                    (second_id,))
+    assert _post(f"leads/{first_id}/stage", {"stage": "new"}).status_code == 200
+    senv.tick()
+    assert senv.lead(second_id)["status"] == "closed_no_response"
+    assert _get(f"leads/{second_id}").json()["lead"]["stage"] == "closed"
+    assert senv.cell(second, "lead_status") == "Closed"
+
+
+def test_a_booked_lead_keeps_booked_when_a_new_row_takes_the_number(phone_env):
+    senv = phone_env
+    phone = _phone()
+    old = senv.start_row(phone=phone, name="Ana Booked")
+    senv.tick()
+    old_id = senv.cell(old, "lead_id")
+    assert _post(f"leads/{old_id}/stage", {"stage": "booked"}).status_code == 200
+    senv.start_row(phone=phone, name="Ana Again")
+    senv.tick()
+    lead = senv.lead(old_id)
+    assert (lead["status"], lead["cadence_state"]) == ("booked", "completed")
+    assert lead["status_reason"] != REPLACED_REASON
