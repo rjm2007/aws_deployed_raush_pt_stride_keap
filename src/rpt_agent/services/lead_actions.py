@@ -11,7 +11,7 @@ from psycopg.types.json import Jsonb
 
 from ..config import get_settings
 from ..db import transaction
-from ..worker import format_phone, materialize_cadence
+from ..worker import format_phone, materialize_cadence, next_due_soon
 from .lead_review import (
     DETAIL_FIELDS,
     FRONT_DESK_REASON,
@@ -40,7 +40,7 @@ NUMBER_BLOCKED_REASON = "Number blocked: this number asked not to be contacted. 
 # undoes a decision made on the dashboard. A lead in review is restarted from its review card; a
 # booked or closed lead is reopened on the dashboard. (n8n mode keeps the old rules.)
 RESTART_REVIEW_DETAIL = "This lead needs review. Resolve it on the dashboard; you can restart it from there."
-RESTART_BOOKED_DETAIL = "This lead is booked. Reopen it on the dashboard if needed."
+RESTART_BOOKED_DETAIL = "This lead is booked. To start again, cancel the visit in Stride, or add a new row."
 RESTART_CLOSED_DETAIL = "This lead is closed ({why}). Use the dashboard."
 
 
@@ -504,6 +504,16 @@ def _restart_cadence(
             f"Cadence was already restarted in the last {RESTART_COOLDOWN_MINUTES} minutes",
             lead_id=str(lead_id),
             extra={"retry_at": (last + timedelta(minutes=RESTART_COOLDOWN_MINUTES)).isoformat()},
+        )
+    # A call or text about to go out (owner, 2026-10-26): restarting now could ring the patient
+    # twice (the old step and the new Day 0). retry_at = due time + the window.
+    if due_retry := next_due_soon(conn, str(lead_id)):
+        raise LeadActionError(
+            409,
+            "outreach_due_soon",
+            "A call or text is due in the next few minutes; restart after it goes out",
+            lead_id=str(lead_id),
+            extra={"retry_at": due_retry.isoformat()},
         )
     if lead_data:
         _update_lead_profile(conn, lead_id, lead_data)

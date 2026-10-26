@@ -103,6 +103,10 @@ LEGACY_WAIT_HINT = "; resolve it on the dashboard first, then the restart runs"
 # Refusals staff can act on (owner, 2026-10-25): the row says what to do, and Action is empty again,
 # so picking the command again is the retry.
 OUTREACH_BUSY = "Error: a call or text is going out right now. Pick Restart cadence again in a minute."
+# A step due within 5 minutes (30 s for TEST_MODE test leads), owner 2026-10-26.
+OUTREACH_DUE_SOON = "Error: a call or text is due in the next few minutes. Pick Restart cadence again after {time}."
+OUTREACH_DUE_SOON_NO_TIME = ("Error: a call or text is due in the next few minutes. Pick Restart "
+                             "cadence again in a few minutes.")
 TOO_SOON = "Error: restarted less than {minutes} minutes ago. Pick Restart cadence again after {time}."
 TOO_SOON_NO_TIME = ("Error: restarted less than {minutes} minutes ago. Pick Restart cadence again "
                     "in {minutes} minutes.")
@@ -110,7 +114,7 @@ TOO_SOON_NO_TIME = ("Error: restarted less than {minutes} minutes ago. Pick Rest
 # a dashboard decision, and a lead in review is restarted from its review card.
 REVIEW_REFUSED = ("Error: this lead needs review. Resolve it on the dashboard; you can restart it "
                   "from there.")
-BOOKED_REFUSED = "Error: this lead is booked. Reopen it on the dashboard if needed."
+BOOKED_REFUSED = "Error: this lead is booked. To start again, cancel the visit in Stride, or add a new row."
 CLOSED_REFUSED = "Error: this lead is closed ({why}). Use the dashboard."
 # Start cadence on a row that already has a Lead ID would create nothing (the phone is taken): it was
 # ignored without a word; now Action empties, so the row says why.
@@ -511,6 +515,14 @@ def label_result(result: ActionExecution) -> Outcome:
     return Outcome("Error: " + str(detail or "request rejected")[:180], None, lead_id)
 
 
+def pt_clock(at: datetime) -> str:
+    """'3:07 PM PT', rounded up to the minute: picking at the shown minute is accepted."""
+    at = at.astimezone(SHEET_TZ)
+    if at.second or at.microsecond:
+        at = at.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    return at.strftime("%I:%M %p").lstrip("0") + " PT"
+
+
 def _refusal_text(body: dict[str, Any]) -> str | None:
     """Sheet words for a refusal staff fix by picking the command again later (owner, 2026-10-25)."""
     from .lead_actions import RESTART_COOLDOWN_MINUTES
@@ -524,15 +536,17 @@ def _refusal_text(body: dict[str, Any]) -> str | None:
         return BOOKED_REFUSED
     if code == "restart_closed":
         return CLOSED_REFUSED.format(why=body.get("closed_reason") or "closed on the dashboard")
-    if code != "restart_too_soon":
+    if code not in ("restart_too_soon", "outreach_due_soon"):
         return None
     try:
-        retry_at = datetime.fromisoformat(str(body.get("retry_at"))).astimezone(SHEET_TZ)
+        retry_at = datetime.fromisoformat(str(body.get("retry_at")))
     except ValueError:  # a refusal stored before retry_at was sent
+        if code == "outreach_due_soon":
+            return OUTREACH_DUE_SOON_NO_TIME
         return TOO_SOON_NO_TIME.format(minutes=RESTART_COOLDOWN_MINUTES)
-    if retry_at.second or retry_at.microsecond:  # round up: picking at the shown minute is accepted
-        retry_at = retry_at.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    clock = retry_at.strftime("%I:%M %p").lstrip("0") + " PT"
+    clock = pt_clock(retry_at)
+    if code == "outreach_due_soon":
+        return OUTREACH_DUE_SOON.format(time=clock)
     return TOO_SOON.format(minutes=RESTART_COOLDOWN_MINUTES, time=clock)
 
 

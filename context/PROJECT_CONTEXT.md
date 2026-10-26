@@ -2542,3 +2542,71 @@ Booked when the booking worked (the booking wins over the end-of-call report).
   card says the patient was told the front desk will reach out. (5) `config/vapi_booking_tools.json`
   book_appointment description (local only, not pushed): IN_PROGRESS → call again with the same details, at
   most twice.
+
+### 2026-10-26 — Calendar redesign phase 1: backend data (owner-approved)
+- The Appointments page is being rebuilt to look like Stride's calendar, view only. Phase 1 adds the data;
+  no UI yet. Elliot books in Stride as pending and Stride's 5-minute export has no pending status (it has
+  U/O/C/A/L/N), so a visit we booked that the export has not shown yet is "waiting for approval".
+- `GET /appointment-calendar`, per visit (old fields unchanged except `source`): `source` elliot / sheet /
+  stride (from the tag; the old "Stride" / "Booking service" text, read by nothing, is now `record_from`),
+  `approval` waiting / in_stride (not_in_stride: ours, cancelled before Stride ever showed it),
+  `stride_status` unmarked / confirmed / checked_in / cancelled / late_cancel / no_show (null while waiting;
+  an unknown Stride word passes through), `visit_type` + `visit_kind` first_visit / follow_up / other
+  (by type name; a type id in `case_types.stride_appointment_type_id` is a first visit), `patient_name`
+  "Last, First", `clinician` {id, name, role = `clinicians.credentials`, else `stride_users.credentials`},
+  `location_id` (Stride's).
+- `practitioner_name` / `clinician.name` is our display name whenever the clinician is in `clinicians`
+  (Stride's export wording, e.g. "Brown, Bob", only for one we do not know).
+- New `open_slots` in the same response (owner, 2026-10-26: no working-hours or count estimates): per
+  clinician and clinic-local day, `slots` [{start_local, end_local}] = cached `availability_slots` with status
+  open, from now on, in the requested range (never lead-filtered), each listed once even when cached for
+  several clinics on one Stride location. The UI draws these open, everything else closed. Only as fresh as
+  the last availability sync, and only inside its window (today to 90 days ahead).
+- New `GET /appointment-approvals`: every visit waiting for approval, upcoming first, then past ones (never
+  approved; over the limit the oldest past ones are dropped). Frontend proxy needs `appointment-approvals` in `ALLOWED_PATH` (phase 2).
+- No migration. Tests: `test_appointment_views.py`, `test_dashboard_calendar.py`,
+  `test_appointment_views_integration.py` (waiting -> in_stride on the CSV row, every status letter,
+  open slots, waiting list order and limit).
+
+### 2026-10-26 — Calendar redesign phase 3: backend fixes (owner-approved)
+- `GET /appointment-calendar`: each `practitioners` entry has `role` (`clinicians.credentials`, else
+  `stride_users.credentials`, else null) so every column header can show it, visits or not.
+- `open_slots` entries are now per clinician, clinic and day, with `location_id` (booking location) and
+  `location` (its name). Each slot is listed once per clinic; clinics sharing one Stride location (the demo's
+  three) each list it. The UI uses only the chosen clinic's open time under a location filter or in the
+  Locations view, and the union of all clinics otherwise.
+- No migration. Tests: `test_dashboard_calendar.py`, `test_appointment_views_integration.py`
+  (`test_practitioners_carry_a_role_ours_first_then_strides`, open slots per clinic).
+
+### 2026-10-26 — Booked is final (owner-approved)
+- A booked lead (any source: Elliot, Sheet Booked, Stride import, board) can no longer be moved out of Booked
+  on the dashboard board: `POST /leads/{id}/stage` to New / In cadence / Needs review / Closed returns 409
+  "This lead is booked. To change it, cancel the visit in Stride; the lead comes back for review by itself."
+  (`BOOKED_IS_FINAL_DETAIL`). Resume on a booked lead (already refused) now gives the same text.
+- Sheet Restart on a booked lead (`restart_booked`) now says "Error: this lead is booked. To start again, cancel
+  the visit in Stride, or add a new row."
+- Unchanged: the only way out is the visit cancelled in Stride -> Stride's export -> Appointment review; the
+  Sheet Booked command; Do Not Contact on a booked lead (safety). Review choices never apply to a booked lead
+  (a booked lead is never flagged, `flag_lead_for_review` skips final statuses).
+- Dashboard: Booked cards are not draggable and show a hint; a 409 still shows its detail.
+- No migration. Tests: `test_demo_review_integration.py` (board moves refused for every column, DNC allowed,
+  Stride cancel still reviews), `test_dashboard.py`, `test_sheet_direct*.py`.
+
+### 2026-10-26 — Restart waits while a call or text is due (owner-approved)
+- A Sheet Restart picked in the same seconds a cadence call was being claimed gave the patient two calls 30 s
+  apart (the old Day-5 call, then the new Day 0). Restart already refused while a step was in flight.
+- Now a restart is also refused while a step for the lead is due soon (`worker.next_due_soon`): one the worker
+  would send right now (the same rules as `CLAIM_SQL`, whose eligibility is now `ELIGIBLE_SQL`, shared, SQL
+  unchanged), or a planned step of an active lead due within 5 minutes (30 seconds for TEST_MODE test leads).
+  A step held back (outside calling hours, paused, in review, a daily limit) never blocks a restart.
+- Sheet Restart (both modes, `_restart_cadence`): 409 `outreach_due_soon` with `retry_at` = step time (now, if
+  late) + the window. Sheet text: "Error: a call or text is due in the next few minutes. Pick Restart cadence
+  again after <h:mm AM/PM> PT." (rounded up to the minute, as the cooldown text). Action empties; Activity shows
+  "Restart cadence refused: …". Checked after the in-flight and 10-minute checks, so those keep their words.
+- Board move to New: now refused while a step is in flight ("A call or text is going out right now. Move it to
+  New again in a minute.") or due soon ("… Move it to New again after <time> PT.").
+- Not changed: review-card restarts (a lead in review is never claimed, so nothing can be due) and the
+  unblock restart (a blocked number is never claimed).
+- No migration. Tests: `test_sheet_direct.py`, `test_sheet_direct_integration.py`,
+  `test_lead_review_integration.py` (the shared Sheet fixture switches the check off for other tests: no worker
+  runs there, so Day 0 would stay due in calling hours).

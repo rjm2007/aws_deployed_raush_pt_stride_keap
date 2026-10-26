@@ -270,8 +270,8 @@ def materialize_cadence(
     return len(steps)
 
 
-CLAIM_SQL = """
-with eligible as (
+# Which planned steps the worker may send right now. Shared by CLAIM_SQL and next_due_soon().
+ELIGIBLE_SQL = """
  select oe.id,oe.lead_id,oe.scheduled_for,
  row_number() over(partition by oe.lead_id order by oe.scheduled_for,oe.id) as lead_order
  from outreach_events oe
@@ -331,7 +331,9 @@ with eligible as (
    select 1 from outreach_events active_event
    where active_event.lead_id=oe.lead_id and active_event.status in ('in_flight','attempted')
  )
-), due as (
+"""
+
+CLAIM_SQL = "\nwith eligible as (" + ELIGIBLE_SQL + """), due as (
  select oe.id from outreach_events oe
  join eligible e on e.id=oe.id and e.lead_order=1
  order by oe.scheduled_for,oe.id limit %(limit)s for update of oe skip locked
@@ -340,6 +342,40 @@ update outreach_events oe set status='in_flight',updated_at=now()
 from due where oe.id=due.id
   returning oe.id,oe.lead_id,oe.channel,oe.cadence_step_id,oe.day_offset,oe.attempt_no
 """
+
+
+# A restart must not race a step that is about to go out (owner, 2026-10-26): a Sheet Restart
+# picked the same seconds a Day-5 call was claimed gave the patient two calls 30 s apart.
+RESTART_DUE_WINDOW = timedelta(minutes=5)
+RESTART_DUE_WINDOW_TEST = timedelta(seconds=30)  # TEST_MODE test leads: compressed cadence
+
+
+def next_due_soon(conn, lead_id: str) -> datetime | None:
+    """When a restart of this lead is accepted again, or None if nothing is due soon.
+
+    Due soon: a step the worker would send now (the same rules as CLAIM_SQL, so a step held back
+    by calling hours, a pause, a review or a limit never blocks a restart), or a planned step of
+    an active lead set to go out within the window (5 minutes; 30 seconds for TEST_MODE test
+    leads). The answer is that step's time (now, if late) plus the window.
+    """
+    lead = conn.execute("select is_test from leads where id=%s", (lead_id,)).fetchone()
+    if not lead:
+        return None
+    test_mode = get_settings().test_mode
+    window = RESTART_DUE_WINDOW_TEST if test_mode and lead["is_test"] else RESTART_DUE_WINDOW
+    row = conn.execute(
+        "with eligible as (" + ELIGIBLE_SQL + ") "
+        "select greatest(min(due.at),now()) + %(window)s as retry_at from ("
+        " select scheduled_for as at from eligible where lead_id=%(lead_id)s"
+        " union all"
+        " select oe.scheduled_for from outreach_events oe join leads l on l.id=oe.lead_id"
+        " where oe.lead_id=%(lead_id)s and oe.status='planned' and l.cadence_state='active'"
+        " and not l.needs_review and oe.scheduled_for>now()"
+        " and oe.scheduled_for<=now()+%(window)s"
+        ") due having count(*)>0",
+        {"lead_id": lead_id, "test_mode": test_mode, "window": window},
+    ).fetchone()
+    return row["retry_at"] if row else None
 
 
 def claim_jobs(trace: WorkflowTrace, limit: int = 20) -> list[Job]:
