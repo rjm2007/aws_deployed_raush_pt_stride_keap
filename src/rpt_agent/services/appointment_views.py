@@ -37,9 +37,9 @@ STRIDE_STATUS = {
     "n": "no_show", "no show": "no_show",
 }
 # Visit kinds the calendar colours by. First-visit words win ("Evaluation & Treatment" is a
-# first visit); a re-evaluation is not one ("eval" right after "re" / "re-" is not counted).
-_FIRST_VISIT = re.compile(r"\b(initial|new patient|first visit|ie)\b|(?<![a-z-])eval", re.IGNORECASE)
-_FOLLOW_UP = re.compile(r"follow|\bf/u\b|re-?eval|treatment|daily|progress", re.IGNORECASE)
+# first visit); a re-evaluation is not one ("eval" right after "re", "re-" or "re " is not counted).
+_FIRST_VISIT = re.compile(r"\b(initial|new patient|first visit|ie)\b|(?<![a-z-])(?<!re )eval", re.IGNORECASE)
+_FOLLOW_UP = re.compile(r"follow|\bf/u\b|re[\s-]?eval|treatment|daily|progress", re.IGNORECASE)
 _CONFIRMATION = re.compile(r"\b(booked|all set|you're set|you are set|confirmed|scheduled you)\b", re.IGNORECASE)
 _SPEAKER = re.compile(r"^\s*(ai|assistant|bot|agent|user|customer|patient)\s*:\s*(.+)$", re.IGNORECASE)
 
@@ -431,7 +431,7 @@ def open_slots(conn, practice_id: int, lower: datetime, upper: datetime, timezon
         "select distinct c.stride_user_id as id,c.display_name as name,"
         "s.start_utc at time zone %s as start_local,s.end_utc at time zone %s as end_local "
         "from availability_slots s join clinicians c on c.id=s.clinician_id "
-        "where s.practice_id=%s and s.status='open' and s.start_utc>=%s and s.start_utc<%s "
+        "where s.practice_id=%s and c.is_active and s.status='open' and s.start_utc>=%s and s.start_utc<%s "
         "order by c.display_name,c.stride_user_id,start_local,end_local",
         (timezone, timezone, practice_id, max(lower, now), upper),
     ).fetchall()

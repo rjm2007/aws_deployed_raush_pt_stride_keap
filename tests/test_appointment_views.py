@@ -245,7 +245,7 @@ def test_each_stride_export_status_maps_to_one_value(raw, expected):
     ("PT Evaluation", None, "first_visit"), ("IE", None, "first_visit"), ("IE - Pelvic", None, "first_visit"),
     ("Follow-up", 1452, "first_visit"), ("Reevaluation", None, "follow_up"),
     ("Follow-up", None, "follow_up"), ("Follow Up Visit", None, "follow_up"),
-    ("Re-Evaluation", None, "follow_up"), ("Treatment", None, "follow_up"),
+    ("Re-Evaluation", None, "follow_up"), ("Re Evaluation", None, "follow_up"), ("Treatment", None, "follow_up"),
     ("Massage", None, "other"), ("Appointment", None, "other"), (None, None, "other"),
     ("PT Visit", 1452, "first_visit"),  # a type id our engine books first visits with
 ])

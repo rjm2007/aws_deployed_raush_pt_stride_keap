@@ -262,3 +262,9 @@ def test_open_slots_are_the_cached_open_ones_once_per_clinician_and_day(booked):
         {"date": next_day, "practitioner_id": "3", "practitioner_name": "Joe Smith", "slots": [
             {"start_local": f"{next_day}T10:30", "end_local": f"{next_day}T11:30"}]},
     ]
+    # A clinician we no longer book for: their cached open slots are not shown.
+    db.execute("update clinicians set is_active=false where id=%s", (clinician,))
+    result = calendar.appointment_calendar(
+        DashboardActor("review", "review@example.test", practice_id=practice),
+        datetime.now(UTC).date() - timedelta(days=2), date.fromisoformat(next_day), lead_id=lead)
+    assert result["open_slots"] == []
