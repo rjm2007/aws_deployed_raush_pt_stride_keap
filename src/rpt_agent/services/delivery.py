@@ -11,7 +11,7 @@ from ..retry import retry_delay_seconds
 from ..usage_report import record_test_usage
 from ..vapi_contract import extract_vapi_context, outcome_from_ended_reason
 from .hang_up_booking import book_confirmed_time_after_hang_up
-from .lead_status import apply_call_outcome
+from .lead_status import BOOKED_WITHOUT_APPOINTMENT, apply_call_outcome
 from .review import flag_lead_for_review
 from .sheet_sync import dashboard_call_link, enqueue_sheet_update
 
@@ -375,6 +375,9 @@ def _patient_replied_after(message: dict, *, introduction: bool) -> bool:
 # times were being checked; the summary invented "said they are all set" and the lead was closed.
 # Word-boundary, case-insensitive, apostrophes and punctuation ignored ("don't" = "dont"); a phrase
 # inside a question ("Is Thursday all set up?") does not count.
+# Stored reason for `booking_hung_up` (owner, 2026-10-27).
+BOOKING_HUNG_UP_REASON = "Patient asked to book, then hung up before confirming; nothing was booked"
+
 REFUSAL_PHRASES = (
     "not interested", "no thanks", "no thank you", "dont need", "do not need", "not now",
     "not right now", "not at this time", "maybe later", "not really", "no longer",
@@ -509,10 +512,16 @@ def _settle_from_structured_output(
             source="call summary",
         )
     except (TypeError, ValueError) as exc:
+        # The summary says "booked" but no booking exists: the patient was asking about or picking
+        # a time and hung up before confirming. Its own card, in plain words (owner, 2026-10-27).
+        hung_up = status == "booked" and str(exc) == BOOKED_WITHOUT_APPOINTMENT
         with transaction() as conn:
             flag_lead_for_review(
-                conn, lead_id, f"structured outcome could not be applied: {exc}",
-                code="call_outcome_not_applied", source="call", outreach_event_id=event_id,
+                conn, lead_id,
+                BOOKING_HUNG_UP_REASON if hung_up
+                else f"structured outcome could not be applied: {exc}",
+                code="booking_hung_up" if hung_up else "call_outcome_not_applied",
+                source="call", outreach_event_id=event_id,
                 details={"call_id": call_id, "extracted_status": status},
             )
         trace.log("validation_failed", reason="structured_output_rejected")

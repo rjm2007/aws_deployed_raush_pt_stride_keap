@@ -11,6 +11,9 @@ from .review import record_review, skip_remaining_planned
 from .sheet_sync import enqueue_sheet_update
 
 CALLBACK_MIN_MINUTES = 5
+# Raised when a "booked" outcome has no scheduled appointment; delivery.py matches it to flag
+# `booking_hung_up` instead of a generic "could not be applied" card.
+BOOKED_WITHOUT_APPOINTMENT = "booked requires a confirmed appointment"
 CALLBACK_MAX_MINUTES = 240
 
 
@@ -290,7 +293,7 @@ def report_lead_status(
                 (lead_id,),
             ).fetchone()
             if not appointment:
-                raise ValueError("booked requires a confirmed appointment")
+                raise ValueError(BOOKED_WITHOUT_APPOINTMENT)
             mark_booked(conn, lead_id, source)
         elif normalized == "declined":
             conn.execute(
@@ -559,7 +562,7 @@ def apply_call_outcome(
             ).fetchone()
             if not appointment:
                 trace.log("validation_failed", reason="booked_without_appointment")
-                raise ValueError("booked requires a confirmed appointment")
+                raise ValueError(BOOKED_WITHOUT_APPOINTMENT)
         callback_utc = None
         if outcome == "callback":
             if callback_requested_at is None or callback_requested_at.tzinfo is None:

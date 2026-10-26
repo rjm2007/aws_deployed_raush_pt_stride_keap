@@ -80,7 +80,7 @@ _UNCLEAR = frozenset({"but", "what", "which", "how", "when", "where", "why", "wh
 _TRAILING = frozenset({"so", "um", "uh", "and", "but"})
 
 
-# Elliot's confirmation (config/vapi_booking_assistant_prompt_confirm.md, step 3f2): "So that's
+# Elliot's confirmation (config/vapi_booking_assistant_prompt.md, step 3f2): "So that's
 # [day] the [date] at [time] with [therapist] at our [clinic] office. Shall I book it?" Tolerated
 # (tester, 2026-10-27): "that is", no "so", and the question as "shall / should / can I (go ahead
 # and) book it / that (for you)", "(do you) want me to book it", "would you like me to book it".

@@ -54,6 +54,9 @@ GROUP_OF = {
     "wrong_person": "call",
     "call_no_outcome": "call",
     "call_outcome_not_applied": "call",
+    # The call summary said booked, but nothing was booked: the patient hung up while asking about
+    # or choosing a time (owner, 2026-10-27; delivery._settle_from_structured_output).
+    "booking_hung_up": "call",
     "unrecognized_status": "call",
     "call_failed": "technical",
     "dispatch_failed": "technical",
@@ -106,6 +109,7 @@ TITLES = {
     "wrong_person": "Wrong person or wrong number",
     "call_no_outcome": "Call answered, no outcome",
     "call_outcome_not_applied": "Call outcome could not be applied",
+    "booking_hung_up": "Patient asked to book, then hung up",
     "unrecognized_status": "Unknown call result",
     "call_failed": "Call could not be placed",
     "dispatch_failed": "Call or text could not be sent",
@@ -260,6 +264,8 @@ def sheet_open_status(code: str | None, details: dict | None) -> str:
         return "Needs review: text failed (landline)" if landline else "Needs review: text failed"
     if code == "wrong_person":
         return "Needs review: wrong number"
+    if code == "booking_hung_up":
+        return "Needs review: patient asked to book, then hung up"
     if group == "call":
         return "Needs review: call result unclear"
     if group == "technical":
@@ -467,6 +473,10 @@ def _plain_reason(row: dict, lead: dict) -> str:
         return "The call was answered, but the agent reported no outcome. Read the transcript."
     if code == "call_outcome_not_applied":
         return "The call summary gave an outcome the system could not apply. Read the transcript."
+    if code == "booking_hung_up":
+        return ("The patient was asking about times or choosing one and hung up before confirming. "
+                "Nothing was booked. Read the transcript, then continue the cadence or have the front "
+                "desk call them.")
     if code == "unrecognized_status":
         return "The agent reported a call result the system does not know. Read the transcript."
     if code == "call_failed":

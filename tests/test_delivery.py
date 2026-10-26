@@ -194,6 +194,56 @@ def test_failed_extraction_goes_to_staff(monkeypatch):
     assert _settle_with(monkeypatch, {})["status"] == "review"
 
 
+def _flag_for_rejected_outcome(monkeypatch, status, error):
+    """The review a rejected post-call outcome leaves (report_lead_status raised `error`)."""
+    from contextlib import contextmanager
+
+    from rpt_agent.observability import WorkflowTrace
+    from rpt_agent.services import delivery, lead_status
+
+    flagged = {}
+
+    @contextmanager
+    def fake_transaction():
+        yield None
+
+    def fake_report(trace, **kwargs):
+        raise error
+
+    def fake_flag(conn, lead_id, reason, **kwargs):
+        flagged.update(reason=reason, **kwargs)
+
+    monkeypatch.setattr(delivery, "transaction", fake_transaction)
+    monkeypatch.setattr(delivery, "flag_lead_for_review", fake_flag)
+    monkeypatch.setattr(lead_status, "report_lead_status", fake_report)
+    message = {"artifact": {"structuredOutputs": {"x": {"result": {"status": status}}},
+                            "messages": []}}
+    assert delivery._settle_from_structured_output(
+        WorkflowTrace("t", "test"), message, lead_id="lead-1", event_id=1, call_id="c") is None
+    return flagged
+
+
+def test_booked_summary_without_a_booking_is_a_hung_up_card(monkeypatch):
+    """Owner, 2026-10-27: the summary said booked, but the patient hung up while asking about or
+    choosing a time; the card says that in plain words, not "could not be applied"."""
+    from rpt_agent.services.lead_status import BOOKED_WITHOUT_APPOINTMENT
+
+    flagged = _flag_for_rejected_outcome(monkeypatch, "booked", ValueError(BOOKED_WITHOUT_APPOINTMENT))
+    assert flagged["code"] == "booking_hung_up" and flagged["source"] == "call"
+    assert flagged["reason"] == ("Patient asked to book, then hung up before confirming; nothing was "
+                                 "booked")
+    assert flagged["details"] == {"call_id": "c", "extracted_status": "booked"}
+
+
+def test_other_rejected_outcomes_keep_the_not_applied_card(monkeypatch):
+    flagged = _flag_for_rejected_outcome(monkeypatch, "callback_scheduled", ValueError("bad time"))
+    assert flagged["code"] == "call_outcome_not_applied"
+    assert flagged["reason"] == "structured outcome could not be applied: bad time"
+    # A booked summary rejected for another reason is not the hung-up case.
+    flagged = _flag_for_rejected_outcome(monkeypatch, "booked", TypeError("bad notes"))
+    assert flagged["code"] == "call_outcome_not_applied"
+
+
 def test_sent_without_delivery_receipt_settles_the_step():
     """Olivia's carrier never returned a delivery receipt: Twilio stayed at
     "sent", the step stayed attempted, and the cadence froze behind it."""

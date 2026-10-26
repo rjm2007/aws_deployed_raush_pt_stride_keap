@@ -2710,3 +2710,8 @@ patient actually said no.
   "No. Bye." / "No, sorry." to the introduction are. New `scripts/check_hangup_rule.py`: the owner's
   one-command PASS / FAIL check of 16 cases on a throwaway local Postgres (see
   `../Hang-up-Booking-Tests.md`).
+- Wording (owner, same day): a post-call summary saying `booked` with no appointment for the lead (the
+  patient asked about / picked a time and hung up before confirming) now flags new code `booking_hung_up`
+  (Call group, same choices and pause as `call_outcome_not_applied`): "Patient asked to book, then hung
+  up", Sheet "Needs review: patient asked to book, then hung up". Other rejected outcomes keep
+  `call_outcome_not_applied`. No migration (`lead_reviews.code` is free text).

@@ -4,7 +4,6 @@
 | --- | --- |
 | `vapi_tools.json` | Vapi tool definitions (`check_availability`, `create_appointment`, `update_lead_status`). Pushed to the Vapi assistant by `scripts/sync_vapi.py`. |
 | `vapi_assistant_prompt.md` | The voice assistant's system prompt. Also synced by `scripts/sync_vapi.py`. |
-| `vapi_booking_assistant_prompt_confirm.md` | Copy of `vapi_booking_assistant_prompt.md` for a separate test assistant (2026-10-27): Elliot asks "So that's ... Shall I book it?" before booking (step 3f2). Not pushed to Vapi. |
 | `n8n/workflows/*.json` | **Older** exports of the n8n workflows (intake, recovery, Sheet webhook, profile sync). |
 
 ## Notes

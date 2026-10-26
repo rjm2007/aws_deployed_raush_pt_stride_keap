@@ -297,6 +297,22 @@ def test_yes_then_hang_up_card_asks_the_front_desk_to_book_by_hand():
         "Needs review: patient said yes to a time, book by hand"
 
 
+def test_booked_then_hung_up_card_is_plain_and_general():
+    # Owner, 2026-10-27: summary said booked, nothing was booked; stays a Call card.
+    card = describe(_review("booking_hung_up"), LEAD, has_calls=True)
+    assert card["group"] == "call" and card["title"] == "Patient asked to book, then hung up"
+    assert card["reason"] == ("The patient was asking about times or choosing one and hung up before "
+                              "confirming. Nothing was booked. Read the transcript, then continue the "
+                              "cadence or have the front desk call them.")
+    assert [o["choice"] for o in card["options"]] == \
+        [o["choice"] for o in describe(_review("call_outcome_not_applied"), LEAD,
+                                       has_calls=True)["options"]]
+    assert card["transcript_url"] == "/leads/lead-1/conversations/calls"
+    assert sheet_open_status("booking_hung_up", {}) == \
+        "Needs review: patient asked to book, then hung up"
+    assert sheet_open_status("call_outcome_not_applied", {}) == "Needs review: call result unclear"
+
+
 def test_booking_cards_and_sheet_words_name_what_happened():
     assert sheet_open_status("booking_patient_exists", {}) == \
         "Needs review: patient already in Stride, book by hand"

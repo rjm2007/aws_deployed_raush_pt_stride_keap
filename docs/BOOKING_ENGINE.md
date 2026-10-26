@@ -98,8 +98,8 @@ used only when the tool itself failed (no lead on the call, booking switched off
 ## Yes, then a hang-up (owner, 2026-10-27)
 
 A "yes" to Elliot's confirmation books the visit even if the patient hangs up before the booking tool
-ran. The confirmation question is in `config/vapi_booking_assistant_prompt_confirm.md` (test assistant
-copy, step 3f2): "So that's [day] the [date] at [time] with [therapist first name] at our [clinic]
+ran. The confirmation question is in `config/vapi_booking_assistant_prompt.md` (step 3f2; on the demo
+booking assistant since 2026-10-27): "So that's [day] the [date] at [time] with [therapist first name] at our [clinic]
 office. Shall I book it?"
 
 `services/hang_up_booking.py` (`book_confirmed_time_after_hang_up`) runs from the end-of-call report
@@ -136,6 +136,11 @@ changed, TAKEN, any reply but BOOKED): the call settles `manual` and the lead go
 `booking_said_yes`, Booking group: "Patient said yes to <day time> and hung up before the booking
 finished; book by hand", with the reason in plain words ("that time was no longer free"). A re-sent
 report books nothing more.
+
+If no booking was made but the post-call summary still says `booked` (the patient asked about or picked
+a time and hung up before confirming), the lead goes to Needs Review with code `booking_hung_up`, Call
+group: "Patient asked to book, then hung up"; staff read the transcript, then continue the cadence or
+have the front desk call (owner, 2026-10-27).
 
 Check it all before a deploy: `uv run --frozen python scripts/check_hangup_rule.py` (16 cases, PASS / FAIL,
 own throwaway Postgres on 127.0.0.1; see `../Hang-up-Booking-Tests.md`).

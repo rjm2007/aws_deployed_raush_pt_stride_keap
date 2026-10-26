@@ -148,6 +148,21 @@ def test_hang_up_after_naming_a_time_before_the_confirmation_is_not_booked(env, 
     assert env.stride.count("appointments") == 0
 
 
+def test_booked_summary_after_a_hang_up_while_choosing_is_a_hung_up_card(env, call):
+    # Owner, 2026-10-27: the summary said booked, but the patient hung up after picking a time and
+    # before confirming. Needs Review, in plain words; nothing booked.
+    lead, event, call_id = call
+    turns = OPENING + BIRTHDAY_YES[:1]
+    process_vapi_end_report(env.trace, _report(lead, event, call_id, turns, {
+        "status": "booked", "summary": "The patient chose nine on Tuesday."}))
+    state = _state(env, lead, event)
+    assert state["lead"]["needs_review"] and state["appointments"] == 0
+    assert state["review"]["code"] == "booking_hung_up"
+    assert state["review"]["message"] == ("Patient asked to book, then hung up before confirming; "
+                                          "nothing was booked")
+    assert env.stride.count("appointments") == 0
+
+
 def test_no_to_the_confirmation_is_not_booked(env, call):
     lead, event, call_id = call
     turns = OPENING + BIRTHDAY_YES + [("bot", CONFIRM), ("user", "No, wait.")]
