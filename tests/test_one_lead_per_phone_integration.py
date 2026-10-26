@@ -78,6 +78,9 @@ def test_board_new_on_the_oldest_row_closes_the_newer_lead_as_restarted(phone_en
                            (new_id,)).fetchone()["resolution"] == "replaced"
     assert senv.cell(new, "outcome_status") == RESTARTED_ROW
     assert _get(f"leads/{new_id}").json()["lead"]["next_step"] == RESTARTED_ROW
+    titles = [entry["title"] for entry in _get(f"leads/{new_id}").json()["activity"]]
+    assert "Resolved by System: Replaced by another lead with this phone number." in titles
+    assert not any("newer referral" in title for title in titles)
     # The middle lead was already closed by the newest row: it keeps the newer-row words.
     assert senv.lead(mid_id)["status_reason"] == REPLACED_REASON
     assert senv.cell(mid, "outcome_status") == NEWER_ROW

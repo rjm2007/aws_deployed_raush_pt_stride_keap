@@ -2547,4 +2547,6 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   "Error: this lead is closed (another row with this phone number was restarted). Use the dashboard."
 - Phone-change close reason has no digits now: "Phone number changed in the Sheet on Oct 26, 2026. Add the
   new number as a new row." (the masked numbers stay in the review's details; Sheet text unchanged).
+- Activity label for a review closed as `replaced` is neutral now: "Replaced by another lead with this
+  phone number" (was "Replaced by a newer referral", wrong for a restart).
 - No migration. Tests: `test_one_lead_per_phone_integration.py`.

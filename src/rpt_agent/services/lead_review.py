@@ -755,9 +755,10 @@ def options_preview(conn, lead: dict, now: datetime | None = None) -> dict[str, 
 
 
 # How a review closed without a staff choice (lead page Activity and the closed-review message).
+# "replaced" covers a newer row and a restarted older one alike (2026-10-26).
 OUTCOME_LABELS = {
     "booked": "Marked Booked", "do_not_contact": "Do Not Contact", "restarted": "Restarted",
-    "replaced": "Replaced by a newer referral", "unblocked": "Number unblocked",
+    "replaced": "Replaced by another lead with this phone number", "unblocked": "Number unblocked",
     "closed": "Closed", "board_closed": "Moved to Closed on the board",
     "board_booked": "Moved to Booked on the board",
     "board_new": "Restarted from the board",
