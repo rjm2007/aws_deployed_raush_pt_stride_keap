@@ -168,7 +168,8 @@ def hand_over_number(
     if not others:
         return None
     for other in others:
-        if other["cadence_state"] in {"pending", "active", "paused"}:
+        # Booked is final (owner, 2026-10-26): a booked lead keeps its status whatever runs next.
+        if other["status"] != "booked" and other["cadence_state"] in {"pending", "active", "paused"}:
             # Its open review closes as "replaced" here: migration 048's clear trigger only knows
             # REPLACED_REASON's words and would record the restarted case as plain "closed".
             conn.execute(
@@ -180,16 +181,19 @@ def hand_over_number(
             )
             # needs_review goes too: the board shows any flagged lead in Needs
             # Attention first, and a replaced lead has nothing left to act on.
+            # Its status closes as well (owner, 2026-10-26): it kept "In cadence" / "Callback
+            # scheduled" (or "Needs review") after its calls had ended. Closed the way a front
+            # desk close is; status_reason keeps the "replaced" words for the card and the Sheet.
             conn.execute(
-                "update leads set cadence_state='terminated',status_reason=%s,"
-                "needs_review=false,status_changed_at=now() where id=%s",
+                "update leads set status='closed_no_response',cadence_state='terminated',"
+                "status_reason=%s,needs_review=false,status_changed_at=now() where id=%s",
                 (reason, other["id"]),
             )
             skip_remaining_planned(conn, str(other["id"]), reason)
             conn.execute(
                 "insert into lead_status_history(lead_id,from_status,to_status,source,reason) "
-                "values(%s,%s,%s,'system',%s)",
-                (other["id"], other["status"], other["status"], reason),
+                "values(%s,%s,'closed_no_response','system',%s)",
+                (other["id"], other["status"], reason),
             )
     conn.execute(
         "update leads set call_opt_out=call_opt_out or %s,sms_opt_out=sms_opt_out or %s "

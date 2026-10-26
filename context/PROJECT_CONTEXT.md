@@ -2630,3 +2630,15 @@ Booked when the booking worked (the booking wins over the end-of-call report).
 - Activity label for a review closed as `replaced` is neutral now: "Replaced by another lead with this
   phone number" (was "Replaced by a newer referral", wrong for a restart).
 - No migration. Tests: `test_one_lead_per_phone_integration.py`.
+
+### 2026-10-26 — A replaced lead shows as Closed (owner-approved)
+
+- `review.hand_over_number` now also sets the replaced lead's status to `closed_no_response` (the
+  status a front desk close uses), for both reasons (newer row, restart). Before, it kept "In cadence",
+  "Callback scheduled" or "Needs review" after its calls had ended; a `needs_attention` one even stayed
+  in the board's Needs Attention column. Its history row records old status -> `closed_no_response`.
+- Unchanged: `status_reason` (so the card, Sheet Outcome Status `SHEET_REPLACED` / `SHEET_RESTARTED`
+  and the review label "Replaced by another lead with this phone number" read as before); Sheet Lead
+  Status is "Closed"; board column Closed. A booked lead is never touched (explicit `status <> booked`).
+- No migration. Older replaced leads in the database keep their old status until a one-off fix.
+  Tests: `test_one_lead_per_phone_integration.py`.
