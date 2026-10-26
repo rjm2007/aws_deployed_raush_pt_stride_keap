@@ -21,6 +21,7 @@ import json
 import re
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -143,6 +144,7 @@ def main() -> None:
     from rpt_agent.services.slot_booking import call_case_variables
 
     settings = get_settings()
+    dob = date.fromisoformat(args.dob)
     lead_id, event_id, phone_number_id = create_test_lead(transaction, args)
     with transaction() as conn:
         case_variables = call_case_variables(conn, lead_id)
@@ -156,6 +158,10 @@ def main() -> None:
                 "lead_id": lead_id, "outreach_event_id": str(event_id),
                 "Patient_name": args.name, "patient_name": args.name, "call_attempt": "1",
                 "clinic_location": args.clinic, "case_name": args.case, **case_variables,
+                # Same birthday variables the cadence worker sends; without them the agent read
+                # "date of birth spoken" aloud and booked with "{{date_of_birth}}" (2026-10-27).
+                "date_of_birth": args.dob,
+                "date_of_birth_spoken": f"{dob:%B} {dob.day}, {dob.year}",
             }},
         })
         with transaction() as conn:
