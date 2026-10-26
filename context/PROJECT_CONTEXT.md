@@ -2494,15 +2494,15 @@ From production (`fc7a339`, `d5314cf`, `ac95599`, `1e951b8`), adapted to the dem
   (by type name; a type id in `case_types.stride_appointment_type_id` is a first visit), `patient_name`
   "Last, First", `clinician` {id, name, role = `clinicians.credentials`, else `stride_users.credentials`},
   `location_id` (Stride's).
-- New `day_summary` in the same response, one row per day and clinician: `working_hours` (first to last
-  cached slot that day in `availability_slots`, any status, widened by that day's visits; source "slots",
-  or "visits" when no slot was ever cached; null otherwise. Stride gives only open slots, never the
-  schedule, so these are an estimate. `business_hours` is Elliot's calling hours, not clinic hours, and is
-  not used), `booked` (visits that day except cancelled, late cancel, rescheduled; waiting ones count),
-  `available` (open slots from now on at the clinician's first-visit length, one per start time; null on a
-  day no successful sync covered: before today or past the 90-day cache), `slot_minutes`.
+- `practitioner_name` / `clinician.name` is our display name whenever the clinician is in `clinicians`
+  (Stride's export wording, e.g. "Brown, Bob", only for one we do not know).
+- New `open_slots` in the same response (owner, 2026-10-26: no working-hours or count estimates): per
+  clinician and clinic-local day, `slots` [{start_local, end_local}] = cached `availability_slots` with status
+  open, from now on, in the requested range (never lead-filtered), each listed once even when cached for
+  several clinics on one Stride location. The UI draws these open, everything else closed. Only as fresh as
+  the last availability sync, and only inside its window (today to 90 days ahead).
 - New `GET /appointment-approvals`: every visit waiting for approval, upcoming first, then past ones (never
-  approved). Frontend proxy needs `appointment-approvals` in `ALLOWED_PATH` (phase 2).
+  approved; over the limit the oldest past ones are dropped). Frontend proxy needs `appointment-approvals` in `ALLOWED_PATH` (phase 2).
 - No migration. Tests: `test_appointment_views.py`, `test_dashboard_calendar.py`,
   `test_appointment_views_integration.py` (waiting -> in_stride on the CSV row, every status letter,
-  counts, working hours).
+  open slots, waiting list order and limit).

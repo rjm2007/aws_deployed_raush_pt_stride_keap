@@ -63,9 +63,9 @@ def appointment_calendar(actor: Actor, start: date, end: date, lead_id: UUID | N
                 "id": r["practitioner_id"], "name": r["practitioner_name"],
                 "location": r["location"],
             })
-        # Per day and clinician: working hours, booked, available (sources in appointment_views).
-        day_summary = appointment_views.day_summaries(
-            conn, actor.practice_id, records, start, end, timezone, datetime.now(UTC))
+        # Open slots from Stride's availability cache (whole clinic, never lead-filtered).
+        slots = appointment_views.open_slots(conn, actor.practice_id, lower, upper, timezone,
+                                             datetime.now(UTC))
         last_import = None
         if tables["imports"]:
             last_import = conn.execute(
@@ -77,7 +77,7 @@ def appointment_calendar(actor: Actor, start: date, end: date, lead_id: UUID | N
         "timezone": timezone, "business_hours": settings.get("business_hours") or {},
         "booking_enabled": bool(settings.get("stride_booking_enabled") and tables["booking"]),
         "stride_import_enabled": tables["imports"], "last_import_at": last_import,
-        "truncated": truncated, "generated_at": datetime.now(UTC), "day_summary": day_summary,
+        "truncated": truncated, "generated_at": datetime.now(UTC), "open_slots": slots,
     }
 
 

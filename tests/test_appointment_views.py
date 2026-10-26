@@ -240,6 +240,10 @@ def test_each_stride_export_status_maps_to_one_value(raw, expected):
 @pytest.mark.parametrize(("name", "type_id", "kind"), [
     ("Initial Evaluation", None, "first_visit"), ("Initial Eval - Pelvic", None, "first_visit"),
     ("Evaluation", None, "first_visit"), ("New Patient", None, "first_visit"),
+    # First-visit words win over treatment words; a type id we book first visits with wins outright.
+    ("Initial Eval and Treatment", None, "first_visit"), ("Evaluation & Treatment", None, "first_visit"),
+    ("PT Evaluation", None, "first_visit"), ("IE", None, "first_visit"), ("IE - Pelvic", None, "first_visit"),
+    ("Follow-up", 1452, "first_visit"), ("Reevaluation", None, "follow_up"),
     ("Follow-up", None, "follow_up"), ("Follow Up Visit", None, "follow_up"),
     ("Re-Evaluation", None, "follow_up"), ("Treatment", None, "follow_up"),
     ("Massage", None, "other"), ("Appointment", None, "other"), (None, None, "other"),

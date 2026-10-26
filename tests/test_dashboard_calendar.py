@@ -70,14 +70,11 @@ class CalendarConnection:
         if "from stride_appointments sa" in sql:
             assert params[0] == 7
             return Result([{**row, "id": 200, "state": "L"}])
-        if "c.credentials as role" in sql:  # day summary: who we book for, at which length
-            return Result([{"id": 12, "name": "Synthetic Clinician", "role": "PT, DPT",
-                            "booking_location_id": 5, "duration_minutes": 60, "is_default": True}])
         if "from availability_slots s" in sql:
-            assert params[2] == 7
-            return Result([])
-        if "from availability_sync_state st" in sql:
-            return Result([])
+            assert params[2] == 7 and "s.status='open'" in sql
+            local = datetime(2026, 10, 13, 9, tzinfo=UTC).replace(tzinfo=None)  # Postgres "at time zone"
+            return Result([{"id": 12, "name": "Synthetic Clinician", "start_local": local,
+                            "end_local": local + timedelta(hours=1)}])
         if "from case_types" in sql:
             return Result([{"id": 1452}])
         if "from clinicians c" in sql:
@@ -105,10 +102,9 @@ def test_calendar_deduplicates_bookings_and_keeps_sheet_link_and_stride_cancella
     assert record["location"] == "Synthetic Clinic"
     assert result["booking_enabled"]
     assert (record["source"], record["approval"], record["stride_status"]) == ("sheet", "in_stride", "late_cancel")
-    # The late cancel frees the time; no sync covered the day, so open slots are unknown, not 0.
-    assert result["day_summary"] == [{
+    assert result["open_slots"] == [{
         "date": "2026-10-13", "practitioner_id": "12", "practitioner_name": "Synthetic Clinician",
-        "role": "PT, DPT", "working_hours": None, "booked": 0, "available": None, "slot_minutes": 60,
+        "slots": [{"start_local": "2026-10-13T09:00", "end_local": "2026-10-13T10:00"}],
     }]
     assert not any(sql.lstrip().startswith(("insert", "update", "delete")) for sql, _ in conn.queries)
 

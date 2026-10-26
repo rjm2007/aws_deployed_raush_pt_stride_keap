@@ -184,6 +184,8 @@ def test_elliot_booking_waits_for_approval_until_the_stride_export_shows_it(book
     assert seen["id"] == "stride:9200" and seen["record_from"] == "Stride"
     assert (seen["approval"], seen["stride_status"], seen["source"]) == ("in_stride", "unmarked", "elliot")
     assert seen["patient_name"] == "Lovelace, Ada" and seen["visit_type"] == "Initial Evaluation"
+    # The export says "Clinician A" for user 3; our list's name is used for every source.
+    assert seen["practitioner_name"] == seen["clinician"]["name"] == "Joe Smith"
     assert calendar.appointment_approvals(actor)["appointments"] == []
 
     for minute, (letter, status) in enumerate([("O", "confirmed"), ("C", "checked_in"), ("N", "no_show"),
@@ -212,8 +214,14 @@ def test_waiting_list_is_upcoming_first_and_skips_what_is_off_the_books(booked):
     assert [r["lead_id"] for r in records] == [soon, later, late]
     assert all(r["approval"] == "waiting" for r in records)
 
+    # Over the limit, old unapproved visits are dropped, never the upcoming ones.
+    older = ctx.lead("Lead 9", phone="+15552010009")
+    _ours(ctx, older, now - timedelta(days=20), case=case)
+    records, truncated = av.waiting_records(db, practice, now, limit=3)
+    assert truncated and [r["lead_id"] for r in records] == [soon, later, late]
 
-def test_day_summary_counts_booked_and_open_slots_and_finds_working_hours(booked):
+
+def test_open_slots_are_the_cached_open_ones_once_per_clinician_and_day(booked):
     ctx = booked
     case = _booking_setup(ctx)
     db, practice = ctx.db, ctx.practice_id
@@ -223,59 +231,34 @@ def test_day_summary_counts_booked_and_open_slots_and_finds_working_hours(booked
     dana = db.execute(
         "insert into booking_locations(practice_id,name,stride_location_id,timezone) "
         "values(%s,'Dana Point',2,'America/New_York') returning id", (practice,)).fetchone()["id"]
-    db.execute("insert into clinician_assignments(clinician_id,booking_location_id,case_type_id) "
-               "values(%s,%s,%s)", (clinician, dana, case))
     day, next_day = future_day(3), future_day(4)
 
-    def slot(location, hour, status="open", minutes=60):
-        start = _at(day, hour)
+    def slot(location, when, status="open", minutes=60):
         db.execute(
             "insert into availability_slots(practice_id,clinician_id,booking_location_id,duration_minutes,"
             "start_utc,end_utc,local_date,local_time,timezone,status) values(%s,%s,%s,%s,%s,%s,%s,%s,"
             "'America/New_York',%s)",
-            (practice, clinician, location, minutes, start, start + timedelta(minutes=minutes),
-             start.date(), start.time(), status))
+            (practice, clinician, location, minutes, when, when + timedelta(minutes=minutes),
+             when.date(), when.time(), status))
 
-    for hour in (9, 10, 11, 14):
-        slot(laguna, hour)
-    slot(dana, 9)                      # same 9:00 slot cached for the other clinic: counted once
-    slot(laguna, 13, status="booked")  # we booked it: not open, still the schedule
-    slot(laguna, 16, status="gone")    # taken since: not open, still the schedule
-    slot(laguna, 17, minutes=30)       # another visit length: not counted, still the schedule
-    # Only `day` is covered by a successful sync.
-    db.execute(
-        "insert into availability_sync_state(booking_location_id,duration_minutes,chunk,window_start,"
-        "window_end,last_success_at,slot_count) values(%s,60,0,current_date,%s,now(),5)", (laguna, day))
-
+    slot(laguna, _at(day, 9))
+    slot(dana, _at(day, 9))                    # same slot, other clinic: listed once
+    slot(laguna, _at(day, 9), minutes=30)      # another visit length: its own end
+    slot(laguna, _at(day, 13), status="booked")
+    slot(laguna, _at(day, 16), status="gone")
+    slot(laguna, _at(next_day, 10, 30))
+    slot(laguna, datetime.now(UTC) - timedelta(days=1))  # past: no longer bookable
     lead = ctx.lead("Ada Lovelace", dob="1991-02-02", phone="+15552010002")
-    _ours(ctx, lead, _at(day, 13), case=case)  # Elliot's, waiting for approval: holds the time
-    ctx.drop("patients_20261001100000.csv", csv_bytes(PATIENT_HEADER, [
-        patient("301", "Walk", "In", "1985-05-05", mobile="(555) 201-0099")]))
-    ctx.drop("appointments_20261001100000.csv", csv_bytes(APPOINTMENT_HEADER, [
-        appointment("9401", "301", "7401", day, start="12:00 PM", end="1:00 PM"),
-        appointment("9402", "301", "7401", day, start="3:00 PM", end="4:00 PM", status="Cancel"),
-        appointment("9403", "301", "7401", day, start="4:00 PM", end="5:00 PM", status="L"),
-        appointment("9404", "301", "7401", day, start="6:00 PM", end="7:00 PM", status="O"),
-        appointment("9405", "301", "7401", next_day, start="10:00 AM", end="11:00 AM"),
-    ]))
-    ctx.tick()
+    _ours(ctx, lead, _at(day, 11), case=case)
 
     result = calendar.appointment_calendar(
         DashboardActor("review", "review@example.test", practice_id=practice),
-        date.fromisoformat(day), date.fromisoformat(next_day) + timedelta(days=1))
-    summary = {r["date"]: r for r in result["day_summary"] if r["practitioner_id"] == "3"}
-    assert summary[day] == {
-        "date": day, "practitioner_id": "3", "practitioner_name": "Joe Smith", "role": None,
-        # 9:00 first slot; the 6-7 PM visit stretches the day past the last slot (17:30).
-        "working_hours": {"start": "09:00", "end": "19:00", "source": "slots"},
-        "booked": 3,     # 12:00 + 18:00 Stride, 13:00 ours waiting; cancel and late cancel excluded
-        "available": 4,  # 9, 10, 11, 14 at 60 minutes
-        "slot_minutes": 60,
-    }
-    # Outside the synced window: open slots unknown; hours only from the visit.
-    assert summary[next_day]["available"] is None and summary[next_day]["booked"] == 1
-    assert summary[next_day]["working_hours"] == {"start": "10:00", "end": "11:00", "source": "visits"}
-    last = (date.fromisoformat(next_day) + timedelta(days=1)).isoformat()
-    assert summary[last]["working_hours"] is None and summary[last]["booked"] == 0
-    waiting = [r for r in result["appointments"] if r["approval"] == "waiting"]
-    assert [r["lead_id"] for r in waiting] == [lead]
+        datetime.now(UTC).date() - timedelta(days=2), date.fromisoformat(next_day), lead_id=lead)
+    assert [r["lead_id"] for r in result["appointments"]] == [lead]  # the lead filter is for visits only
+    assert result["open_slots"] == [
+        {"date": day, "practitioner_id": "3", "practitioner_name": "Joe Smith", "slots": [
+            {"start_local": f"{day}T09:00", "end_local": f"{day}T09:30"},
+            {"start_local": f"{day}T09:00", "end_local": f"{day}T10:00"}]},
+        {"date": next_day, "practitioner_id": "3", "practitioner_name": "Joe Smith", "slots": [
+            {"start_local": f"{next_day}T10:30", "end_local": f"{next_day}T11:30"}]},
+    ]
