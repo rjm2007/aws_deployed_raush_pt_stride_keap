@@ -149,28 +149,23 @@
       "messages": [
         {
           "type": "request-start",
-          "content": "Perfect, booking that now.",
+          "content": "Perfect, booking that now. It'll just take a few seconds.",
           "blocking": false
         },
         {
           "type": "request-start",
-          "content": "Great, locking that in.",
+          "content": "Great, I'll lock that in. Just a few seconds.",
           "blocking": false
         },
         {
           "type": "request-start",
-          "content": "Okay, booking it now.",
+          "content": "Okay, booking that for you now. Just a few seconds.",
           "blocking": false
         },
         {
           "type": "request-response-delayed",
-          "content": "Almost done...",
-          "timingMilliseconds": 4500
-        },
-        {
-          "type": "request-response-delayed",
-          "content": "Still with you, it's just finishing up.",
-          "timingMilliseconds": 9000
+          "content": "Thanks for waiting, nearly there.",
+          "timingMilliseconds": 12000
         }
       ],
       "server": {

@@ -286,11 +286,12 @@ def test_logged_tool_call_that_never_ran_still_books(env, call):
     assert _booked(env, lead, event)
 
 
-@pytest.mark.parametrize("waits", [["Perfect, booking that now."],
-                                   ["Perfect, booking that now.", "Almost done..."],
+@pytest.mark.parametrize("waits", [["Perfect, booking that now. It'll just take a few seconds."],
+                                   ["Perfect, booking that now. It'll just take a few seconds.",
+                                    "Thanks for waiting, nearly there."],
                                    ["Perfect,"]])
 def test_human_copy_waiting_lines_after_the_yes_still_book(env, call, waits):
-    # The human copy of Elliot (2026-10-27) plays "Perfect, booking that now." / "Almost done..."
+    # The human copy of Elliot (2026-10-27) plays "Perfect, booking that now. ..." / "Thanks for waiting, ..."
     # after the yes; they are not Elliot's last line, so the yes still books.
     lead, event, call_id = call
     turns = [("user", "Hello?")] + OPENING + BIRTHDAY_YES + [

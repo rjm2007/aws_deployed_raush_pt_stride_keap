@@ -39,6 +39,7 @@ def test_constant_matches_both_tool_files():
 @pytest.mark.parametrize("line", sorted(_config_lines()) + [
     "One moment, please, while I check our available",  # cut short at the hang-up
     "Perfect, booking that",
+    "Perfect, booking that now. It'll just",
     "Sorry, a few more seconds.", "Just a sec.", "One moment.", "Give me a moment.",
     "Hold on a sec.", "This'll just take a sec.",
 ])
@@ -55,18 +56,19 @@ def test_elliots_own_lines_are_not_skipped(line):
     assert not _is_waiting_line(line)
 
 
-@pytest.mark.parametrize("wait", ["Perfect, booking that now.", "Almost done...",
-                                  "Still with you, it's just finishing up.", "Just a sec."])
+@pytest.mark.parametrize("wait", ["Perfect, booking that now. It'll just take a few seconds.",
+                                  "Thanks for waiting, nearly there.", "Just a sec."])
 def test_confirmation_is_found_behind_the_waiting_lines(wait):
     turns = [("bot", CONFIRM), ("user", "Yes."), ("bot", wait)]
     found = find_confirmation(turns)
     assert found and found[0] == 0 and found[2]
-    turns = [("bot", CONFIRM), ("user", "Yes."), ("bot", "Perfect, booking that now."),
-             ("bot", "Almost done...")]
+    turns = [("bot", CONFIRM), ("user", "Yes."),
+             ("bot", "Perfect, booking that now. It'll just take a few seconds."),
+             ("bot", "Thanks for waiting, nearly there.")]
     assert find_confirmation(turns)[0] == 0
 
 
-@pytest.mark.parametrize("cut", ["Perfect,", "Great,", "Okay,", "Okay, booking", "Almost"])
+@pytest.mark.parametrize("cut", ["Perfect,", "Great,", "Okay,", "Okay, booking", "Thanks"])
 def test_booking_waiting_line_cut_to_one_word_after_the_yes_is_skipped(cut):
     found = find_confirmation([("bot", CONFIRM), ("user", "Yes."), ("bot", cut)])
     assert found and found[0] == 0 and found[2]

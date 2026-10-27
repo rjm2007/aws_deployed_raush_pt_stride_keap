@@ -107,11 +107,10 @@ TOOL_WAITING_LINES = (
     "Okay, one sec.",
     "Let me see what's open.",
     "Let me check.",
-    "Perfect, booking that now.",
-    "Great, locking that in.",
-    "Okay, booking it now.",
-    "Almost done...",
-    "Still with you, it's just finishing up.",
+    "Perfect, booking that now. It'll just take a few seconds.",
+    "Great, I'll lock that in. Just a few seconds.",
+    "Okay, booking that for you now. Just a few seconds.",
+    "Thanks for waiting, nearly there.",
     "Sure, one sec.",
     "Let me pull that up.",
 )
@@ -120,11 +119,10 @@ TOOL_WAITING_LINES = (
 BOOKING_WAITING_LINES = (
     "Thank you. One moment, please, while I confirm your appointment.",
     "Thanks for your patience, I'm still confirming that for you.",
-    "Perfect, booking that now.",
-    "Great, locking that in.",
-    "Okay, booking it now.",
-    "Almost done...",
-    "Still with you, it's just finishing up.",
+    "Perfect, booking that now. It'll just take a few seconds.",
+    "Great, I'll lock that in. Just a few seconds.",
+    "Okay, booking that for you now. Just a few seconds.",
+    "Thanks for waiting, nearly there.",
 )
 # Vapi's own stock fillers while a tool is slow.
 _STOCK_FILLERS = ("Sorry, a few more seconds.", "Just a sec.", "Just a second.", "One moment.",

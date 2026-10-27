@@ -46,14 +46,17 @@ def test_tools_have_variants_and_no_old_patience_line():
                 if m["type"] == "request-start"]) >= 2
     book = _tool(TOOLS, "book_appointment")["messages"]
     assert len([m for m in book if m["type"] == "request-start"]) >= 3
-    delayed = sorted(m["timingMilliseconds"] for m in book if m["type"] == "request-response-delayed")
-    assert delayed == [4500, 9000]
+    delayed = [m for m in book if m["type"] == "request-response-delayed"]
+    assert [m["timingMilliseconds"] for m in delayed] == [12000]
+    assert delayed[0]["content"] == "Thanks for waiting, nearly there."
+    assert all("few seconds" in m["content"] for m in book if m["type"] == "request-start")
     for tool in TOOLS["tools"]:
         for m in tool["messages"]:
             if m["type"] == "request-start":
                 assert m["blocking"] is False and m["content"].strip()
     raw = (CONFIG / "vapi_booking_tools_human.json").read_text(encoding="utf-8")
     assert "Thanks for your patience" not in raw
+    assert "Almost done" not in raw and "Still with you" not in raw
     assert "\"credentialId\"" not in raw and "\"secret\"" not in raw.lower()
 
 
@@ -87,6 +90,8 @@ def test_shorter_opening_and_small_fixes():
     assert "after a booking close with \"See you [day]. Goodbye!\"" in FLAT
     assert "Do you have a moment?" not in FLAT
     assert "Tuesday, June" not in FLAT and "[day], [date]" not in FLAT
+    assert "\"Saturday the twenty-fifth\", \"Monday the twenty-seventh\"" in FLAT
+    assert "Saturday the twenty-fifth at ten in the morning with Thao, or Monday the twenty-seventh" in FLAT
     assert "no usable first name" in FLAT and "\"Hi, it's Elliot...\"" in FLAT
     assert "are not sentences for this rule" in FLAT
     # Kept: birthday check, last name first, insurance line.
