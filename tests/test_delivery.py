@@ -90,7 +90,7 @@ def test_undelivered_cadence_sms_pauses_for_review():
     assert skip[0][1][1] == "lead-1"
 
 
-def _settle_with(monkeypatch, structured, turns=None):
+def _settle_with(monkeypatch, structured, turns=None, *, ended="customer-ended-call", extra=()):
     """Run the post-call fallback on one extractor result; return the status
     it applied, or "review" when the call went to staff instead."""
     from contextlib import contextmanager
@@ -121,9 +121,9 @@ def _settle_with(monkeypatch, structured, turns=None):
 
     monkeypatch.setattr(delivery, "transaction", fake_transaction)
     monkeypatch.setattr(lead_status, "report_lead_status", fake_report)
-    message = {"artifact": {
+    message = {"endedReason": ended, "artifact": {
         "structuredOutputs": {"x": {"result": structured}},
-        "messages": [{"role": r, "message": m} for r, m in (turns or [])],
+        "messages": [{"role": r, "message": m} for r, m in (turns or [])] + list(extra),
     }}
     delivery._settle_from_structured_output(
         WorkflowTrace("t", "test"), message, lead_id="lead-1", event_id=1, call_id="c"
@@ -530,3 +530,43 @@ def test_round_two_refusals_and_false_positives():
     for reply in ROUND_TWO_NOT_REFUSALS:
         assert not _refused_after(None, reply), reply
         assert not _refused_after("And do mornings or afternoons work better?", reply), reply
+
+
+DEMO_01A17CE0 = [  # 2026-10-27: hung up during the visit line, no transfer tool ran
+    ("user", "Hello?"),
+    ("bot", "Hi, am I speaking with Rpt Tester?"),
+    ("user", "Yes."),
+    ("bot", "Great. This is Elliot calling from Rausch Physical Therapy. Do you have a moment?"),
+    ("user", "Yep. Yes. Yes."),
+    ("bot", "So this is for your leg visit at our"),
+]
+TRANSFER_SUMMARY = {"status": "transferred_human",
+                    "summary": "The patient was transferred to a team member."}
+
+
+def _tool_call(name, arguments="{}", kind="function"):
+    return {"role": "tool_calls", "message": "", "toolCalls": [
+        {"id": "call_1", "type": kind, "function": {"name": name, "arguments": arguments}}]}
+
+
+def test_transferred_summary_needs_a_real_transfer(monkeypatch):
+    """Demo call 01a17ce0 (2026-10-27): no transfer happened, the summary said transferred."""
+    applied = _settle_with(monkeypatch, TRANSFER_SUMMARY, DEMO_01A17CE0)
+    assert applied["status"] == "no_answer"
+    assert applied["notes"].startswith("No answer from the patient; outreach continues.")
+    # A real transfer still records as transferred.
+    for extra, ended in (([_tool_call("transfer_tool_outreach")], "customer-ended-call"),
+                         ([_tool_call("transferCall", kind="transferCall")], "customer-ended-call"),
+                         ([], "assistant-forwarded-call"),
+                         ([], "customer-ended-call-during-transfer")):
+        assert _settle_with(monkeypatch, TRANSFER_SUMMARY, DEMO_01A17CE0, ended=ended,
+                            extra=extra)["status"] == "transferred_human"
+
+
+def test_link_and_transfer_without_a_transfer_keeps_only_a_requested_link(monkeypatch):
+    both = {"status": "booking_link_and_transfer", "summary": "Link sent and transferred."}
+    assert _settle_with(monkeypatch, both, DEMO_01A17CE0)["status"] == "no_answer"
+    link = _tool_call("update_lead_status", '{"status": "booking_link_and_transfer"}')
+    assert _settle_with(monkeypatch, both, DEMO_01A17CE0, extra=[link])["status"] == "booking_link"
+    assert _settle_with(monkeypatch, both, DEMO_01A17CE0, ended="assistant-forwarded-call",
+                        extra=[link])["status"] == "booking_link_and_transfer"

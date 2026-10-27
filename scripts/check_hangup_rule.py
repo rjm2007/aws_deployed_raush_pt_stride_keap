@@ -130,7 +130,7 @@ BIRTHDAY_YES = [("bot", ("And just so I pull up the right file, your birthday's 
 DECLINED = {"status": "declined", "summary": "The patient said they are all set."}
 
 
-def real_shaped_report(lead, event, call_id, turns, structured=None):
+def real_shaped_report(lead, event, call_id, turns, structured=None, ended="customer-ended-call"):
     """Like a real Vapi end-of-call report (demo report 11307): system message first, tool calls as
     their own items, the tool's waiting line as a separate bot item after the call."""
     msgs = [{"role": "system", "message": "<prompt>", "time": 0, "secondsFromStart": 0}]
@@ -152,7 +152,7 @@ def real_shaped_report(lead, event, call_id, turns, structured=None):
                            if r in ("bot", "user"))
     so = structured or DECLINED
     return {"message": {
-        "type": "end-of-call-report", "endedReason": "customer-ended-call",
+        "type": "end-of-call-report", "endedReason": ended,
         "call": {"id": call_id, "assistantOverrides": {
             "variableValues": {"lead_id": lead, "outreach_event_id": str(event)}}},
         "messages": msgs, "transcript": transcript, "analysis": {"summary": so.get("summary", "")},
@@ -235,18 +235,19 @@ def run_cases(verbose: bool) -> list[tuple[str, bool, str]]:
                 slot_booking.find_slots(trace, lead_id=self.lead, call_id=self.call_id,
                                         when="earliest", time_of_day="morning", providers=self.stride)
 
-        def report(self, turns, structured=None):
-            return process_vapi_end_report(
-                trace, real_shaped_report(self.lead, self.event, self.call_id, turns, structured))
+        def report(self, turns, structured=None, ended="customer-ended-call"):
+            return process_vapi_end_report(trace, real_shaped_report(
+                self.lead, self.event, self.call_id, turns, structured, ended))
 
         def state(self) -> dict:
-            lead = db.execute("select status,needs_review from leads where id=%s",
+            lead = db.execute("select status,cadence_state,needs_review from leads where id=%s",
                               (self.lead,)).fetchone()
             appointments = db.execute("select count(*) n from appointments where lead_id=%s and "
                                       "state='scheduled'", (self.lead,)).fetchone()["n"]
             card = db.execute("select code from lead_reviews where lead_id=%s and resolved_at is null "
                               "order by id desc limit 1", (self.lead,)).fetchone()
-            return {"status": lead["status"], "appointments": appointments,
+            return {"status": lead["status"], "cadence": lead["cadence_state"],
+                    "appointments": appointments,
                     "stride_appointments": self.stride.creates.count("appointments"),
                     "card": card["code"] if card else None}
 
@@ -304,6 +305,15 @@ def run_cases(verbose: bool) -> list[tuple[str, bool, str]]:
         ("user", "No, it's May first."), ("bot", "No problem, what's the right one?"),
         ("user", "May first, nineteen ninety."), ("bot", CONFIRM), ("user", "Yes.")]
     intro_only = OPENING[:4]
+    # Demo call 01a17ce0 (2026-10-27): hung up during the visit line; the summary said transferred.
+    leg_visit = [("user", "Hello?"), ("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yes."),
+                 ("bot", INTRO), ("user", "Yep. Yes. Yes."),
+                 ("bot", "So this is for your leg visit at our")]
+    transferred_summary = {"status": "transferred_human", "summary": "The patient answered and "
+                           "was transferred to a team member."}
+
+    def in_cadence(s):
+        return s["status"] != "transferred_human" and s["cadence"] == "active" and quiet(s)
 
     cases = [
         ("1. Yes, then hang up -> Booked", lambda c: c.report(yes_then("Yes.")), booked, "Booked"),
@@ -339,6 +349,13 @@ def run_cases(verbose: bool) -> list[tuple[str, bool, str]]:
          "a booking_said_yes card, no booking"),
         ("15. Report sent twice -> one booking", case_twice, booked, "Booked once"),
         ("16. Booking switched off -> nothing", "off", quiet, "not booked, not declined, no card"),
+        ("17. Summary says transferred but nobody was transferred -> stays in cadence",
+         lambda c: c.report(leg_visit, transferred_summary), in_cadence,
+         "not transferred, cadence active, no card"),
+        ("18. Transfer tool ran -> transferred",
+         lambda c: c.report(leg_visit[:-1] + [("tool", "transfer_tool_outreach")],
+                            transferred_summary, "assistant-forwarded-call"),
+         lambda s: s["status"] == "transferred_human", "Transferred to staff"),
     ]
     results = []
     for name, action, check, expected in cases:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from zoneinfo import ZoneInfo
 
@@ -448,6 +449,56 @@ def _words(text: str) -> set[str]:
     return set(re.findall(r"[a-z]+", text.lower()))
 
 
+# Statuses that say the patient was put through to staff.
+_TRANSFER_STATUSES = frozenset({"transferred_human", "booking_link_and_transfer"})
+
+
+def _call_tool_calls(message: dict) -> list[dict]:
+    """Every tool call made on the call, as {"name", "type", "arguments"}, from the report's
+    messages (role "tool_calls" / "tool_call_result") and the OpenAI-formatted copy."""
+    artifact = message.get("artifact") if isinstance(message.get("artifact"), dict) else {}
+    found: list[dict] = []
+    for items in (artifact.get("messages"), message.get("messages"),
+                  artifact.get("messagesOpenAIFormatted")):
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("role") == "tool_call_result":
+                found.append({"name": str(item.get("name") or ""), "type": "", "arguments": {}})
+            for call in item.get("toolCalls") or item.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except ValueError:
+                        arguments = {}
+                found.append({"name": str(function.get("name") or call.get("name") or ""),
+                              "type": str(call.get("type") or ""),
+                              "arguments": arguments if isinstance(arguments, dict) else {}})
+    return found
+
+
+def _call_transferred(message: dict, ended_reason: str) -> bool:
+    """Whether the call was really handed to staff: Vapi ended it as forwarded / during a transfer
+    ("assistant-forwarded-call", "customer-ended-call-during-transfer", "...-transfer-failed"), or a
+    transfer tool ran (Vapi's transferCall type, our "transfer_tool_outreach")."""
+    reason = ended_reason.strip().lower()
+    if reason == "assistant-forwarded-call" or "transfer" in reason:
+        return True
+    return any("transfer" in call["name"].lower() or call["type"] == "transferCall"
+               for call in _call_tool_calls(message))
+
+
+def _booking_link_requested(message: dict) -> bool:
+    """Whether the agent asked for the booking link text on the call (update_lead_status with a
+    booking_link status)."""
+    return any(str(call["arguments"].get("status") or "").startswith("booking_link")
+               for call in _call_tool_calls(message))
+
+
 def _settle_from_structured_output(
     trace: WorkflowTrace, message: dict, *, lead_id: str, event_id: int, call_id: str
 ) -> str | None:
@@ -494,6 +545,19 @@ def _settle_from_structured_output(
         if status in {"do_not_contact", "call_opt_out"}
         else True
     )
+    # A transfer from the summary needs a transfer on the call (owner, 2026-10-27). Demo call
+    # 01a17ce0: "Yes." / "Yep. Yes. Yes.", then a hang-up during "So this is for your leg visit";
+    # no transfer tool ran, Vapi said customer-ended-call, yet the summary said "transferred to a
+    # team member" and the lead left the cadence as "Call transferred". "Link and transfer" without
+    # a transfer keeps the link only if the agent asked for it on the call.
+    call = message.get("call") if isinstance(message.get("call"), dict) else {}
+    ended = str(message.get("endedReason") or call.get("endedReason") or "")
+    if status in _TRANSFER_STATUSES and not _call_transferred(message, ended):
+        trace.log("fallback_transfer_without_transfer", event_id=event_id, extracted=status)
+        if status == "booking_link_and_transfer" and _booking_link_requested(message):
+            status = "booking_link"
+        else:
+            answered = False
     if not answered:
         trace.log("fallback_refusal_without_answer", event_id=event_id, extracted=status)
         status = "no_answer"

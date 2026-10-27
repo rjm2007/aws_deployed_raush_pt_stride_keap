@@ -142,13 +142,18 @@ a time and hung up before confirming), the lead goes to Needs Review with code `
 group: "Patient asked to book, then hung up"; staff read the transcript, then continue the cadence or
 have the front desk call (owner, 2026-10-27).
 
-Check it all before a deploy: `uv run --frozen python scripts/check_hangup_rule.py` (16 cases, PASS / FAIL,
+Check it all before a deploy: `uv run --frozen python scripts/check_hangup_rule.py` (18 cases, PASS / FAIL,
 own throwaway Postgres on 127.0.0.1; see `../Hang-up-Booking-Tests.md`).
 
 A post-call summary's `declined` is applied only when the patient's own lines contain a refusal
 (`delivery.REFUSAL_PHRASES`; not inside a question), or a bare "no" / "nope" / "nah" as the answer to the
 introduction ("Do you have a moment?"). A bare "no" to the clinic, a time or the confirmation means "not
 that one". Otherwise the call counts as no answer and outreach goes on.
+
+A summary's `transferred_human` (or `booking_link_and_transfer`) is applied only if the call really was
+transferred: Vapi's endedReason is `assistant-forwarded-call` or mentions a transfer, or the report has a
+transfer tool call. Otherwise it counts as no answer (link-and-transfer keeps just the link if the agent
+asked for it on the call).
 
 ## Booking rules
 

@@ -2715,3 +2715,9 @@ patient actually said no.
   (Call group, same choices and pause as `call_outcome_not_applied`): "Patient asked to book, then hung
   up", Sheet "Needs review: patient asked to book, then hung up". Other rejected outcomes keep
   `call_outcome_not_applied`. No migration (`lead_reviews.code` is free text).
+- Transfer guard (same day, demo call 01a17ce0: hang-up during "So this is for your leg visit", summary said
+  `transferred_human`): `_settle_from_structured_output` accepts an extracted `transferred_human` /
+  `booking_link_and_transfer` only if Vapi's endedReason is `assistant-forwarded-call` or contains
+  "transfer", or the report has a transfer tool call (name contains "transfer", or type `transferCall`);
+  otherwise `no_answer`, cadence continues (link-and-transfer keeps `booking_link` if the agent asked for
+  the link on the call). `check_hangup_rule.py` cases 17-18.
