@@ -91,6 +91,60 @@ _SUMMARY = re.compile(r"\b(?:so )?that(?:s| is) ")
 # The tool's own waiting line ("One moment, please, while I confirm your appointment") is a separate
 # bot item after the tool call in Vapi's report; it is not Elliot's last word.
 _WAITING = re.compile(r"\bone moment please while i\b")
+# Every waiting line Vapi can play for the booking tools (request-start and request-response-delayed
+# `content` in config/vapi_booking_tools.json and config/vapi_booking_tools_human.json). Kept here
+# because the Docker image does not ship config/; tests/test_hang_up_waiting_lines.py keeps it in
+# sync with both files. Why (2026-10-27): the human copy of Elliot plays "Perfect, booking that now."
+# after the patient's yes; read as Elliot's last line, it hid the confirmation and the yes was lost.
+TOOL_WAITING_LINES = (
+    # config/vapi_booking_tools.json
+    "One moment, please, while I check our availability.",
+    "Thank you. One moment, please, while I confirm your appointment.",
+    "Thanks for your patience, I'm still confirming that for you.",
+    "One moment, please.",
+    # config/vapi_booking_tools_human.json
+    "Sure, let me look.",
+    "Okay, one sec.",
+    "Let me see what's open.",
+    "Let me check.",
+    "Perfect, booking that now.",
+    "Great, locking that in.",
+    "Okay, booking it now.",
+    "Almost done...",
+    "Still with you, it's just finishing up.",
+    "Sure, one sec.",
+    "Let me pull that up.",
+)
+# The book_appointment lines of both files (subset of TOOL_WAITING_LINES): they play right after
+# the patient's yes, so one cut to a single word ("Perfect,") is still a waiting line there.
+BOOKING_WAITING_LINES = (
+    "Thank you. One moment, please, while I confirm your appointment.",
+    "Thanks for your patience, I'm still confirming that for you.",
+    "Perfect, booking that now.",
+    "Great, locking that in.",
+    "Okay, booking it now.",
+    "Almost done...",
+    "Still with you, it's just finishing up.",
+)
+# Vapi's own stock fillers while a tool is slow.
+_STOCK_FILLERS = ("Sorry, a few more seconds.", "Just a sec.", "Just a second.", "One moment.",
+                  "Give me a moment.", "Give me a second.", "Hold on a moment.", "Hold on a sec.",
+                  "This'll just take a sec.")
+
+
+def _is_waiting_line(words: str) -> bool:
+    """A tool waiting line or stock filler, whole or cut short (Vapi stores a line cut off mid-word
+    when the call ends: "One moment, please, while I check our available"). A cut line must keep at
+    least two words, so a lone "Sure." or "Okay." from Elliot is never skipped."""
+    plain = _plain(words)
+    if not plain:
+        return False
+    if _WAITING.search(plain):
+        return True
+    cut = len(plain.split()) >= 2
+    return any(plain == line or (cut and line.startswith(plain)) for line in _WAITING_PLAIN)
+
+
 # What the card says for each book_slot reply that was not BOOKED.
 _PLAIN_WHY = {
     "TAKEN": "that time was no longer free",
@@ -105,6 +159,16 @@ def _plain(text: str) -> str:
     """Lower case, apostrophes dropped ("that's" -> "thats"), punctuation to spaces."""
     text = text.lower().replace("’", "'").replace("'", "")
     return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+_WAITING_PLAIN = tuple(_plain(line) for line in TOOL_WAITING_LINES + _STOCK_FILLERS)
+_BOOKING_WAITING_PLAIN = tuple(_plain(line) for line in BOOKING_WAITING_LINES)
+
+
+def _cut_booking_waiting_line(words: str) -> bool:
+    """Any start of a book_appointment waiting line, even one word ("Perfect," / "Okay,")."""
+    plain = _plain(words)
+    return bool(plain) and any(line.startswith(plain) for line in _BOOKING_WAITING_PLAIN)
 
 
 def _number_words(n: int) -> str:
@@ -201,10 +265,20 @@ def find_confirmation(turns: list[tuple[str, str]]) -> tuple[int, str, bool] | N
     spoke over it, so Vapi stored the line cut): never booked from that, only reviewed.
     """
     spoken = [i for i, (role, words) in enumerate(turns)
-              if role == "bot" and words.strip() and not _WAITING.search(_plain(words))]
+              if role == "bot" and words.strip() and not _is_waiting_line(words)]
     if not spoken:
         return None
     index = spoken[-1]
+    # Tester (2026-10-27): the booking waiting line cut to its first word ("Perfect,") right after
+    # the patient's yes to the confirmation is still the waiting line. Only there: a lone "Okay."
+    # anywhere else (or after a reply that is not a plain yes) stays Elliot's last line.
+    if len(spoken) >= 2 and _cut_booking_waiting_line(turns[index][1]):
+        before = spoken[-2]
+        replies = [w for role, w in turns[before + 1:index] if role == "user" and w.strip()]
+        if replies and plain_yes(replies):
+            found = find_confirmation(turns[:index])
+            if found and found[0] == before:
+                return found
     plain = _plain(turns[index][1])
     question, summary = _BOOK_QUESTION.search(plain), _SUMMARY.search(plain)
     if question:

@@ -2721,3 +2721,5 @@ patient actually said no.
   "transfer", or the report has a transfer tool call (name contains "transfer", or type `transferCall`);
   otherwise `no_answer`, cadence continues (link-and-transfer keeps `booking_link` if the agent asked for
   the link on the call). `check_hangup_rule.py` cases 17-18.
+
+- 2026-10-27 (later): human-sounding test copy of the booking agent: `config/vapi_booking_assistant_prompt_human.md` (varied acknowledgments and offer endings, shorter opening and closing, details read back once, no comma in dates) and `config/vapi_booking_tools_human.json` (several short request-start variants per tool, booking waits at 4.5 s and 9 s). Used by the copy assistant "Elliot confirm test" with its own tool copies; the main Elliot is unchanged. The yes-then-hang-up safety net now skips every tool waiting line and Vapi stock filler (`TOOL_WAITING_LINES`, `BOOKING_WAITING_LINES`; keep them in sync with both tool files - `tests/test_hang_up_waiting_lines.py` fails otherwise). `scripts/check_hangup_rule.py`: 20 cases.

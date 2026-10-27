@@ -286,6 +286,20 @@ def test_logged_tool_call_that_never_ran_still_books(env, call):
     assert _booked(env, lead, event)
 
 
+@pytest.mark.parametrize("waits", [["Perfect, booking that now."],
+                                   ["Perfect, booking that now.", "Almost done..."],
+                                   ["Perfect,"]])
+def test_human_copy_waiting_lines_after_the_yes_still_book(env, call, waits):
+    # The human copy of Elliot (2026-10-27) plays "Perfect, booking that now." / "Almost done..."
+    # after the yes; they are not Elliot's last line, so the yes still books.
+    lead, event, call_id = call
+    turns = [("user", "Hello?")] + OPENING + BIRTHDAY_YES + [
+        ("bot", CONFIRM), ("user", "Yes."), ("logged", "book_appointment")] + [
+        ("bot", w) for w in waits]
+    assert process_vapi_end_report(env.trace, _report(lead, event, call_id, turns)) == "booked"
+    assert _booked(env, lead, event)
+
+
 def test_other_confirmation_wording_books(env, call):
     lead, event, call_id = call
     confirm = ("Perfect. That is Tuesday the sixteenth at nine in the morning with Thao at our Laguna "

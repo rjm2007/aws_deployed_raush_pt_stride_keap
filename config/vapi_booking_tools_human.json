@@ -1,0 +1,222 @@
+{
+  "copied_from": "config/vapi_booking_tools.json (Outreach Booking Agent - Test / Elliot)",
+  "structured_output_id": "7170e50c-48d5-4416-b723-3a59fabb5371",
+  "prompt_file": "config/vapi_booking_assistant_prompt_human.md",
+  "note": "Human-sounding COPY of the booking tools, to be created as new tools on a copy of Elliot. Only `messages` differ from config/vapi_booking_tools.json; tool ids are the originals' and must be replaced by the new copies' ids. Several request-start messages are variants: Vapi picks one each time. Server auth (X-Vapi-Secret header + credentialId) is not stored here. ",
+  "tools": [
+    {
+      "type": "function",
+      "async": false,
+      "function": {
+        "name": "find_slots",
+        "description": "Find the nearest open appointment times for this patient's initial evaluation. Call it after the patient has confirmed the clinic, therapist preference, last-name spelling and date of birth, and again whenever they ask for another day, week, month, time of day, therapist or clinic. Only offer times this tool returns. The reply starts with a code such as OPENINGS, NOTHING_IN_RANGE or NO_SUCH_THERAPIST.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "when": {
+              "description": "When the patient wants to come in. earliest when they have no preference. specific_date for one named day. next_month or specific_month (with month) when they name a month. A later date or month is a search like any other; the reply says the last bookable day.",
+              "type": "string",
+              "enum": [
+                "earliest",
+                "today",
+                "tomorrow",
+                "this_week",
+                "next_week",
+                "in_two_weeks",
+                "specific_date",
+                "next_month",
+                "specific_month"
+              ]
+            },
+            "location": {
+              "description": "Only if the patient wants a different clinic than the one on file: Laguna Niguel, Dana Point or Mission Viejo.",
+              "type": "string"
+            },
+            "case_type": {
+              "description": "Only if the caller wants a different service than the one on file: the exact service name from the list of services we offer.",
+              "type": "string"
+            },
+            "time_of_day": {
+              "description": "Only if the patient asked for a part of the day.",
+              "type": "string",
+              "enum": [
+                "morning",
+                "afternoon",
+                "evening"
+              ]
+            },
+            "specific_date": {
+              "description": "Only with when=specific_date: the day the patient named, as YYYY-MM-DD, as you understand it. The tool places it on its own calendar.",
+              "type": "string"
+            },
+            "month": {
+              "description": "Only with when=specific_month: the month the patient named, as YYYY-MM (for example 2026-12), as you understand it. The tool places it on its own calendar.",
+              "type": "string"
+            },
+            "clinician_name": {
+              "description": "Only if the patient asked for a particular therapist: the name they said, for example 'Thao' or 'Dr. Rome'.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "when"
+          ]
+        }
+      },
+      "messages": [
+        {
+          "type": "request-start",
+          "content": "Sure, let me look.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Okay, one sec.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Let me see what's open.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Let me check.",
+          "blocking": false
+        }
+      ],
+      "server": {
+        "url": "https://demo.aibolt.ai/api/v1/tools/find-slots",
+        "timeoutSeconds": 20
+      },
+      "copied_from_tool_id": "f622d276-97aa-4125-b655-abd1d18ecefc"
+    },
+    {
+      "type": "function",
+      "async": false,
+      "function": {
+        "name": "book_appointment",
+        "description": "Book the time the patient just chose from the open-times tool. Call it right after they pick a time. The reply starts with a code: BOOKED or ALREADY_BOOKED means it is done; TAKEN or NOT_AVAILABLE lists other openings; IN_PROGRESS means an earlier request for this patient is still finishing: call it again with the same details, at most twice. PATIENT_EXISTS, UNCONFIRMED or FOLLOW_UP mean the booking was not made: our front desk team will take care of it. Never call it again after BOOKED, ALREADY_BOOKED, PATIENT_EXISTS, UNCONFIRMED or FOLLOW_UP.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "date": {
+              "description": "The chosen day as YYYY-MM-DD, from the parentheses in the open-times reply.",
+              "type": "string"
+            },
+            "time": {
+              "description": "The chosen time as the open-times reply wrote it, for example '9:00 AM'.",
+              "type": "string"
+            },
+            "email": {
+              "description": "Leave empty unless the patient gave it.",
+              "type": "string"
+            },
+            "location": {
+              "description": "Only if the patient changed clinic: Laguna Niguel, Dana Point or Mission Viejo.",
+              "type": "string"
+            },
+            "case_type": {
+              "description": "Only if the caller wants a different service than the one on file: the exact service name from the list of services we offer.",
+              "type": "string"
+            },
+            "last_name": {
+              "description": "The patient's last name exactly as they spelled it.",
+              "type": "string"
+            },
+            "first_name": {
+              "description": "The patient's first name.",
+              "type": "string"
+            },
+            "date_of_birth": {
+              "description": "The patient's date of birth as YYYY-MM-DD.",
+              "type": "string"
+            },
+            "clinician_name": {
+              "description": "The full name of the therapist for the chosen time, as the open-times reply wrote it.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "date",
+            "time",
+            "first_name",
+            "last_name",
+            "date_of_birth"
+          ]
+        }
+      },
+      "messages": [
+        {
+          "type": "request-start",
+          "content": "Perfect, booking that now.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Great, locking that in.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Okay, booking it now.",
+          "blocking": false
+        },
+        {
+          "type": "request-response-delayed",
+          "content": "Almost done...",
+          "timingMilliseconds": 4500
+        },
+        {
+          "type": "request-response-delayed",
+          "content": "Still with you, it's just finishing up.",
+          "timingMilliseconds": 9000
+        }
+      ],
+      "server": {
+        "url": "https://demo.aibolt.ai/api/v1/tools/book-appointment",
+        "timeoutSeconds": 30
+      },
+      "copied_from_tool_id": "0c8f0b68-fc8f-4459-bf83-1ef95df7a68e"
+    },
+    {
+      "type": "function",
+      "async": false,
+      "function": {
+        "name": "list_providers",
+        "description": "List the therapists the patient can see for their service at their clinic, with any credentials and short note on file. Call it when the patient asks who the therapists are, asks about a therapist, or asks for options. Answer only from what it returns.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "description": "Only if the patient changed clinic: Laguna Niguel, Dana Point or Mission Viejo.",
+              "type": "string"
+            },
+            "case_type": {
+              "description": "Only if the caller wants a different service than the one on file: the exact service name from the list of services we offer.",
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      "messages": [
+        {
+          "type": "request-start",
+          "content": "Sure, one sec.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Let me pull that up.",
+          "blocking": false
+        }
+      ],
+      "server": {
+        "url": "https://demo.aibolt.ai/api/v1/tools/list-providers",
+        "timeoutSeconds": 15
+      },
+      "copied_from_tool_id": "bbd1aed1-7443-4b2b-80b3-704e51c9e301"
+    }
+  ]
+}

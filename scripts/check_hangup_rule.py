@@ -356,6 +356,14 @@ def run_cases(verbose: bool) -> list[tuple[str, bool, str]]:
          lambda c: c.report(leg_visit[:-1] + [("tool", "transfer_tool_outreach")],
                             transferred_summary, "assistant-forwarded-call"),
          lambda s: s["status"] == "transferred_human", "Transferred to staff"),
+        ("19. Yes, then the human copy's waiting lines -> Booked",
+         lambda c: c.report(yes_then("Yes.") + [("tool", "book_appointment"),
+                                                ("bot", "Perfect, booking that now."),
+                                                ("bot", "Almost done...")]),
+         booked, "Booked"),
+        ("20. Yes, then a waiting line cut to one word -> Booked",
+         lambda c: c.report(yes_then("Yes.") + [("tool", "book_appointment"), ("bot", "Perfect,")]),
+         booked, "Booked"),
     ]
     results = []
     for name, action, check, expected in cases:
