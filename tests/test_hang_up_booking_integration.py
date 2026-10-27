@@ -161,6 +161,20 @@ def test_booked_summary_after_a_hang_up_while_choosing_is_a_hung_up_card(env, ca
     assert state["review"]["message"] == ("Patient asked to book, then hung up before confirming; "
                                           "nothing was booked")
     assert env.stride.count("appointments") == 0
+    # The call itself is settled with the card, so the Sheet shows it and the stale-call sweeper
+    # does not add a second "Call result never arrived" card two hours later.
+    assert state["event"] == {"status": "delivered", "outcome": "manual"}
+    # The sweeper's two call predicates (worker.run_safety_checks), scoped to this event because the
+    # local test database is shared: neither picks the settled call up, even hours later.
+    env.db.execute("update outreach_events set executed_at=now()-interval '3 hours',"
+                   "updated_at=now()-interval '3 hours' where id=%s", (event,))
+    assert env.one(
+        "select count(*) n from outreach_events where id=%s and ("
+        "(status='in_flight' and updated_at<now()-interval '15 minutes') or "
+        "(channel='call' and status='attempted' and executed_at<now()-interval '2 hours'))",
+        event)["n"] == 0
+    codes = env.db.execute("select code from lead_reviews where lead_id=%s", (lead,)).fetchall()
+    assert [r["code"] for r in codes] == ["booking_hung_up"]
 
 
 def test_no_to_the_confirmation_is_not_booked(env, call):

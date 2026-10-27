@@ -494,6 +494,11 @@ def test_sheet_action_status_only_for_system_outcomes():
         "Cadence completed"
     )
     assert _action_label({"status": "booked", "cadence_state": "completed"}) == "Booked"
+    assert _action_label({"status": "declined", "cadence_state": "terminated",
+                          "last_call_outcome": "not_interested"}) == "Declined on the call"
+    # Board close sets 'declined' too, but writes its own text once (board_closed).
+    assert _action_label({"status": "declined", "cadence_state": "terminated",
+                          "last_call_outcome": "no_answer"}) is None
 
 
 class _Rows:
@@ -1377,3 +1382,40 @@ def test_board_close_snapshot_says_closed_on_the_dashboard():
     assert (sheet["action_status"], sheet["lead_status"]) == ("Closed on the dashboard", "Closed")
     assert "action" not in sheet
     assert "action_status" not in build_sheet_snapshot(Closed(), lead, reasons=["stage_changed"])["sheet"]
+
+
+def _snapshot_with(**lead_fields):
+    class Lead(_SnapshotConnection):
+        def execute(self, query, params=None):
+            if "a.patient_dob" in query:
+                return _Rows(one=None)
+            rows = super().execute(query, params)
+            if query.startswith("select l.id,l.status"):
+                rows.one = {**rows.one, "needs_review": False, "review_reason": None, **lead_fields}
+            return rows
+
+    return build_sheet_snapshot(Lead(), "00000000-0000-0000-0000-000000000002",
+                                reasons=["call_settled"])["sheet"]
+
+
+def test_declined_on_the_call_rewrites_outcome_status():
+    """2026-10-27: a "No thanks" left "Cadence started" under Lead Status "Closed"."""
+    sheet = _snapshot_with(status="declined", cadence_state="terminated",
+                           last_call_outcome="not_interested", status_reason="patient declined",
+                           cadence_total=4, next_event_id=None)
+    assert (sheet["action_status"], sheet["lead_status"]) == ("Declined on the call", "Closed")
+    assert sheet["action"] == ""  # n8n mode: no "Start cadence" left to re-send
+
+
+def test_a_lead_still_in_cadence_keeps_cadence_started():
+    sheet = _snapshot_with(status="in_progress", cadence_state="active",
+                           last_call_outcome="no_answer", cadence_total=4, next_event_id=7)
+    assert "action_status" not in sheet  # the intake's "Cadence started" stays
+    assert sheet["lead_status"] == "In cadence"
+    assert "action" not in sheet
+
+
+def test_booked_outcome_status_unchanged():
+    sheet = _snapshot_with(status="booked", cadence_state="completed",
+                           last_call_outcome="booked", cadence_total=4, next_event_id=None)
+    assert (sheet["action_status"], sheet["action"]) == ("Booked", "Booked")

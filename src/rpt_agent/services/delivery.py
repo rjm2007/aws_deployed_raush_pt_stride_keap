@@ -579,17 +579,28 @@ def _settle_from_structured_output(
         # The summary says "booked" but no booking exists: the patient was asking about or picking
         # a time and hung up before confirming. Its own card, in plain words (owner, 2026-10-27).
         hung_up = status == "booked" and str(exc) == BOOKED_WITHOUT_APPOINTMENT
+        reason = (BOOKING_HUNG_UP_REASON if hung_up
+                  else f"structured outcome could not be applied: {exc}")
         with transaction() as conn:
+            # report_lead_status rolled back its own settle, so settle the call here with the card:
+            # left in_flight/attempted, the Sheet showed nothing for the call and the sweeper later
+            # added a second "Call result never arrived" card. Lead before event, as above.
+            conn.execute("select id from leads where id=%s for update", (lead_id,))
+            settled = conn.execute(
+                "update outreach_events set status='delivered',settled_at=now(),"
+                "settled_by='webhook',outcome='manual',failure_reason=%s,updated_at=now() "
+                "where id=%s and lead_id=%s and status in ('in_flight','attempted') "
+                "returning outcome",
+                (reason, event_id, lead_id),
+            ).fetchone()
             flag_lead_for_review(
-                conn, lead_id,
-                BOOKING_HUNG_UP_REASON if hung_up
-                else f"structured outcome could not be applied: {exc}",
+                conn, lead_id, reason,
                 code="booking_hung_up" if hung_up else "call_outcome_not_applied",
                 source="call", outreach_event_id=event_id,
                 details={"call_id": call_id, "extracted_status": status},
             )
         trace.log("validation_failed", reason="structured_output_rejected")
-        return None
+        return settled["outcome"] if settled else None
     with transaction() as conn:
         row = conn.execute(
             "select outcome from outreach_events where id=%s", (event_id,)

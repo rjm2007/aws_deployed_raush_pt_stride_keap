@@ -201,11 +201,17 @@ def _flag_for_rejected_outcome(monkeypatch, status, error):
     from rpt_agent.observability import WorkflowTrace
     from rpt_agent.services import delivery, lead_status
 
-    flagged = {}
+    flagged = {"sql": []}
+
+    class FakeConn:
+        def execute(self, sql, params=()):
+            flagged["sql"].append((sql, params))
+            row = {"outcome": "manual"} if "update outreach_events" in sql else None
+            return type("Cursor", (), {"fetchone": lambda self: row})()
 
     @contextmanager
     def fake_transaction():
-        yield None
+        yield FakeConn()
 
     def fake_report(trace, **kwargs):
         raise error
@@ -218,8 +224,13 @@ def _flag_for_rejected_outcome(monkeypatch, status, error):
     monkeypatch.setattr(lead_status, "report_lead_status", fake_report)
     message = {"artifact": {"structuredOutputs": {"x": {"result": {"status": status}}},
                             "messages": []}}
+    # The call is settled with the card (lead locked first), not left for the sweeper.
     assert delivery._settle_from_structured_output(
-        WorkflowTrace("t", "test"), message, lead_id="lead-1", event_id=1, call_id="c") is None
+        WorkflowTrace("t", "test"), message, lead_id="lead-1", event_id=1, call_id="c") == "manual"
+    lock, settle = flagged.pop("sql")
+    assert "from leads" in lock[0] and "for update" in lock[0]
+    assert "outcome='manual'" in settle[0] and "status in ('in_flight','attempted')" in settle[0]
+    assert settle[1] == (flagged["reason"], 1, "lead-1")
     return flagged
 
 

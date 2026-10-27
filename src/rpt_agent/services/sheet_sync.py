@@ -74,6 +74,9 @@ def enqueue_sheet_update(
 
 SHEET_REPLACED = "Closed: a newer row has this phone number"
 SHEET_RESTARTED = "Closed: another row with this phone number was restarted"
+# The patient said no on a call (2026-10-27): the cell kept "Cadence started" under Lead Status
+# "Closed" and Call Outcome "Answered - declined", so staff thought the calls were still going.
+SHEET_DECLINED = "Declined on the call"
 
 
 def _action_label(lead: dict[str, Any]) -> str | None:
@@ -82,7 +85,7 @@ def _action_label(lead: dict[str, Any]) -> str | None:
     Intake/recovery already write Lead ID and Cadence started / restarted / DNC.
     Re-sending those from the AWS webhook overwrote the intake row and made it look
     like the status webhook owned start/Lead ID. Only emit labels that outreach can
-    set after the fact (completed cadence, voice/tool DNC).
+    set after the fact (completed cadence, voice/tool DNC, declined on the call).
     """
     from .review import REPLACED_REASON, RESTARTED_REASON  # review imports this module
 
@@ -97,12 +100,23 @@ def _action_label(lead: dict[str, Any]) -> str | None:
         return SHEET_RESTARTED
     if lead["status"] == "do_not_contact":
         return "Do Not Contact applied"  # same words as the Sheet command's own result
+    if _declined_on_call(lead):
+        return SHEET_DECLINED
     if _stride_problem(lead):
         # The n8n intake skips rows whose Outcome Status starts with "Needs review".
         return f"Needs review: {lead['review_reason']}"
     if lead["cadence_state"] == "completed":
         return "Cadence completed"
     return None
+
+
+def _declined_on_call(lead: dict[str, Any]) -> bool:
+    """Closed by the patient's own "no" on a call (lead_status: declined + not_interested).
+
+    A board move to Closed also sets status 'declined', but keeps the last call outcome; it writes
+    its own "Closed on the dashboard" once (DASHBOARD_OUTCOMES) and later snapshots leave it.
+    """
+    return lead["status"] == "declined" and lead.get("last_call_outcome") == "not_interested"
 
 
 def _stride_problem(lead: dict[str, Any]) -> bool:
@@ -302,7 +316,7 @@ def build_sheet_snapshot(
     """Build the current Sheet view from committed database truth."""
     lead = conn.execute(
         "select l.id,l.status,l.cadence_state,l.needs_review,l.review_reason,l.callback_requested_at,"
-        "l.sms_disabled,l.status_reason,"
+        "l.sms_disabled,l.status_reason,l.last_call_outcome,"
         "coalesce(l.timezone,p.timezone,'America/Los_Angeles') as timezone,"
         # For the board column (Lead Status): is the cadence spent?
         "(select count(*) from outreach_events t where t.lead_id=l.id) as cadence_total,"
@@ -431,7 +445,8 @@ def build_sheet_snapshot(
     # it runs and the cell empties (owner, 2026-10-25); the backend never fills Action.
     if lead["status"] == "booked":
         sheet["action"] = "Booked"
-    elif _stride_problem(lead):
+    elif _stride_problem(lead) or _declined_on_call(lead):
+        # Declined: the n8n intake would re-send a "Start cadence" left next to the new words.
         sheet["action"] = ""
 
     return {

@@ -239,6 +239,18 @@ def test_a_snapshot_without_action_status_keeps_the_outcome_cell():
     assert grid.rows[0].get("call_outcome") == "No answer"
 
 
+def test_a_declined_snapshot_replaces_cadence_started():
+    """2026-10-27: a decline on the call reaches the Outcome Status cell in direct mode."""
+    _, _, grid = _grid_with(name="Asha Rao", lead_id="L1", action="",
+                            outcome_status="Cadence started", lead_status="In cadence")
+    apply_snapshot(grid, {"lead_id": "L1", "sheet": {
+        "call_outcome": "Answered - declined", "action_status": "Declined on the call",
+        "action": "", "lead_status": "Closed"}})
+    row = grid.rows[0]
+    assert row.get("outcome_status") == "Declined on the call"
+    assert row.get("lead_status") == "Closed" and row.get("action") == ""
+
+
 def test_sheet_archive_days_zero_is_not_the_default(monkeypatch):
     from types import SimpleNamespace
 
