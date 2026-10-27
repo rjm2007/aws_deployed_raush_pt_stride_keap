@@ -92,17 +92,18 @@ _SUMMARY = re.compile(r"\b(?:so )?that(?:s| is) ")
 # bot item after the tool call in Vapi's report; it is not Elliot's last word.
 _WAITING = re.compile(r"\bone moment please while i\b")
 # Every waiting line Vapi can play for the booking tools (request-start and request-response-delayed
-# `content` in config/vapi_booking_tools.json and config/vapi_booking_tools_human.json). Kept here
-# because the Docker image does not ship config/; tests/test_hang_up_waiting_lines.py keeps it in
-# sync with both files. Why (2026-10-27): the human copy of Elliot plays "Perfect, booking that now."
-# after the patient's yes; read as Elliot's last line, it hid the confirmation and the yes was lost.
+# `content` in config/vapi_booking_tools.json), plus the old lines used before 2026-10-27 (calls in
+# flight and stored reports still have them). Kept here because the Docker image does not ship
+# config/; tests/test_hang_up_waiting_lines.py fails if a tool-file line is missing. Why (2026-10-27):
+# Elliot plays "Perfect, booking that now." after the patient's yes; read as Elliot's last line, it
+# hid the confirmation and the yes was lost.
 TOOL_WAITING_LINES = (
-    # config/vapi_booking_tools.json
+    # Old lines (before 2026-10-27), still recognised
     "One moment, please, while I check our availability.",
     "Thank you. One moment, please, while I confirm your appointment.",
     "Thanks for your patience, I'm still confirming that for you.",
     "One moment, please.",
-    # config/vapi_booking_tools_human.json
+    # config/vapi_booking_tools.json
     "Sure, let me look.",
     "Okay, one sec.",
     "Let me see what's open.",
@@ -114,7 +115,7 @@ TOOL_WAITING_LINES = (
     "Sure, one sec.",
     "Let me pull that up.",
 )
-# The book_appointment lines of both files (subset of TOOL_WAITING_LINES): they play right after
+# The book_appointment lines, old and current (subset of TOOL_WAITING_LINES): they play right after
 # the patient's yes, so one cut to a single word ("Perfect,") is still a waiting line there.
 BOOKING_WAITING_LINES = (
     "Thank you. One moment, please, while I confirm your appointment.",

@@ -1,8 +1,9 @@
 """The hang-up safety net skips every tool waiting line when it looks for Elliot's last line.
 
-Why (2026-10-27): the human copy of Elliot plays "Perfect, booking that now." after the patient's
-yes; taken as Elliot's last line, it hid the confirmation. The Docker image does not ship config/,
-so hang_up_booking keeps the lines as a constant; this test keeps it in sync with both tool files.
+Why (2026-10-27): Elliot plays "Perfect, booking that now." after the patient's yes; taken as
+Elliot's last line, it hid the confirmation. The Docker image does not ship config/, so
+hang_up_booking keeps the lines as a constant; this test checks every tool-file line is in it. The
+old lines (before 2026-10-27) stay in the constant for calls in flight and stored reports.
 """
 import json
 from pathlib import Path
@@ -17,26 +18,41 @@ from rpt_agent.services.hang_up_booking import (
 )
 
 CONFIG = Path(__file__).parents[1] / "config"
+OLD_LINES = ("One moment, please, while I check our availability.",
+             "Thank you. One moment, please, while I confirm your appointment.",
+             "Thanks for your patience, I'm still confirming that for you.",
+             "One moment, please.")
+OLD_BOOKING_LINES = OLD_LINES[1:3]
 CONFIRM = ("So that's Tuesday the sixteenth at nine in the morning with Thao at our Laguna Niguel "
            "office. Shall I book it?")
 
 
 def _config_lines(tool: str | None = None) -> set[str]:
-    lines = set()
-    for name in ("vapi_booking_tools.json", "vapi_booking_tools_human.json"):
-        tools = json.loads((CONFIG / name).read_text(encoding="utf-8"))["tools"]
-        lines |= {m["content"] for t in tools for m in t.get("messages", [])
-                  if m["type"] in ("request-start", "request-response-delayed")
-                  and tool in (None, t["function"]["name"])}
-    return lines
+    tools = json.loads((CONFIG / "vapi_booking_tools.json").read_text(encoding="utf-8"))["tools"]
+    return {m["content"] for t in tools for m in t.get("messages", [])
+            if m["type"] in ("request-start", "request-response-delayed")
+            and tool in (None, t["function"]["name"])}
 
 
-def test_constant_matches_both_tool_files():
-    assert set(TOOL_WAITING_LINES) == _config_lines()
-    assert set(BOOKING_WAITING_LINES) == _config_lines("book_appointment")
+def test_constant_has_every_tool_file_line():
+    assert _config_lines() <= set(TOOL_WAITING_LINES)
+    assert _config_lines("book_appointment") <= set(BOOKING_WAITING_LINES)
+    assert set(BOOKING_WAITING_LINES) <= set(TOOL_WAITING_LINES)
+    # Nothing in the constant besides the tool-file lines and the old lines.
+    assert set(TOOL_WAITING_LINES) <= _config_lines() | set(OLD_LINES)
 
 
-@pytest.mark.parametrize("line", sorted(_config_lines()) + [
+def test_old_lines_are_still_recognised():
+    assert set(OLD_LINES) <= set(TOOL_WAITING_LINES)
+    assert set(OLD_BOOKING_LINES) <= set(BOOKING_WAITING_LINES)
+    for line in OLD_LINES:
+        assert _is_waiting_line(line)
+    for line in OLD_BOOKING_LINES:
+        found = find_confirmation([("bot", CONFIRM), ("user", "Yes."), ("bot", line)])
+        assert found and found[0] == 0 and found[2]
+
+
+@pytest.mark.parametrize("line", sorted(_config_lines() | set(OLD_LINES)) + [
     "One moment, please, while I check our available",  # cut short at the hang-up
     "Perfect, booking that",
     "Perfect, booking that now. It'll just",

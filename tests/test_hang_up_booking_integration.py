@@ -290,8 +290,8 @@ def test_logged_tool_call_that_never_ran_still_books(env, call):
                                    ["Perfect, booking that now. It'll just take a few seconds.",
                                     "Thanks for waiting, nearly there."],
                                    ["Perfect,"]])
-def test_human_copy_waiting_lines_after_the_yes_still_book(env, call, waits):
-    # The human copy of Elliot (2026-10-27) plays "Perfect, booking that now. ..." / "Thanks for waiting, ..."
+def test_new_waiting_lines_after_the_yes_still_book(env, call, waits):
+    # Elliot (since 2026-10-27) plays "Perfect, booking that now. ..." / "Thanks for waiting, ..."
     # after the yes; they are not Elliot's last line, so the yes still books.
     lead, event, call_id = call
     turns = [("user", "Hello?")] + OPENING + BIRTHDAY_YES + [

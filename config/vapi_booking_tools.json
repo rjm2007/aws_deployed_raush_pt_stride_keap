@@ -69,7 +69,22 @@
       "messages": [
         {
           "type": "request-start",
-          "content": "One moment, please, while I check our availability.",
+          "content": "Sure, let me look.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Okay, one sec.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Let me see what's open.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Let me check.",
           "blocking": false
         }
       ],
@@ -137,13 +152,23 @@
       "messages": [
         {
           "type": "request-start",
-          "content": "Thank you. One moment, please, while I confirm your appointment.",
+          "content": "Perfect, booking that now. It'll just take a few seconds.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Great, I'll lock that in. Just a few seconds.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Okay, booking that for you now. Just a few seconds.",
           "blocking": false
         },
         {
           "type": "request-response-delayed",
-          "content": "Thanks for your patience, I'm still confirming that for you.",
-          "timingMilliseconds": 9000
+          "content": "Thanks for waiting, nearly there.",
+          "timingMilliseconds": 12000
         }
       ],
       "server": {
@@ -176,7 +201,12 @@
       "messages": [
         {
           "type": "request-start",
-          "content": "One moment, please.",
+          "content": "Sure, one sec.",
+          "blocking": false
+        },
+        {
+          "type": "request-start",
+          "content": "Let me pull that up.",
           "blocking": false
         }
       ],

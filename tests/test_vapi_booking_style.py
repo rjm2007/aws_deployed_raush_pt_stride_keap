@@ -1,7 +1,7 @@
-"""Checks for the human-sounding copy of Elliot (owner, 2026-10-27: tried on a copy first).
+"""Checks for Elliot's human-sounding style (tested on a copy, moved to the main agent 2026-10-27).
 
-The main prompt and tools stay as they are; these files only change wording. The 3f2 confirmation
-must stay word for word because the hang-up safety net (services/hang_up_booking.py) parses it.
+The 3f2 confirmation must stay word for word because the hang-up safety net
+(services/hang_up_booking.py) parses it.
 """
 import json
 from pathlib import Path
@@ -9,22 +9,20 @@ from pathlib import Path
 from rpt_agent.services.hang_up_booking import find_confirmation
 
 CONFIG = Path(__file__).parents[1] / "config"
-MAIN_PROMPT = (CONFIG / "vapi_booking_assistant_prompt.md").read_text(encoding="utf-8")
-PROMPT = (CONFIG / "vapi_booking_assistant_prompt_human.md").read_text(encoding="utf-8")
+PROMPT = (CONFIG / "vapi_booking_assistant_prompt.md").read_text(encoding="utf-8")
 FLAT = " ".join(PROMPT.split())
-MAIN_TOOLS = json.loads((CONFIG / "vapi_booking_tools.json").read_text(encoding="utf-8"))
-TOOLS = json.loads((CONFIG / "vapi_booking_tools_human.json").read_text(encoding="utf-8"))
+RAW_TOOLS = (CONFIG / "vapi_booking_tools.json").read_text(encoding="utf-8")
+TOOLS = json.loads(RAW_TOOLS)
 CONFIRMATION = ("\"So that's [day] the [date] at [time] with [therapist first name] at our [clinic] "
                 "office. Shall I book it?\"")
 
 
-def _tool(tools: dict, name: str) -> dict:
-    return next(t for t in tools["tools"] if t["function"]["name"] == name)
+def _tool(name: str) -> dict:
+    return next(t for t in TOOLS["tools"] if t["function"]["name"] == name)
 
 
 def test_confirmation_is_word_for_word_and_still_parsed():
     assert CONFIRMATION in FLAT
-    assert CONFIRMATION in " ".join(MAIN_PROMPT.split())
     example = "So that's Thursday the eighteenth at eleven in the morning with Thao at our Laguna Niguel office. Shall I book it?"
     assert example in FLAT
     found = find_confirmation([("bot", example)])
@@ -40,11 +38,11 @@ def test_rule_9_no_longer_quotes_the_old_waiting_line_but_still_forbids_it():
 
 
 def test_tools_have_variants_and_no_old_patience_line():
-    find = [m for m in _tool(TOOLS, "find_slots")["messages"] if m["type"] == "request-start"]
+    find = [m for m in _tool("find_slots")["messages"] if m["type"] == "request-start"]
     assert len(find) >= 3
-    assert len([m for m in _tool(TOOLS, "list_providers")["messages"]
+    assert len([m for m in _tool("list_providers")["messages"]
                 if m["type"] == "request-start"]) >= 2
-    book = _tool(TOOLS, "book_appointment")["messages"]
+    book = _tool("book_appointment")["messages"]
     assert len([m for m in book if m["type"] == "request-start"]) >= 3
     delayed = [m for m in book if m["type"] == "request-response-delayed"]
     assert [m["timingMilliseconds"] for m in delayed] == [12000]
@@ -54,19 +52,15 @@ def test_tools_have_variants_and_no_old_patience_line():
         for m in tool["messages"]:
             if m["type"] == "request-start":
                 assert m["blocking"] is False and m["content"].strip()
-    raw = (CONFIG / "vapi_booking_tools_human.json").read_text(encoding="utf-8")
-    assert "Thanks for your patience" not in raw
-    assert "Almost done" not in raw and "Still with you" not in raw
-    assert "\"credentialId\"" not in raw and "\"secret\"" not in raw.lower()
+    assert "Thanks for your patience" not in RAW_TOOLS
+    assert "One moment, please" not in RAW_TOOLS
+    assert "Almost done" not in RAW_TOOLS and "Still with you" not in RAW_TOOLS
+    assert "\"credentialId\"" not in RAW_TOOLS and "\"secret\"" not in RAW_TOOLS.lower()
 
 
-def test_tools_differ_from_main_only_in_messages():
-    assert [t["function"]["name"] for t in TOOLS["tools"]] == \
-        [t["function"]["name"] for t in MAIN_TOOLS["tools"]]
-    for main, human in zip(MAIN_TOOLS["tools"], TOOLS["tools"]):
-        assert human["function"] == main["function"]
-        assert human["server"] == main["server"]
-        assert human["async"] == main["async"]
+def test_tool_ids_unchanged():
+    assert {t["function"]["name"]: t["id"][:8] for t in TOOLS["tools"]} == {
+        "find_slots": "f622d276", "book_appointment": "0c8f0b68", "list_providers": "bbd1aed1"}
 
 
 def test_closing_is_short_and_already_booked_without_time_unchanged():

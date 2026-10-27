@@ -105,7 +105,8 @@ office. Shall I book it?"
 `services/hang_up_booking.py` (`book_confirmed_time_after_hang_up`) runs from the end-of-call report
 (`delivery.process_vapi_end_report`) for an answered call whose event is unsettled, before the post-call
 summary.
-- Elliot's last line (the tool's own "One moment, please, while I ..." line ignored) must be a
+- Elliot's last line (tool waiting lines such as "Perfect, booking that now. ..." and Vapi fillers
+  ignored; list in `TOOL_WAITING_LINES`) must be a
   confirmation: "(so) that's / that is ..." plus "shall / should / can I (go ahead and) book it / that
   (for you)", "(do you) want me to book it" or "would you like me to book it". Case and punctuation
   ignored.
