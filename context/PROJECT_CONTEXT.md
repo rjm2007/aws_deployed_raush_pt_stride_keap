@@ -2780,3 +2780,26 @@ patient actually said no.
 - Demo open slots now show 3 hours earlier than in Stride's own UI (Stride shows Eastern). Expected.
 - Tests: `tests/test_dashboard_calendar.py`, `tests/test_appointment_views_integration.py` (01:00 Eastern lands on
   the previous California day).
+
+### 2026-10-29 — Structured output: no_decision, already_booked, wrong-person check, stored (branch `feature/own-postgres`)
+
+Spec and owner decisions: `../Structured-Output-Review.md`. Only `delivery._settle_from_structured_output`
+(answered call, no tool reported) changed.
+- `no_decision` (new status): same as no status: `no_answer`, cadence continues, summary kept as the note.
+- `already_booked` (new): `report_lead_status` closes the lead with no migration: status `declined`, cadence
+  `terminated`, last outcome / event outcome `not_interested`, `status_reason = ALREADY_BOOKED_REASON`
+  ("Already booked or already a patient"), planned steps skipped, history reason = that + the summary. Shown as
+  such on the dashboard (`_closed_reason`, the call's Activity line) and the Sheet (Outcome Status "Closed:
+  already booked or already a patient", call "Already booked or a patient"; not "Declined on the call").
+  Needs a patient reply after Elliot's first line, else `no_answer`.
+- `wrong_person` (and its old name `manual`): accepted only if `_patient_said_wrong_person`: after the identity
+  question ("speaking with / is this / are you") the person said a wrong-person phrase (`WRONG_PERSON_PHRASES`)
+  or a bare "No." straight to that question, never said yes / speaking / that's me before it, and nothing
+  sounds like family or "not home" (owner: family member is not a wrong number). Else `no_answer`. Demo calls
+  648 ("Yes." then "No.") and 650 ("Hello?") are tests.
+- A callback with no time (`CALLBACK_WITHOUT_TIME`) gets its own card `callback_no_time` "Asked to be called
+  later, no time given". It and `booking_hung_up` offer only "Continue cadence" / "Front desk will handle"
+  (`lead_review.CODE_CHOICES`); other choices are refused (409). Unknown statuses still go to review.
+- Every end-of-call report with structured outputs stores them (as sent) in `call_logs.structured_output`
+  (migration 053, `add column if not exists ... jsonb`; apply on demo before deploying this code).
+

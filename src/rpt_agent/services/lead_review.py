@@ -57,6 +57,8 @@ GROUP_OF = {
     # The call summary said booked, but nothing was booked: the patient hung up while asking about
     # or choosing a time (owner, 2026-10-27; delivery._settle_from_structured_output).
     "booking_hung_up": "call",
+    # "Call me later" with no time, then the call ended (owner, 2026-10-28).
+    "callback_no_time": "call",
     "unrecognized_status": "call",
     "call_failed": "technical",
     "dispatch_failed": "technical",
@@ -110,6 +112,7 @@ TITLES = {
     "call_no_outcome": "Call answered, no outcome",
     "call_outcome_not_applied": "Call outcome could not be applied",
     "booking_hung_up": "Patient asked to book, then hung up",
+    "callback_no_time": "Asked to be called later, no time given",
     "unrecognized_status": "Unknown call result",
     "call_failed": "Call could not be placed",
     "dispatch_failed": "Call or text could not be sent",
@@ -180,6 +183,15 @@ GROUP_CHOICES = {
     "other": ["continue", "restart_cadence", "front_desk"],
 }
 
+# A card whose choices are not its group's. Asked to book / to be called later, then the call ended
+# (owner, 2026-10-29): the number is not in doubt, so only continue the cadence or the front desk.
+CODE_CHOICES = {
+    "booking_hung_up": ["continue", "front_desk"],
+    "callback_no_time": ["continue", "front_desk"],
+}
+CODE_CHOICE_LABELS = {("booking_hung_up", "continue"): "Continue cadence",
+                      ("callback_no_time", "continue"): "Continue cadence"}
+
 RESUME_CHOICES = {"use_new_name", "keep_old_name", "use_new_value", "keep_old_value", "calls_only",
                   "retry_texts", "number_ok", "continue"}
 # Restart from Day 0. A variant also applies its name / value choice first (RESTART_BASE).
@@ -200,7 +212,7 @@ DETAIL_FIELDS = {
 
 def choice_label(choice: str, code: str | None = None) -> str:
     """A choice in staff words; "value" choices name the field of their review ("Use new case & ...")."""
-    label = CHOICE_LABELS.get(choice, choice)
+    label = CODE_CHOICE_LABELS.get((code, choice)) or CHOICE_LABELS.get(choice, choice)
     if code in DETAIL_FIELDS and "value" in label:
         label = label.replace("value", DETAIL_FIELDS[code][2])
     return label
@@ -266,6 +278,8 @@ def sheet_open_status(code: str | None, details: dict | None) -> str:
         return "Needs review: wrong number"
     if code == "booking_hung_up":
         return "Needs review: patient asked to book, then hung up"
+    if code == "callback_no_time":
+        return "Needs review: asked to be called later, no time given"
     if group == "call":
         return "Needs review: call result unclear"
     if group == "technical":
@@ -477,6 +491,9 @@ def _plain_reason(row: dict, lead: dict) -> str:
         return ("The patient was asking about times or choosing one and hung up before confirming. "
                 "Nothing was booked. Read the transcript, then continue the cadence or have the front "
                 "desk call them.")
+    if code == "callback_no_time":
+        return ("The patient asked to be called later but gave no time, and the call ended. Read the "
+                "transcript, then continue the cadence or have the front desk call them.")
     if code == "unrecognized_status":
         return "The agent reported a call result the system does not know. Read the transcript."
     if code == "call_failed":
@@ -598,7 +615,7 @@ def describe(row: dict, lead: dict, *, has_calls: bool = False, more: bool = Fal
     failure = sms_failure(details.get("error_code")) if group == "text" else None
     no_texts = bool(lead.get("sms_opt_out") or lead.get("sms_disabled"))
     choices = [
-        choice for choice in GROUP_CHOICES[group]
+        choice for choice in CODE_CHOICES.get(code, GROUP_CHOICES[group])
         if not (choice == "retry_texts" and failure and failure["permanent"])
         # A pre-048 name review never recorded the new name, so there is nothing to "use".
         and not (choice in {"use_new_name", "use_new_name_restart"} and not details.get("new_name"))

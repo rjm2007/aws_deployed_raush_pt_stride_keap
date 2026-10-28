@@ -33,6 +33,7 @@ from ..services.lead_review import (
 )
 from ..services.lead_stage import STAGE_SQL
 from ..services.lead_stage import stage_of as _stage
+from ..services.lead_status import ALREADY_BOOKED_REASON
 from ..services.number_block import (
     NumberBlockError,
     block_number,
@@ -241,6 +242,8 @@ def _closed_reason(row: dict) -> str:
         return "Closed: another row with this phone number was restarted"
     if reason == FRONT_DESK_REASON:
         return FRONT_DESK_REASON
+    if reason == ALREADY_BOOKED_REASON and row["status"] == "declined":
+        return ALREADY_BOOKED_REASON
     if row["status"] == "invalid_phone" and row.get("cadence_state") == "terminated":
         if reason.startswith("Phone number changed"):
             return "Phone changed: add a new row"
@@ -547,6 +550,10 @@ def _build_activity(audits, events, status_history, appointments, reviews=(),
     # A call's outcome is settled in the same transaction as the lead's status line: the call's own
     # line names the outcome, so that status line is not shown again.
     call_settled_at = set()
+    # Closed as "already booked / already a patient": the call's outcome is not_interested (no outcome
+    # of its own), so its line says what the status line it hides says (2026-10-29).
+    already_booked_at = {row["changed_at"] for row in status_history
+                         if str(row.get("reason") or "").startswith(ALREADY_BOOKED_REASON)}
     for event in events:
         # planned: not done yet. skipped: a step cancelled by another event (booked, restart, ...),
         # which has its own line.
@@ -562,6 +569,8 @@ def _build_activity(audits, events, status_history, appointments, reviews=(),
         if is_call and event.get("outcome"):
             outcome = str(event["outcome"])
             title = f"Call: {CALL_OUTCOME_WORDS.get(outcome, outcome.replace('_', ' '))}"
+            if outcome == "not_interested" and event.get("settled_at") in already_booked_at:
+                title = "Call: already booked or already a patient"
         else:
             words = ("made" if is_call else "sent") if status == "delivered" and not carrier else (
                 EVENT_STATUS_WORDS.get(status, status.replace("_", " ")) if status != "delivered"

@@ -1407,6 +1407,23 @@ def test_declined_on_the_call_rewrites_outcome_status():
     assert sheet["action"] == ""  # n8n mode: no "Start cadence" left to re-send
 
 
+def test_already_booked_on_the_call_is_closed_with_its_own_words():
+    """2026-10-29: "I already booked" closes the lead; the Sheet must not say "Declined"."""
+    from rpt_agent.services.lead_status import ALREADY_BOOKED_REASON
+
+    sheet = _snapshot_with(status="declined", cadence_state="terminated",
+                           last_call_outcome="not_interested", status_reason=ALREADY_BOOKED_REASON,
+                           cadence_total=4, next_event_id=None)
+    assert (sheet["action_status"], sheet["lead_status"]) == (
+        "Closed: already booked or already a patient", "Closed")
+    assert sheet["action"] == ""
+    lead = {"status": "declined", "cadence_state": "terminated",
+            "last_call_outcome": "not_interested", "status_reason": ALREADY_BOOKED_REASON}
+    _, call, _, _ = format_cadence_columns(
+        [{"channel": "call", "status": "delivered", "outcome": "not_interested"}], lead)
+    assert call == "Already booked or a patient"
+
+
 def test_a_lead_still_in_cadence_keeps_cadence_started():
     sheet = _snapshot_with(status="in_progress", cadence_state="active",
                            last_call_outcome="no_answer", cadence_total=4, next_event_id=7)

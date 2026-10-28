@@ -1733,3 +1733,21 @@ def test_lead_list_and_board_refuse_bad_input_with_422(monkeypatch, path):
         assert response.status_code == 422, (path, response.status_code)
     finally:
         get_settings.cache_clear()
+
+
+def test_already_booked_close_is_named_on_the_card_and_in_activity():
+    """2026-10-29: closed as "already booked / already a patient", not "Not interested"."""
+    from rpt_agent.services.lead_status import ALREADY_BOOKED_REASON
+
+    row = {"status": "declined", "cadence_state": "terminated", "status_reason": ALREADY_BOOKED_REASON}
+    assert dashboard_routes._closed_reason(row) == ALREADY_BOOKED_REASON
+    assert dashboard_routes._closed_reason({**row, "status_reason": "x"}) == "Not interested"
+    now = datetime.now(UTC)
+    call = {"id": 3, "status": "delivered", "channel": "call", "outcome": "not_interested",
+            "created_at": now, "executed_at": now, "settled_at": now}
+    history = [{"from_status": "in_progress", "to_status": "declined", "source": "call summary",
+                "reason": f"{ALREADY_BOOKED_REASON}. Said she booked last week.", "changed_at": now}]
+    titles = [e["title"] for e in dashboard_routes._build_activity([], [call], history, [])]
+    assert titles == ["Call: already booked or already a patient"]
+    titles = [e["title"] for e in dashboard_routes._build_activity([], [call], [], [])]
+    assert titles == ["Call: not interested"]

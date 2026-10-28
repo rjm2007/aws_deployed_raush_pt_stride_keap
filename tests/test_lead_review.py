@@ -304,9 +304,9 @@ def test_booked_then_hung_up_card_is_plain_and_general():
     assert card["reason"] == ("The patient was asking about times or choosing one and hung up before "
                               "confirming. Nothing was booked. Read the transcript, then continue the "
                               "cadence or have the front desk call them.")
-    assert [o["choice"] for o in card["options"]] == \
-        [o["choice"] for o in describe(_review("call_outcome_not_applied"), LEAD,
-                                       has_calls=True)["options"]]
+    # Owner, 2026-10-29: the number is not in doubt, so only these two (not the call group's four).
+    assert card["options"] == [{"choice": "continue", "label": "Continue cadence"},
+                               {"choice": "front_desk", "label": "Front desk will handle"}]
     assert card["transcript_url"] == "/leads/lead-1/conversations/calls"
     assert sheet_open_status("booking_hung_up", {}) == \
         "Needs review: patient asked to book, then hung up"
@@ -317,3 +317,53 @@ def test_booking_cards_and_sheet_words_name_what_happened():
     assert sheet_open_status("booking_patient_exists", {}) == \
         "Needs review: patient already in Stride, book by hand"
     assert "front desk team will take care" in describe(_review("booking_unclear"), LEAD)["reason"]
+
+
+# --- owner, 2026-10-29: asked to book / to be called later, then the call ended -------------------
+
+
+def test_callback_without_a_time_card_is_plain_with_two_choices():
+    card = describe(_review("callback_no_time"), LEAD, has_calls=True)
+    assert card["group"] == "call" and card["title"] == "Asked to be called later, no time given"
+    assert card["reason"].startswith("The patient asked to be called later but gave no time")
+    assert [o["label"] for o in card["options"]] == ["Continue cadence", "Front desk will handle"]
+    assert card["transcript_url"] == "/leads/lead-1/conversations/calls"
+    assert sheet_open_status("callback_no_time", {}) == \
+        "Needs review: asked to be called later, no time given"
+    # The other call cards keep the call group's four choices.
+    for code in ("wrong_person", "call_no_outcome", "call_outcome_not_applied"):
+        assert [o["choice"] for o in describe(_review(code), LEAD)["options"]] == GROUP_CHOICES["call"]
+
+
+@pytest.mark.parametrize("code", ["booking_hung_up", "callback_no_time"])
+@pytest.mark.parametrize("choice", ["number_ok", "wrong_number", "restart_cadence"])
+def test_removed_choices_are_refused_on_the_hung_up_cards(code, choice):
+    from rpt_agent.services.lead_review import ReviewError, resolve_review
+
+    lead = {"id": "lead-1", "needs_review": True, "full_name": "Asha Rao", "status": "needs_attention"}
+
+    class Conn:
+        """The lead row (locked), then its one open review."""
+
+        def execute(self, sql, params):
+            self.sql = sql
+            return self
+
+        def fetchone(self):
+            return lead
+
+        def fetchall(self):
+            return [_review(code)] if "lead_reviews" in self.sql else []
+
+    with pytest.raises(ReviewError) as error:
+        resolve_review(Conn(), "lead-1", choice, note=None, actor_id="u", actor_name="Emma")
+    assert error.value.status_code == 409
+    assert "is not an option for this review" in error.value.detail
+
+
+def test_continue_cadence_label_shows_in_the_resolution():
+    from rpt_agent.services.lead_review import resolution_label
+
+    assert resolution_label("continue", "booking_hung_up") == "Continue cadence"
+    assert resolution_label("continue", "callback_no_time") == "Continue cadence"
+    assert resolution_label("continue", "moved_by_staff") == "Continue"

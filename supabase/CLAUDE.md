@@ -6,7 +6,7 @@ every migration also applies to plain Postgres (003's Supabase-role revoke only 
 
 | Path | Purpose |
 | --- | --- |
-| `migrations/NNN_name.sql` | Ordered, idempotent schema changes (001 … 052). 048 (`lead_reviews`) is byte-identical to production's; demo-only review codes come from Python. 046, 047, 050 (`appointments.stride_patient_id`), 051 (`availability_sync_state.chunk`, 90-day slot cache) and 052 (`appointments.in_progress_reply_at`) are demo-only. `rpt migrate` applies any file not yet recorded in `public.schema_migrations`, in filename order. |
+| `migrations/NNN_name.sql` | Ordered, idempotent schema changes (001 … 053). 048 (`lead_reviews`) is byte-identical to production's; demo-only review codes come from Python. 046, 047, 050 (`appointments.stride_patient_id`), 051 (`availability_sync_state.chunk`, 90-day slot cache) and 052 (`appointments.in_progress_reply_at`) are demo-only. 053 (`call_logs.structured_output`, 2026-10-29) is demo first; same file name if it goes to production. `rpt migrate` applies any file not yet recorded in `public.schema_migrations`, in filename order. |
 | `seed.sql` | Fresh-sandbox seed (`rpt seed`): the `rausch-pt` practice, settings, default cadence. Leaves `stride_booking_enabled=false`. |
 | `dev/reset_test_lead_by_name.sql` | Dev/test only. Used by `rpt test-lead` to reset synthetic leads; can only match `is_test` dashboard leads. Remove before a real production release (see `docs/FUTURE_DEPLOYMENT.md`). |
 

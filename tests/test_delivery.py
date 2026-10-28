@@ -1,3 +1,5 @@
+import pytest
+
 from rpt_agent.services.delivery import apply_twilio_message_status
 
 
@@ -253,6 +255,88 @@ def test_other_rejected_outcomes_keep_the_not_applied_card(monkeypatch):
     # A booked summary rejected for another reason is not the hung-up case.
     flagged = _flag_for_rejected_outcome(monkeypatch, "booked", TypeError("bad notes"))
     assert flagged["code"] == "call_outcome_not_applied"
+
+
+# --- 2026-10-29: new structured-output statuses and the wrong-person check -----------------------
+
+
+def test_no_decision_is_a_missed_contact_with_the_summary_kept(monkeypatch):
+    applied = _settle_with(monkeypatch, {"status": "no_decision", "summary": "Line went quiet."},
+                           [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Hello?")])
+    assert applied == {"status": "no_answer", "notes": "Line went quiet."}
+
+
+def test_already_booked_closes_only_when_the_patient_spoke(monkeypatch):
+    said = [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yes."),
+            ("bot", "This is Elliot calling from Rausch. Do you have a moment?"),
+            ("user", "Oh, I already booked with you guys last week.")]
+    applied = _settle_with(monkeypatch, {"status": "already_booked", "summary": "Already booked."}, said)
+    assert applied == {"status": "already_booked", "notes": "Already booked."}
+    silent = [("bot", "Hi, am I speaking with Rpt Tester?")]
+    assert _settle_with(monkeypatch, {"status": "already_booked"}, silent)["status"] == "no_answer"
+
+
+CALL_648 = [  # 2026-10-28: "Yes." then "No." over the greeting, then a hang-up
+    ("bot", "Hi, am I speaking with Rpt Tester?"),
+    ("user", "Yes."),
+    ("bot", "Great. This is Elliot calling from Rausch Physical Therapy and Wellness."),
+    ("user", "No."),
+]
+CALL_650 = [("user", "Hello?"), ("bot", "Hi, am I speaking with Rpt Tester?")]  # then a hang-up
+
+
+@pytest.mark.parametrize("turns", [CALL_648, CALL_650, [("user", "Yes."), ("user", "No.")] + CALL_650[1:]],
+                         ids=["648", "650", "yes-before-the-question"])
+def test_wrong_person_needs_the_person_to_say_so(monkeypatch, turns):
+    """Calls 648 and 650 were closed as Wrong number from the summary alone."""
+    applied = _settle_with(monkeypatch, {"status": "wrong_person", "summary": "Wrong person."}, turns)
+    assert applied["status"] == "no_answer"
+    assert applied["notes"].startswith("No answer from the patient; outreach continues.")
+
+
+@pytest.mark.parametrize("reply", [
+    "No, you have the wrong number.", "No.", "Wrong number.", "There's no one here by that name.",
+    "No, this is not Rpt.", "Nope, sorry. Bye.", "I don't know who that is.",
+])
+def test_wrong_person_said_by_the_person_is_applied(monkeypatch, reply):
+    turns = [("user", "Hello?"), ("bot", "Hi, am I speaking with Rpt Tester?"), ("user", reply)]
+    assert _settle_with(monkeypatch, {"status": "wrong_person"}, turns)["status"] == "wrong_person"
+    # "manual" is the old name for the same status.
+    assert _settle_with(monkeypatch, {"status": "manual"}, turns)["status"] == "manual"
+
+
+@pytest.mark.parametrize("turns", [
+    # A family member is not a wrong number (owner, 2026-10-28).
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, she's not home right now.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, this is her mom.")],
+    # Said yes to the name first, so it is the patient.
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yeah."),
+     ("bot", "This is Elliot calling from Rausch."), ("user", "Wrong number.")],
+    # A "no" to a later question is not about who they are.
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Speaking."),
+     ("bot", "This is Elliot from Rausch. Is now a good time?"), ("user", "No.")],
+    # No identity question on the call at all.
+    [("bot", "Hello, this is Elliot from Rausch."), ("user", "No.")],
+])
+def test_wrong_person_is_not_a_family_member_or_the_patient(monkeypatch, turns):
+    assert _settle_with(monkeypatch, {"status": "wrong_person"}, turns)["status"] == "no_answer"
+
+
+def test_unknown_status_is_passed_on_for_review(monkeypatch):
+    """report_lead_status flags an unknown status for review (`unrecognized_status`); no crash."""
+    applied = _settle_with(monkeypatch, {"status": "Something New", "summary": "?"},
+                           [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yes.")])
+    assert applied["status"] == "something new"
+
+
+def test_callback_without_a_time_is_its_own_plain_card(monkeypatch):
+    """Owner, 2026-10-28: "call me later" with no time goes to Needs Review, in plain words."""
+    from rpt_agent.services.lead_status import CALLBACK_WITHOUT_TIME
+
+    flagged = _flag_for_rejected_outcome(monkeypatch, "callback_scheduled",
+                                         ValueError(CALLBACK_WITHOUT_TIME))
+    assert flagged["code"] == "callback_no_time" and flagged["source"] == "call"
+    assert flagged["reason"] == "Patient asked to be called later, no time given"
 
 
 def test_sent_without_delivery_receipt_settles_the_step():

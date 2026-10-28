@@ -150,3 +150,46 @@ def test_link_then_both_keeps_one_text(env):
     assert env.db.execute("select count(*) as n from notification_log where lead_id=%s",
                           (lead,)).fetchone()["n"] == 1
     assert len(env.run_sender()) == 1
+
+
+def test_already_booked_closes_the_lead_with_its_own_reason(env):
+    """2026-10-29: "I already booked / I'm already a patient" closes the lead (owner, 28 Oct)."""
+    from rpt_agent.services.lead_status import ALREADY_BOOKED_REASON
+
+    lead, event, call = env.call()
+    env.db.execute("insert into outreach_events(lead_id,attempt_no,channel,status,scheduled_for) "
+                   "values(%s,2,'sms','planned',now()+interval '1 day')", (lead,))
+    env.report(lead, event, call, "already_booked")
+    row = env.db.execute("select status,cadence_state,last_call_outcome,status_reason from leads "
+                         "where id=%s", (lead,)).fetchone()
+    assert row == {"status": "declined", "cadence_state": "terminated",
+                   "last_call_outcome": "not_interested", "status_reason": ALREADY_BOOKED_REASON}
+    steps = env.db.execute("select channel,status,outcome from outreach_events where lead_id=%s "
+                           "order by attempt_no", (lead,)).fetchall()
+    assert steps == [{"channel": "call", "status": "delivered", "outcome": "not_interested"},
+                     {"channel": "sms", "status": "skipped", "outcome": None}]
+    history = env.db.execute("select to_status,reason from lead_status_history where lead_id=%s",
+                             (lead,)).fetchone()
+    assert history == {"to_status": "declined", "reason": f"{ALREADY_BOOKED_REASON}. test"}
+
+
+def test_end_of_call_report_keeps_the_structured_output(env):
+    """2026-10-28 review: call_logs.structured_output was never filled."""
+    lead, event, call = env.call()
+    outputs = {"so-1": {"name": "Cadence Call Outcome", "result": {"status": "no_decision",
+                                                                   "summary": "Line went quiet."}}}
+    body = {"message": {
+        "type": "end-of-call-report", "endedReason": "customer-ended-call",
+        "call": {"id": call, "assistantOverrides": {"variableValues": {
+            "lead_id": lead, "outreach_event_id": str(event)}}},
+        "artifact": {"messages": [{"role": "bot", "message": "Hi, am I speaking with Test Patient?"},
+                                  {"role": "user", "message": "Hello?"}],
+                     "structuredOutputs": outputs},
+    }}
+    assert delivery.process_vapi_end_report(WorkflowTrace("test", "test"), body) == "no_answer"
+    log = env.db.execute("select structured_output from call_logs where vapi_call_id=%s",
+                         (call,)).fetchone()
+    assert log["structured_output"] == outputs
+    assert env.lead(lead) == {"status": "in_progress", "cadence_state": "active"}
+    env.db.execute("delete from call_transcripts where lead_id=%s", (lead,))
+    env.db.execute("delete from call_logs where lead_id=%s", (lead,))

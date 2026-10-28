@@ -14,6 +14,11 @@ CALLBACK_MIN_MINUTES = 5
 # Raised when a "booked" outcome has no scheduled appointment; delivery.py matches it to flag
 # `booking_hung_up` instead of a generic "could not be applied" card.
 BOOKED_WITHOUT_APPOINTMENT = "booked requires a confirmed appointment"
+# Raised when a callback has no time at all; delivery.py matches it to flag `callback_no_time`.
+CALLBACK_WITHOUT_TIME = "callback_scheduled requires a callback time"
+# The patient said they already booked or are already a patient (owner, 2026-10-28: close the lead).
+# A closed lead like `declined`, told apart by this status_reason (dashboard and Sheet name it).
+ALREADY_BOOKED_REASON = "Already booked or already a patient"
 CALLBACK_MAX_MINUTES = 240
 
 
@@ -64,7 +69,7 @@ def resolve_callback_time(
         if callback_requested_at.tzinfo is None:
             return callback_requested_at.replace(tzinfo=tz).astimezone(UTC)
         return callback_requested_at.astimezone(UTC)
-    raise ValueError("callback_scheduled requires a callback time")
+    raise ValueError(CALLBACK_WITHOUT_TIME)
 
 
 def _window_for(hours: dict, holidays: list, day) -> tuple[dtime, dtime] | None:
@@ -277,6 +282,8 @@ def report_lead_status(
             "booking_link_sent": "booking_link",
             "booking_link": "booking_link",
             "booking_link_and_transfer": "transferred",
+            # No outcome of its own (the column's check list); the lead's status_reason says why.
+            "already_booked": "not_interested",
         }.get(normalized, "manual")
         if event:
             conn.execute(
@@ -307,6 +314,19 @@ def report_lead_status(
                 (lead_id,),
             )
             record_status(conn, lead_id, lead["status"], "declined", source, note or "declined")
+        elif normalized == "already_booked":
+            history = f"{ALREADY_BOOKED_REASON}. {note}" if note else ALREADY_BOOKED_REASON
+            conn.execute(
+                "update leads set status='declined',cadence_state='terminated',"
+                "last_call_outcome='not_interested',status_reason=%s,status_changed_at=now() where id=%s",
+                (ALREADY_BOOKED_REASON, lead_id),
+            )
+            conn.execute(
+                "update outreach_events set status='skipped',updated_at=now() "
+                "where lead_id=%s and status='planned'",
+                (lead_id,),
+            )
+            record_status(conn, lead_id, lead["status"], "declined", source, history[:500])
         elif normalized == "callback_scheduled":
             tz, hours, holidays = _practice_clock(conn, lead_id)
             now = datetime.now(UTC)

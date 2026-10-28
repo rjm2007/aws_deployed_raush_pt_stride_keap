@@ -77,6 +77,8 @@ SHEET_RESTARTED = "Closed: another row with this phone number was restarted"
 # The patient said no on a call (2026-10-27): the cell kept "Cadence started" under Lead Status
 # "Closed" and Call Outcome "Answered - declined", so staff thought the calls were still going.
 SHEET_DECLINED = "Declined on the call"
+# The patient said they already booked or are already a patient (2026-10-29): closed, not "declined".
+SHEET_ALREADY_BOOKED = "Closed: already booked or already a patient"
 
 
 def _action_label(lead: dict[str, Any]) -> str | None:
@@ -100,6 +102,8 @@ def _action_label(lead: dict[str, Any]) -> str | None:
         return SHEET_RESTARTED
     if lead["status"] == "do_not_contact":
         return "Do Not Contact applied"  # same words as the Sheet command's own result
+    if _already_booked_on_call(lead):
+        return SHEET_ALREADY_BOOKED
     if _declined_on_call(lead):
         return SHEET_DECLINED
     if _stride_problem(lead):
@@ -116,7 +120,15 @@ def _declined_on_call(lead: dict[str, Any]) -> bool:
     A board move to Closed also sets status 'declined', but keeps the last call outcome; it writes
     its own "Closed on the dashboard" once (DASHBOARD_OUTCOMES) and later snapshots leave it.
     """
-    return lead["status"] == "declined" and lead.get("last_call_outcome") == "not_interested"
+    return (lead["status"] == "declined" and lead.get("last_call_outcome") == "not_interested"
+            and not _already_booked_on_call(lead))
+
+
+def _already_booked_on_call(lead: dict[str, Any]) -> bool:
+    """Closed because the patient said on a call they already booked / are already a patient."""
+    from .lead_status import ALREADY_BOOKED_REASON  # lead_status imports this module
+
+    return lead["status"] == "declined" and lead.get("status_reason") == ALREADY_BOOKED_REASON
 
 
 def _stride_problem(lead: dict[str, Any]) -> bool:
@@ -127,6 +139,8 @@ def _stride_problem(lead: dict[str, Any]) -> bool:
 def _call_label(event: dict[str, Any], lead: dict[str, Any]) -> str:
     if lead["status"] == "invalid_phone":
         return "Wrong number"
+    if event.get("outcome") == "not_interested" and _already_booked_on_call(lead):
+        return "Already booked or a patient"
     if event.get("status") in {"failed", "unknown"}:
         return "Failed" if event["status"] == "failed" else "Needs staff review"
     return CALL_OUTCOME_LABELS.get(event.get("outcome"), "Needs staff review")
@@ -445,7 +459,7 @@ def build_sheet_snapshot(
     # it runs and the cell empties (owner, 2026-10-25); the backend never fills Action.
     if lead["status"] == "booked":
         sheet["action"] = "Booked"
-    elif _stride_problem(lead) or _declined_on_call(lead):
+    elif _stride_problem(lead) or _declined_on_call(lead) or _already_booked_on_call(lead):
         # Declined: the n8n intake would re-send a "Start cadence" left next to the new words.
         sheet["action"] = ""
 

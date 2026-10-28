@@ -4,6 +4,8 @@ import json
 import re
 from zoneinfo import ZoneInfo
 
+from psycopg.types.json import Jsonb
+
 from ..config import get_settings
 from ..db import transaction
 from ..observability import WorkflowTrace
@@ -12,7 +14,7 @@ from ..retry import retry_delay_seconds
 from ..usage_report import record_test_usage
 from ..vapi_contract import extract_vapi_context, outcome_from_ended_reason
 from .hang_up_booking import book_confirmed_time_after_hang_up
-from .lead_status import BOOKED_WITHOUT_APPOINTMENT, apply_call_outcome
+from .lead_status import BOOKED_WITHOUT_APPOINTMENT, CALLBACK_WITHOUT_TIME, apply_call_outcome
 from .review import flag_lead_for_review
 from .sheet_sync import dashboard_call_link, enqueue_sheet_update
 
@@ -302,6 +304,14 @@ def _structured_outcome(message: dict) -> dict | None:
     return None
 
 
+def _structured_outputs(message: dict) -> dict | None:
+    """Every structured output Vapi made for the call, as sent (id -> name, result), for
+    call_logs.structured_output: staff and debugging see why a cut call moved the lead."""
+    artifact = message.get("artifact") if isinstance(message.get("artifact"), dict) else {}
+    outputs = artifact.get("structuredOutputs")
+    return outputs if isinstance(outputs, dict) and outputs else None
+
+
 def _call_text_artifacts(message: dict) -> tuple[str | None, str | None]:
     artifact = message.get("artifact") if isinstance(message.get("artifact"), dict) else {}
     analysis = message.get("analysis") if isinstance(message.get("analysis"), dict) else {}
@@ -378,6 +388,8 @@ def _patient_replied_after(message: dict, *, introduction: bool) -> bool:
 # inside a question ("Is Thursday all set up?") does not count.
 # Stored reason for `booking_hung_up` (owner, 2026-10-27).
 BOOKING_HUNG_UP_REASON = "Patient asked to book, then hung up before confirming; nothing was booked"
+# Stored reason for `callback_no_time` (owner, 2026-10-28).
+CALLBACK_NO_TIME_REASON = "Patient asked to be called later, no time given"
 
 REFUSAL_PHRASES = (
     "not interested", "no thanks", "no thank you", "dont need", "do not need", "not now",
@@ -447,6 +459,70 @@ _AGREEMENT_WORDS = frozenset(
 
 def _words(text: str) -> set[str]:
     return set(re.findall(r"[a-z]+", text.lower()))
+
+
+# A "wrong_person" from the post-call summary is accepted only when the person said so themselves,
+# in answer to "Am I speaking with ...?", and never said they were the patient (owner, 2026-10-28).
+# Demo call 648: "Yes." then "No." over the greeting, then a hang-up; call 650: "Hello?" then a
+# hang-up. Both were read as wrong person and the leads were closed as Wrong number.
+WRONG_PERSON_PHRASES = (
+    "wrong number", "wrong person", "wrong phone", "not me", "not him", "not her", "thats not",
+    "this isnt", "this is not", "no one by that name", "nobody by that name", "no one here by",
+    "nobody here by", "no one named", "nobody named", "no such person", "never heard of",
+    r"(?:dont|do not) know (?:who|any|that|him|her|them)", "not the patient",
+    r"(?:doesnt|does not|dont|do not) live here", "you have the wrong", "youve got the wrong",
+    "you got the wrong",
+)
+# A family member or someone who knows the patient is not a wrong number (owner, 2026-10-28):
+# "She's not home", "I'm her mom", "Can I take a message?" keep the cadence going.
+_FAMILY = re.compile(
+    r"\b(?:mom|mother|dad|father|wife|husband|son|daughter|sister|brother|grandma|grandmother|"
+    r"grandpa|grandfather|aunt|uncle|niece|nephew|partner|girlfriend|boyfriend|not home|"
+    r"not here|not available|not in|take a message|call (?:her|him) back|at work|sleeping|busy)\b"
+)
+_WRONG_PERSON = re.compile(r"\b(?:" + "|".join(p.replace(" ", r"\s+") for p in WRONG_PERSON_PHRASES)
+                           + r")\b")
+_IDENTITY_QUESTION = re.compile(r"speaking (?:with|to)|is this|are you")
+_CONFIRM = re.compile(r"\b(?:yes|yeah|yep|yup|speaking|correct|thats right|thats me|its me|this is me|"
+                      r"this is (?:she|he))\b")
+
+
+def _patient_said_wrong_person(message: dict) -> bool:
+    """Whether the person on the call said they are not the patient (or it is a wrong number) after
+    Elliot asked who he was speaking with, without saying yes to being the patient before that."""
+    turns = _call_turns(message)
+    question = next((i for i, (role, words) in enumerate(turns)
+                     if role == "bot" and _IDENTITY_QUESTION.search(words.lower())), None)
+    if question is None:
+        return False
+    last_bot = question
+    said_wrong = False
+    for i, (role, reply) in enumerate(turns):
+        if role == "bot":
+            if i > question and reply.strip():
+                last_bot = i
+            continue
+        if role != "user" or not reply.strip():
+            continue
+        text = _refusal_words(reply)
+        if _FAMILY.search(text):
+            return False
+        if said_wrong:
+            continue  # "Yes, bye" after "wrong number" is not a confirmation
+        for sentence in re.findall(r"[^.?!]+", reply):
+            words = _refusal_words(sentence)
+            if _WRONG_PERSON.search(words):
+                said_wrong = i > question
+                if said_wrong:
+                    break
+            elif _CONFIRM.search(words):
+                # A yes anywhere before the denial (648: "Yes." over the greeting) is the patient.
+                return False
+            elif (i > question and last_bot == question and set(words.split()) & _BARE_NO
+                  and set(words.split()) <= _BARE_NO | _BARE_NO_FILLER):
+                said_wrong = True  # a plain "No." to "Am I speaking with ...?"
+                break
+    return said_wrong
 
 
 # Statuses that say the patient was put through to staff.
@@ -530,9 +606,12 @@ def _settle_from_structured_output(
         return "manual"
     # The extractor is told a hang-up is not a refusal and that any wording of
     # "stop contacting me" is do_not_contact, so its judgement is applied as-is.
-    # No status means the patient never decided: count it as a missed contact
-    # and keep the cadence going - only the patient can end outreach.
-    status = str(result.get("status") or "").strip() or "no_answer"
+    # No status, or "no_decision", means the patient never decided (silence, a cut call, a family
+    # member, asked for times then hung up): count it as a missed contact and keep the cadence
+    # going - only the patient can end outreach.
+    status = str(result.get("status") or "").strip().lower() or "no_answer"
+    if status == "no_decision":
+        status = "no_answer"
     summary_note = str(result.get("summary") or "")
     # The extractor is told silence is not a refusal, but it runs on a model Vapi
     # picks (Gemini, whatever we pin) and has still called silence "declined".
@@ -542,7 +621,10 @@ def _settle_from_structured_output(
         _patient_refused(message)
         if status == "declined"
         else _patient_replied_after(message, introduction=False)
-        if status in {"do_not_contact", "call_opt_out"}
+        if status in {"do_not_contact", "call_opt_out", "already_booked"}
+        # "manual" is report_lead_status's old name for wrong_person.
+        else _patient_said_wrong_person(message)
+        if status in {"wrong_person", "manual"}
         else True
     )
     # A transfer from the summary needs a transfer on the call (owner, 2026-10-27). Demo call
@@ -579,7 +661,10 @@ def _settle_from_structured_output(
         # The summary says "booked" but no booking exists: the patient was asking about or picking
         # a time and hung up before confirming. Its own card, in plain words (owner, 2026-10-27).
         hung_up = status == "booked" and str(exc) == BOOKED_WITHOUT_APPOINTMENT
+        # "Call me later" with no time: Needs Review, so the front desk decides (owner, 2026-10-28).
+        no_time = status == "callback_scheduled" and str(exc) == CALLBACK_WITHOUT_TIME
         reason = (BOOKING_HUNG_UP_REASON if hung_up
+                  else CALLBACK_NO_TIME_REASON if no_time
                   else f"structured outcome could not be applied: {exc}")
         with transaction() as conn:
             # report_lead_status rolled back its own settle, so settle the call here with the card:
@@ -595,7 +680,8 @@ def _settle_from_structured_output(
             ).fetchone()
             flag_lead_for_review(
                 conn, lead_id, reason,
-                code="booking_hung_up" if hung_up else "call_outcome_not_applied",
+                code=("booking_hung_up" if hung_up else "callback_no_time" if no_time
+                      else "call_outcome_not_applied"),
                 source="call", outreach_event_id=event_id,
                 details={"call_id": call_id, "extracted_status": status},
             )
@@ -678,18 +764,19 @@ def process_vapi_end_report(trace: WorkflowTrace, body: dict) -> str:
         call_log = conn.execute(
             "insert into call_logs(outreach_event_id,lead_id,vapi_call_id,dialed_at,ended_at,"
             "answer_state,ended_reason,outcome_source,transcript_text,summary_text,"
-            "duration_seconds,cost) "
+            "duration_seconds,cost,structured_output) "
             "values(%s,%s,%s,coalesce(%s::timestamptz,now()),%s::timestamptz,%s,%s,%s,%s,%s,"
             # Derive the duration rather than trusting a field: we always have both
             # timestamps, and greatest() keeps a clock skew from storing a negative.
             "coalesce(%s,greatest(extract(epoch from (%s::timestamptz - %s::timestamptz)),0))::int,"
-            "%s) "
+            "%s,%s) "
             "on conflict(vapi_call_id) do update set "
             "outcome_source=coalesce(call_logs.outcome_source,excluded.outcome_source),"
             "transcript_text=coalesce(excluded.transcript_text,call_logs.transcript_text),"
             "summary_text=coalesce(excluded.summary_text,call_logs.summary_text),"
             "duration_seconds=greatest(call_logs.duration_seconds,excluded.duration_seconds),"
             "cost=coalesce(excluded.cost,call_logs.cost),"
+            "structured_output=coalesce(excluded.structured_output,call_logs.structured_output),"
             "ended_at=coalesce(excluded.ended_at,call_logs.ended_at) returning id",
             (
                 int(event_id),
@@ -706,6 +793,7 @@ def process_vapi_end_report(trace: WorkflowTrace, body: dict) -> str:
                 ended_at_raw,
                 started_at_raw,
                 call_cost,
+                Jsonb(outputs) if (outputs := _structured_outputs(message)) else None,
             ),
         ).fetchone()
         settings = get_settings()
