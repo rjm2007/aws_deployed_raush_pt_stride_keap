@@ -5,7 +5,7 @@ from datetime import UTC, date, datetime
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -14,7 +14,7 @@ from ..db import transaction
 from ..observability import WorkflowTrace
 from ..parsing import parse_flexible_date
 from ..security import DashboardActor, require_dashboard_auth
-from ..services import appointment_views
+from ..services import appointment_views, lead_list
 from ..services.keap_sync_status import keap_sync_status
 from ..services.lead_actions import _replay_stored_response
 from ..services.lead_review import (
@@ -31,6 +31,7 @@ from ..services.lead_review import (
     resolution_label,
     resolve_review,
 )
+from ..services.lead_stage import STAGE_SQL
 from ..services.lead_stage import stage_of as _stage
 from ..services.number_block import (
     NumberBlockError,
@@ -721,56 +722,82 @@ def _clone_version_steps(
             )
 
 
+# One lead row as the board shows it (`_lead`). Shared by the snapshot and the paged lead list / board,
+# so a card looks the same wherever it comes from.
+_LEAD_SELECT = (
+    "select l.id,l.full_name,l.phone_e164,l.email,l.source_system,l.status,l.cadence_state,"
+    "l.needs_review,l.review_reason,l.created_at,l.last_contacted_at,l.date_of_birth,"
+    "l.referred_by,l.lead_type,l.location,l.owner,l.owner_user_id,l.is_test,l.timezone,l.status_reason,"
+    "l.sms_disabled,l.review_flagged_at as lead_review_flagged_at,"
+    "open_review.id as review_id,open_review.code as review_code,"
+    "open_review.message as review_message,open_review.details as review_details,"
+    "open_review.source as review_source,open_review.flagged_at as review_flagged_at,"
+    "open_review.open_reviews,"
+    "case when l.needs_review then exists(select 1 from call_logs cl where cl.lead_id=l.id) "
+    "else false end as has_calls,"
+    "blocked.reason as blocked_reason,blocked.source as blocked_source,"
+    "blocked.created_at as blocked_at,"
+    "current_version.name as cadence_version_name,"
+    "(select count(*) from outreach_events progress where progress.lead_id=l.id "
+    "and progress.cadence_version_id=current_version.id "
+    "and progress.status<>'planned') as cadence_progress,"
+    "(select count(*) from outreach_events total where total.lead_id=l.id "
+    "and total.cadence_version_id=current_version.id) as cadence_total,"
+    "next_event.id as next_event_id,next_event.status as next_event_status,"
+    "next_event.description as next_step,next_event.channel as next_channel,"
+    "next_event.scheduled_for as next_scheduled_for from leads l left join lateral ("
+    # The version stamped on the lead's own schedule, not whichever is
+    # active for the practice. Leads stay pinned to the version they
+    # started on, so reading the practice default named a cadence the
+    # lead was not on and counted progress against events that did not
+    # exist -- every mid-cadence lead read "0 of 0".
+    "select cv.id,cv.name from cadence_versions cv where cv.id=coalesce("
+    "(select oe2.cadence_version_id from outreach_events oe2 where oe2.lead_id=l.id "
+    "and oe2.cadence_version_id is not null order by oe2.created_at desc,oe2.id desc limit 1),"
+    "(select cv2.id from cadence_versions cv2 where cv2.practice_id=l.practice_id "
+    "and cv2.status='active' and cv2.lead_id is null limit 1))"
+    ") current_version on true left join lateral ("
+    "select oe.id,cs.description,oe.channel,oe.scheduled_for,oe.status from outreach_events oe "
+    "left join cadence_steps cs on cs.id=oe.cadence_step_id where oe.lead_id=l.id "
+    "and oe.status in ('planned','in_flight','attempted') order by "
+    "case when oe.status='planned' then 0 else 1 end,oe.scheduled_for nulls last,oe.id limit 1"
+    ") next_event on true left join lateral ("
+    # The oldest open review is the card (they are settled in order); the rest are counted.
+    "select r.id,r.code,r.message,r.details,r.source,r.flagged_at,"
+    "count(*) over() as open_reviews from lead_reviews r "
+    "where l.needs_review and r.lead_id=l.id and r.resolved_at is null "
+    "order by r.flagged_at,r.id limit 1"
+    ") open_review on true "
+    # A blocked number stops every call and text, whatever the lead's status.
+    "left join suppressed_numbers blocked on blocked.phone_e164=l.phone_e164 "
+)
+
+
+def _lead_rows(conn, practice_id: int, ids: list[str], now: datetime) -> dict[str, dict]:
+    """Board-shaped leads by id (with the booked card's booking), in no particular order."""
+    if not ids:
+        return {}
+    rows = conn.execute(_LEAD_SELECT + "where l.id=any(%s::uuid[])", (ids,)).fetchall()
+    leads = [_lead(row) for row in rows]
+    booked = appointment_views.lead_bookings(
+        conn, practice_id, [lead["id"] for lead in leads if lead["stage"] == "booked"], now,
+    )
+    for lead in leads:
+        lead["booking"] = _board_booking(booked.get(str(lead["id"])))
+        lead["kind"] = "lead"
+    return {lead["id"]: lead for lead in leads}
+
+
 @router.get("/snapshot")
 def dashboard_snapshot(actor: Actor):
     with transaction() as conn:
         rows = conn.execute(
-            "select l.id,l.full_name,l.phone_e164,l.email,l.source_system,l.status,l.cadence_state,"
-            "l.needs_review,l.review_reason,l.created_at,l.last_contacted_at,l.date_of_birth,"
-            "l.referred_by,l.lead_type,l.location,l.owner,l.owner_user_id,l.is_test,l.timezone,l.status_reason,"
-            "l.sms_disabled,l.review_flagged_at as lead_review_flagged_at,"
-            "open_review.id as review_id,open_review.code as review_code,"
-            "open_review.message as review_message,open_review.details as review_details,"
-            "open_review.source as review_source,open_review.flagged_at as review_flagged_at,"
-            "open_review.open_reviews,"
-            "case when l.needs_review then exists(select 1 from call_logs cl where cl.lead_id=l.id) "
-            "else false end as has_calls,"
-            "blocked.reason as blocked_reason,blocked.source as blocked_source,"
-            "blocked.created_at as blocked_at,"
-            "current_version.name as cadence_version_name,"
-            "(select count(*) from outreach_events progress where progress.lead_id=l.id "
-            "and progress.cadence_version_id=current_version.id "
-            "and progress.status<>'planned') as cadence_progress,"
-            "(select count(*) from outreach_events total where total.lead_id=l.id "
-            "and total.cadence_version_id=current_version.id) as cadence_total,"
-            "next_event.id as next_event_id,next_event.status as next_event_status,"
-            "next_event.description as next_step,next_event.channel as next_channel,"
-            "next_event.scheduled_for as next_scheduled_for from leads l left join lateral ("
-            # The version stamped on the lead's own schedule, not whichever is
-            # active for the practice. Leads stay pinned to the version they
-            # started on, so reading the practice default named a cadence the
-            # lead was not on and counted progress against events that did not
-            # exist -- every mid-cadence lead read "0 of 0".
-            "select cv.id,cv.name from cadence_versions cv where cv.id=coalesce("
-            "(select oe2.cadence_version_id from outreach_events oe2 where oe2.lead_id=l.id "
-            "and oe2.cadence_version_id is not null order by oe2.created_at desc,oe2.id desc limit 1),"
-            "(select cv2.id from cadence_versions cv2 where cv2.practice_id=l.practice_id "
-            "and cv2.status='active' and cv2.lead_id is null limit 1))"
-            ") current_version on true left join lateral ("
-            "select oe.id,cs.description,oe.channel,oe.scheduled_for,oe.status from outreach_events oe "
-            "left join cadence_steps cs on cs.id=oe.cadence_step_id where oe.lead_id=l.id "
-            "and oe.status in ('planned','in_flight','attempted') order by "
-            "case when oe.status='planned' then 0 else 1 end,oe.scheduled_for nulls last,oe.id limit 1"
-            ") next_event on true left join lateral ("
-            # The oldest open review is the card (they are settled in order); the rest are counted.
-            "select r.id,r.code,r.message,r.details,r.source,r.flagged_at,"
-            "count(*) over() as open_reviews from lead_reviews r "
-            "where l.needs_review and r.lead_id=l.id and r.resolved_at is null "
-            "order by r.flagged_at,r.id limit 1"
-            ") open_review on true "
-            # A blocked number stops every call and text, whatever the lead's status.
-            "left join suppressed_numbers blocked on blocked.phone_e164=l.phone_e164 "
-            "order by l.created_at desc limit 250"
+            _LEAD_SELECT +
+            # The newest 250 for Home / Analytics / the assistant, plus every lead waiting for review:
+            # the Review queue reads this list, and an old flagged lead must not drop out of it.
+            "where l.id in (select id from leads order by created_at desc limit 250) "
+            "or l.needs_review or l.status='needs_attention' "
+            "order by l.created_at desc"
         ).fetchall()
         leads = [_lead(row) for row in rows]
         now = datetime.now(UTC)
@@ -780,6 +807,12 @@ def dashboard_snapshot(actor: Actor):
         )
         for lead in leads:
             lead["booking"] = _board_booking(booked.get(str(lead["id"])))
+        # Home / Analytics tiles count every lead, not the loaded list (it stopped at 250), and per
+        # clinic so the location filter shows real totals too.
+        stage_rows = conn.execute(
+            "select " + STAGE_SQL + " as stage,coalesce(l.location,'') as location,count(*) as n "
+            "from leads l group by 1,2"
+        ).fetchall()
         # Next appointments: every visit still on the books from now on, ours and
         # Stride's (front desk bookings and Stride-only patients included).
         upcoming, _ = appointment_views.load_records(conn, actor.practice_id, lower=now, limit=200)
@@ -837,10 +870,13 @@ def dashboard_snapshot(actor: Actor):
         ).fetchone()
 
     counts = {"new": 0, "cadence": 0, "attention": 0, "booked": 0, "closed": 0}
-    for lead in leads:
-        counts[lead["stage"]] += 1
+    counts_by_location: dict[str, dict[str, int]] = {}
+    for row in stage_rows:
+        counts[row["stage"]] += int(row["n"])
+        by_stage = counts_by_location.setdefault(row["location"], dict.fromkeys(counts, 0))
+        by_stage[row["stage"]] += int(row["n"])
     settings = get_settings()
-    total_leads = len(leads)
+    total_leads = sum(counts.values())
 
     def _rate(part: int, whole: int) -> float | None:
         # None, not zero: "no data yet" and "zero percent" are different answers.
@@ -875,6 +911,7 @@ def dashboard_snapshot(actor: Actor):
     return {
         "generated_at": datetime.now(UTC),
         "counts": counts,
+        "counts_by_location": counts_by_location,
         "leads": leads,
         "appointments": appointments,
         "cadence": cadence,
@@ -908,6 +945,68 @@ def dashboard_keap_sync(actor: Actor):
     """Is the Keap contact sync connected and keeping up? Plain words, no patient data."""
     with transaction() as conn:
         return keap_sync_status(conn, actor.practice_id)
+
+
+Stage = Literal["new", "cadence", "attention", "booked", "closed"]
+
+
+@router.get("/lead-list")
+def dashboard_lead_list(
+    actor: Actor,
+    source: Literal["all", "sheet", "stride"] = "all",
+    stage: Annotated[list[Stage] | None, Query()] = None,
+    owner: Annotated[str | None, Query(max_length=120)] = None,
+    location: Annotated[str | None, Query(max_length=120)] = None,
+    q: Annotated[str, Query(max_length=120)] = "",
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=lead_list.LIST_LIMIT)] = lead_list.LIST_LIMIT,
+):
+    """The Leads list: one batch (newest first) of leads and unlinked Stride patients matching the
+    filters, the real total and the count per source (lead_list.list_page)."""
+    with transaction() as conn:
+        page = lead_list.list_page(conn, actor.practice_id, source=source, q=q, owner=owner or None,
+                                   location=location or None, stages=stage, offset=offset, limit=limit)
+        lead_ids = [key for kind, key in page["keys"] if kind == "lead"]
+        leads = _lead_rows(conn, actor.practice_id, lead_ids, datetime.now(UTC))
+        stride = lead_list.stride_rows(
+            conn, actor.practice_id, [int(key) for kind, key in page["keys"] if kind == "stride"])
+    rows = [leads.get(key) if kind == "lead" else stride.get(int(key)) for kind, key in page["keys"]]
+    return {"rows": [row for row in rows if row], "total": page["total"], "sources": page["sources"],
+            "offset": offset, "limit": limit}
+
+
+@router.get("/lead-board")
+def dashboard_lead_board(
+    actor: Actor,
+    stage: Annotated[list[Stage] | None, Query()] = None,
+    owner: Annotated[str | None, Query(max_length=120)] = None,
+    location: Annotated[str | None, Query(max_length=120)] = None,
+    q: Annotated[str, Query(max_length=120)] = "",
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = lead_list.BOARD_LIMIT,
+):
+    """Board columns (leads only, no Stride patients): the next cards per column and each column's
+    real total. Without `stage` every column's first page; with it, more cards for those columns."""
+    with transaction() as conn:
+        columns = lead_list.board_page(conn, actor.practice_id, q=q, owner=owner or None,
+                                       location=location or None, stages=stage, offset=offset, limit=limit)
+        leads = _lead_rows(conn, actor.practice_id,
+                           [i for column in columns.values() for i in column["ids"]], datetime.now(UTC))
+    return {
+        "columns": {name: {"rows": [leads[i] for i in column["ids"] if i in leads], "total": column["total"]}
+                    for name, column in columns.items()},
+        "offset": offset, "limit": limit,
+    }
+
+
+@router.get("/stride-patients/{stride_id}")
+def dashboard_stride_patient(stride_id: int, actor: Actor):
+    """Read-only view of a Stride patient with no lead: details and visits."""
+    with transaction() as conn:
+        found = lead_list.stride_patient(conn, actor.practice_id, stride_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="Stride patient not found")
+    return found
 
 
 @router.post("/leads", status_code=201)

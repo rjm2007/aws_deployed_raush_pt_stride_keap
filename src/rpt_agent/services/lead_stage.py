@@ -41,6 +41,25 @@ def stage_of(row: dict[str, Any]) -> str:
     return "cadence"
 
 
+# stage_of() as one SQL expression over a `leads l` row, for filtering and counting the board
+# server-side (lead list / board paging). Same checks in the same order; cadence_total > 0 is
+# "has an event stamped with a cadence version" (the snapshot counts events of the version on
+# the lead's newest stamped event), next_event_id is "has a planned / in-flight / attempted event".
+# tests/test_lead_list_integration.py proves parity with stage_of() for every branch.
+STAGE_SQL = (
+    "(case when l.status='booked' then 'booked' "
+    "when l.needs_review or l.status='needs_attention' then 'attention' "
+    "when l.status in (" + ",".join(f"'{s}'" for s in sorted(CLOSED_STATUSES)) + ") "
+    "or l.cadence_state in ('completed','terminated') then 'closed' "
+    "when l.status='new' or l.cadence_state='pending' then 'new' "
+    "when l.cadence_state='paused' then 'cadence' "
+    "when exists(select 1 from outreach_events st where st.lead_id=l.id and st.cadence_version_id is not null) "
+    "and not exists(select 1 from outreach_events st where st.lead_id=l.id "
+    "and st.status in ('planned','in_flight','attempted')) then 'closed' "
+    "else 'cadence' end)"
+)
+
+
 def sheet_lead_status(row: dict[str, Any]) -> str:
     """The Sheet's Lead Status: the board column, with Paused and Do not outreach named."""
     stage = stage_of(row)

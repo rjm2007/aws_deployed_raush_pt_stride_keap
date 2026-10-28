@@ -2725,3 +2725,23 @@ patient actually said no.
 - 2026-10-27 (later): human-sounding test copy of the booking agent: `config/vapi_booking_assistant_prompt_human.md` (varied acknowledgments and offer endings, shorter opening and closing, details read back once, no comma in dates) and `config/vapi_booking_tools_human.json` (several short request-start variants per tool, booking waits at 4.5 s and 9 s). Used by the copy assistant "Elliot confirm test" with its own tool copies; the main Elliot is unchanged. The yes-then-hang-up safety net now skips every tool waiting line and Vapi stock filler (`TOOL_WAITING_LINES`, `BOOKING_WAITING_LINES`; keep them in sync with both tool files - `tests/test_hang_up_waiting_lines.py` fails otherwise). `scripts/check_hangup_rule.py`: 20 cases.
 - 2026-10-27 (latest): owner approved the human style for the main demo booking agent (Elliot 7e4d63e1). `config/vapi_booking_assistant_prompt.md` now carries the human prompt and `config/vapi_booking_tools.json` the human waiting lines (only `messages` changed; ids, functions, server unchanged); the `*_human` files and `tests/test_vapi_human_copy.py` are gone (checks now in `tests/test_vapi_booking_style.py`). `TOOL_WAITING_LINES` keeps the old "One moment, please, ..." lines so calls in flight and stored reports still parse; `tests/test_hang_up_waiting_lines.py` now requires every tool-file line to be in the constant (subset). The copy agent "Elliot confirm test" keeps its own tool copies.
 - 2026-10-27 (later): Sheet Outcome Status says "Declined on the call" when the patient's own no closed the lead (status declined + last_call_outcome not_interested; board close keeps "Closed on the dashboard"). A post-call outcome that can't be applied (booking_hung_up, call_outcome_not_applied) now settles the call (delivered / manual) with the card, so the Sheet shows "Needs staff review" and the 2-hour sweeper adds no second card.
+
+### 2026-10-28 — Leads page paged in the database; Stride patients on the list (owner-approved mockup)
+- Problem: the snapshot loaded only the newest 250 leads (`order by created_at desc limit 250`), so lead
+  251+ was missing from the Leads list, board and search, and Home / Analytics tiles counted only those 250.
+  Stride patients the front desk booked directly (no linked lead) were not on the Leads page at all.
+- New `services/lead_list.py` and three GET routes in `routes/dashboard.py`: `/lead-list` (source
+  all / sheet / stride, stage (multi), owner ("Unassigned" = none), location, q (name, email; phone digits
+  when the search is only digits and phone punctuation), offset, limit ≤ 500; returns rows + total + counts
+  per source), `/lead-board` (per column the next 25 cards + real totals; leads only), `/stride-patients/{id}`
+  (read-only patient + visits). Lead rows use the snapshot's `_lead` shape (`_LEAD_SELECT` / `_lead_rows`).
+- Source = where the row started: `leads.source_system='google_sheets'` is "Google Sheet" forever;
+  "stride" = `stride_patients` with no `lead_id` (not deleted). Stride rows are view only: stage Booked when a
+  visit is still on the books (future, status blank / unmarked / confirmed), else "No upcoming visit" /
+  "No visits".
+- `lead_stage.STAGE_SQL` is `stage_of()` as one SQL expression (cadence_total > 0 = has a versioned event;
+  next event = planned / in_flight / attempted). `tests/test_lead_list_integration.py` checks parity for
+  every status x cadence state x review x events combination.
+- Snapshot: `counts` and new `counts_by_location` are real totals over every lead (Home tiles, Analytics,
+  location filter); `leads` = newest 250 plus every lead in review (the Review queue reads it).
+- No migration. Dashboard (`rpt_frontend`): proxy allows the three paths (GET only).
