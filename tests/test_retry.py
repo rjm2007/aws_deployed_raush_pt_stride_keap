@@ -75,6 +75,9 @@ def test_in_server_database_may_skip_tls():
         "postgresql://rpt:pw@db.example.org:5432/rpt",
         "postgresql://rpt:pw@dbhost:5432/rpt?sslmode=disable",
         "postgresql://db:pw@remote.invalid:5432/rpt",
+        "postgresql://rpt:pw@db:5432/rpt?host=evil.invalid&sslmode=disable",
+        "postgresql://rpt:pw@db:5432/rpt?sslmode=disable&hostaddr=203.0.113.9",
+        "postgresql://rpt:pw@db:5432/rpt?sslmode=disable&HOST=evil.invalid",
     ):
         settings = Settings(_env_file=None, app_env="production", supabase_db_url=url)
         assert "SUPABASE_DB_URL must set sslmode=require or verify-full" in settings.runtime_errors(

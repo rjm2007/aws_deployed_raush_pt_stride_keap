@@ -22,6 +22,9 @@ chmod 700 "$LOCAL_DIR"
 umask 077
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 file="$LOCAL_DIR/rpt-demo-$stamp.dump"
+# A failed run must not leave a half-written dump behind (also clears any left by older runs).
+trap 'rm -f "$file.part"' EXIT
+rm -f "$LOCAL_DIR"/rpt-demo-*.dump.part
 
 "${compose[@]}" exec -T db pg_dump -U rpt -d rpt -Fc --no-owner --no-privileges > "$file.part"
 # A dump pg_restore cannot list is broken: fail loudly instead of uploading it.
