@@ -2768,3 +2768,15 @@ patient actually said no.
   all 54 files apply to a fresh plain Postgres 17. `rpt migrate` tracks by file name only.
 - `scripts/db_backup.sh` (nightly pg_dump → S3 SSE-KMS), `db_restore.sh`, `db_row_counts.sh`.
 - Runbook with AWS/DNS prerequisites, cutover, rollback and the local rehearsal results: `../DB-Move-Runbook.md`.
+
+### 2026-10-28 — Calendar shows clinic (California) time (owner decision; branch `fix/calendar-pt`)
+- Why: the Appointments calendar used `practice_settings.stride_location_timezone` (US/Eastern on the demo,
+  Stride location 3169), so a visit the lead page showed at 2:00 PM showed at 5:00 PM.
+- `routes/dashboard_calendar.py`: `GET /appointment-calendar` buckets days, open-slot clock times and returns
+  `timezone` in the clinic zone (`practices.timezone`, fallback America/Los_Angeles), like the rest of the
+  dashboard; `POST /appointments` `start_day` is the clinic day too. The frontend already draws in the zone the
+  calendar returns. Stride's import, the booking engine, Keap, confirmation SMS and sync status still read
+  Stride times in the Stride zone; `GET /appointment-slots` (not used by the UI) still lists Stride-local times.
+- Demo open slots now show 3 hours earlier than in Stride's own UI (Stride shows Eastern). Expected.
+- Tests: `tests/test_dashboard_calendar.py`, `tests/test_appointment_views_integration.py` (01:00 Eastern lands on
+  the previous California day).

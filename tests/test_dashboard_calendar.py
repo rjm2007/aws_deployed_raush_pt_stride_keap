@@ -48,14 +48,18 @@ class Result:
 
 
 class CalendarConnection:
-    def __init__(self):
+    def __init__(self, timezone="America/Los_Angeles"):
         self.queries = []
+        self.timezone = timezone
 
     def execute(self, sql, params=None):
         self.queries.append((sql, params))
         if "from practice_settings" in sql:
-            return Result([{"stride_location_timezone": "America/Los_Angeles",
-                            "stride_booking_enabled": True, "business_hours": {}}])
+            assert "stride_location_timezone" not in sql  # the calendar never shows the Stride zone
+            return Result([{"stride_booking_enabled": True, "business_hours": {}}])
+        if "from practices where id" in sql:
+            assert params == (7,)
+            return Result([{"timezone": self.timezone}])
         if "to_regclass" in sql:
             return Result([{"imports": True, "booking": True}])
         start = datetime(2026, 10, 13, 16, tzinfo=UTC)
@@ -113,6 +117,27 @@ def test_calendar_deduplicates_bookings_and_keeps_sheet_link_and_stride_cancella
     assert not any(sql.lstrip().startswith(("insert", "update", "delete")) for sql, _ in conn.queries)
 
 
+@pytest.mark.parametrize("practice_zone", ["America/Los_Angeles", None])
+def test_calendar_days_and_slots_are_clinic_time_not_the_stride_zone(monkeypatch, practice_zone):
+    """The demo's Stride location is US/Eastern; the calendar showed a 2:00 PM PT visit at 5:00 PM
+    (2026-10-28). It now uses the clinic zone like the lead page (fallback: California)."""
+    conn = CalendarConnection(practice_zone)
+
+    @contextmanager
+    def transaction():
+        yield conn
+
+    monkeypatch.setattr(calendar, "transaction", transaction)
+    result = calendar.appointment_calendar(DashboardActor("review", "review@example.test", practice_id=7),
+                                           date(2026, 11, 2), date(2026, 11, 2))
+    assert result["timezone"] == "America/Los_Angeles"
+    # Nov 2 in California: 08:00 UTC to 08:00 UTC, so 01:00 Eastern on Nov 3 (06:00 UTC) is in it.
+    (visits,) = [p for sql, p in conn.queries if "from appointments a" in sql]
+    assert datetime(2026, 11, 2, 8, tzinfo=UTC) in visits and datetime(2026, 11, 3, 8, tzinfo=UTC) in visits
+    (slots,) = [p for sql, p in conn.queries if "from availability_slots s" in sql]
+    assert slots[:2] == ("America/Los_Angeles", "America/Los_Angeles")  # open-slot clock times
+
+
 def test_calendar_routes_require_staff_authentication(monkeypatch):
     monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
     get_settings.cache_clear()
@@ -166,9 +191,12 @@ def test_staff_booking_reuses_the_booking_engine_and_handles_uncertain_results(m
             if "from appointments where" in sql:
                 return Result([{"id": 100, "state": "scheduled",
                                 "start_utc": datetime(2026, 10, 13, 16, tzinfo=UTC)}])
+            if "from practices where id" in sql:
+                return Result([{"timezone": "America/Los_Angeles"}])
             assert params == (42, 7)
             return Result([{"local_date": day, "local_time": datetime.min.time(),
-                            "display_name": "Synthetic Clinician", "timezone": "America/Los_Angeles"}])
+                            "start_utc": datetime(2026, 10, 13, 16, tzinfo=UTC),
+                            "display_name": "Synthetic Clinician"}])
 
     @contextmanager
     def transaction():

@@ -14,6 +14,7 @@ from .dashboard import Actor, _audit
 
 router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
 MAX_RECORDS = 2000
+CLINIC_TIMEZONE = "America/Los_Angeles"  # the dashboard's fallback (frontend display.ts)
 
 
 def calendar_window(start: date, end: date, timezone: str):
@@ -26,6 +27,16 @@ def calendar_window(start: date, end: date, timezone: str):
     )
 
 
+def clinic_timezone(conn, practice_id) -> str:
+    """The zone the calendar shows: the clinic's own (practices.timezone), like the lead page,
+    the home page and the rest of the dashboard. Not stride_location_timezone: the demo's Stride
+    location is US/Eastern, so the calendar showed a 2:00 PM visit at 5:00 PM (2026-10-28).
+    Stride's times are still read in the Stride zone by the import and the booking engine; only
+    how the calendar displays and buckets the same instants changes."""
+    row = conn.execute("select timezone from practices where id=%s", (practice_id,)).fetchone()
+    return (row or {}).get("timezone") or CLINIC_TIMEZONE
+
+
 def calendar_record(row, *, imported=False):
     return appointment_views.record(row, imported=imported)
 
@@ -34,10 +45,10 @@ def calendar_record(row, *, imported=False):
 def appointment_calendar(actor: Actor, start: date, end: date, lead_id: UUID | None = None):
     with transaction() as conn:
         settings = conn.execute(
-            "select stride_location_timezone,stride_booking_enabled,business_hours "
-            "from practice_settings where practice_id=%s", (actor.practice_id,),
+            "select ps.stride_booking_enabled,ps.business_hours from practice_settings ps "
+            "where ps.practice_id=%s", (actor.practice_id,),
         ).fetchone() or {}
-        timezone = settings.get("stride_location_timezone") or "America/Los_Angeles"
+        timezone = clinic_timezone(conn, actor.practice_id)
         lower, upper = calendar_window(start, end, timezone)
         tables = appointment_views.optional_tables(conn)
         records, truncated = appointment_views.load_records(
@@ -162,12 +173,13 @@ def create_calendar_appointment(payload: CalendarBooking, actor: Actor):
         if not lead["first_name"] or not lead["last_name"] or not lead["date_of_birth"]:
             raise HTTPException(400, "The lead needs a first name, last name and date of birth to book.")
         slot = conn.execute(
-            "select s.local_date,s.local_time,s.timezone,c.display_name from availability_slots s "
+            "select s.local_date,s.local_time,s.start_utc,c.display_name from availability_slots s "
             "join clinicians c on c.id=s.clinician_id where s.id=%s and s.practice_id=%s "
             "and s.status='open'", (payload.slot_id, actor.practice_id),
         ).fetchone()
         if not slot:
             raise HTTPException(409, "That appointment time is no longer available.")
+        timezone = clinic_timezone(conn, actor.practice_id)
         _audit(conn, actor, actor.practice_id, "appointment.booking_requested", "lead",
                str(payload.lead_id), {"slot_id": payload.slot_id})
     try:
@@ -203,8 +215,9 @@ def create_calendar_appointment(payload: CalendarBooking, actor: Actor):
         "status": "scheduled" if saved and saved["state"] == "scheduled" else "confirmed_sync_pending",
         "id": calendar_record(saved)["id"] if saved else None,
         "lead_id": payload.lead_id,
-        "start_day": (saved["start_utc"].astimezone(ZoneInfo(slot["timezone"])).date()
-                      if saved and saved["start_utc"] else slot["local_date"]),
+        # The calendar day to jump to, in the calendar's (clinic) zone.
+        "start_day": ((saved["start_utc"] if saved and saved["start_utc"] else slot["start_utc"])
+                      .astimezone(ZoneInfo(timezone)).date()),
     }
 
 
