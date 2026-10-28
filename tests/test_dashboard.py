@@ -135,6 +135,10 @@ class SnapshotConnection:
             return Result([{"imports": False, "booking": False}])
         if "from leads l group by 1,2" in sql:
             return Result([{"stage": "cadence", "location": "", "n": 1}])
+        if "distinct coalesce(nullif(trim(owner)" in sql:
+            return Result([{"owner": "Unassigned"}])
+        if "as day," in sql:
+            return Result([])
         if "from leads l left join lateral" in sql:
             return Result([{
                 "id": uuid4(), "full_name": "Synthetic Lead", "phone_e164": "+15550000001",
@@ -1698,3 +1702,34 @@ def test_resume_refuses_finished_leads_with_a_plain_reason(monkeypatch, status, 
     assert response.status_code == 409
     assert response.json()["detail"] == message
     assert not any(sql.startswith("update") for sql in connection.statements)
+
+
+@pytest.mark.parametrize("path", [
+    "lead-list?offset=99999999999999999999",
+    "lead-board?offset=99999999999999999999",
+    "lead-list?offset=10000001",
+    "lead-list?q=ab%00c",
+    "lead-list?owner=%00",
+    "lead-board?q=%00",
+    "lead-board?owner=a%00",
+    "lead-list?location=%00",
+    "lead-list?stage=nope",
+    "lead-list?limit=501",
+])
+def test_lead_list_and_board_refuse_bad_input_with_422(monkeypatch, path):
+    # Offset past bigint and a NUL in a text filter reached Postgres and came back as a 500.
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", "x" * 32)
+    get_settings.cache_clear()
+
+    def forbidden_transaction():
+        raise AssertionError("Bad input reached the database")
+
+    monkeypatch.setattr(dashboard_routes, "transaction", forbidden_transaction)
+    try:
+        response = TestClient(app).get(f"/api/v1/dashboard/{path}", headers={
+            "X-Dashboard-Token": "x" * 32, "X-Dashboard-User-ID": "staff-1",
+            "X-Dashboard-User-Name": "Staff", "X-Dashboard-User-Role": "employee",
+        })
+        assert response.status_code == 422, (path, response.status_code)
+    finally:
+        get_settings.cache_clear()

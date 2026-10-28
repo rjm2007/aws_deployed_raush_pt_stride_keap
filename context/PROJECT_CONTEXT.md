@@ -2745,3 +2745,7 @@ patient actually said no.
 - Snapshot: `counts` and new `counts_by_location` are real totals over every lead (Home tiles, Analytics,
   location filter); `leads` = newest 250 plus every lead in review (the Review queue reads it).
 - No migration. Dashboard (`rpt_frontend`): proxy allows the three paths (GET only).
+- Tester fixes (same day): bad input is a 422, not a 500 (offset above 10,000,000; NUL in q / owner /
+  location); `lead-list` returns `overall` (total with no filters); `lead-board` accepts `limit` up to 500 so
+  the dashboard re-reads each column as far as it was scrolled; snapshot `owners` (every owner on any lead)
+  and `created_by_day` (Analytics "Leads created", every lead, per clinic day and clinic).

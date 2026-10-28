@@ -813,6 +813,19 @@ def dashboard_snapshot(actor: Actor):
             "select " + STAGE_SQL + " as stage,coalesce(l.location,'') as location,count(*) as n "
             "from leads l group by 1,2"
         ).fetchall()
+        # Every owner on any lead, for the Leads page owner filter (the loaded leads miss older ones).
+        owners = [r["owner"] for r in conn.execute(
+            "select distinct coalesce(nullif(trim(owner),''),'Unassigned') as owner from leads order by 1"
+        ).fetchall()]
+        # Analytics "Leads created · last 14 days", per clinic day and clinic, over every lead.
+        created_by_day = [
+            {"day": r["day"].isoformat(), "location": r["location"], "count": int(r["n"])}
+            for r in conn.execute(
+                "select (created_at at time zone 'America/Los_Angeles')::date as day,"
+                "coalesce(location,'') as location,count(*) as n from leads "
+                "where created_at>=now()-interval '15 days' group by 1,2 order by 1,2"
+            ).fetchall()
+        ]
         # Next appointments: every visit still on the books from now on, ours and
         # Stride's (front desk bookings and Stride-only patients included).
         upcoming, _ = appointment_views.load_records(conn, actor.practice_id, lower=now, limit=200)
@@ -912,6 +925,8 @@ def dashboard_snapshot(actor: Actor):
         "generated_at": datetime.now(UTC),
         "counts": counts,
         "counts_by_location": counts_by_location,
+        "owners": owners,
+        "created_by_day": created_by_day,
         "leads": leads,
         "appointments": appointments,
         "cadence": cadence,
@@ -948,6 +963,9 @@ def dashboard_keap_sync(actor: Actor):
 
 
 Stage = Literal["new", "cadence", "attention", "booked", "closed"]
+# Text filters: no NUL (Postgres refuses it, which was a 500), bounded offset (bigint overflow was a 500).
+_Text = Annotated[str | None, Query(max_length=120, pattern=r"^[^\x00]*$")]
+_Offset = Annotated[int, Query(ge=0, le=lead_list.MAX_OFFSET)]
 
 
 @router.get("/lead-list")
@@ -955,16 +973,16 @@ def dashboard_lead_list(
     actor: Actor,
     source: Literal["all", "sheet", "stride"] = "all",
     stage: Annotated[list[Stage] | None, Query()] = None,
-    owner: Annotated[str | None, Query(max_length=120)] = None,
-    location: Annotated[str | None, Query(max_length=120)] = None,
-    q: Annotated[str, Query(max_length=120)] = "",
-    offset: Annotated[int, Query(ge=0)] = 0,
+    owner: _Text = None,
+    location: _Text = None,
+    q: _Text = None,
+    offset: _Offset = 0,
     limit: Annotated[int, Query(ge=1, le=lead_list.LIST_LIMIT)] = lead_list.LIST_LIMIT,
 ):
     """The Leads list: one batch (newest first) of leads and unlinked Stride patients matching the
     filters, the real total and the count per source (lead_list.list_page)."""
     with transaction() as conn:
-        page = lead_list.list_page(conn, actor.practice_id, source=source, q=q, owner=owner or None,
+        page = lead_list.list_page(conn, actor.practice_id, source=source, q=q or "", owner=owner or None,
                                    location=location or None, stages=stage, offset=offset, limit=limit)
         lead_ids = [key for kind, key in page["keys"] if kind == "lead"]
         leads = _lead_rows(conn, actor.practice_id, lead_ids, datetime.now(UTC))
@@ -972,23 +990,23 @@ def dashboard_lead_list(
             conn, actor.practice_id, [int(key) for kind, key in page["keys"] if kind == "stride"])
     rows = [leads.get(key) if kind == "lead" else stride.get(int(key)) for kind, key in page["keys"]]
     return {"rows": [row for row in rows if row], "total": page["total"], "sources": page["sources"],
-            "offset": offset, "limit": limit}
+            "overall": page["overall"], "offset": offset, "limit": limit}
 
 
 @router.get("/lead-board")
 def dashboard_lead_board(
     actor: Actor,
     stage: Annotated[list[Stage] | None, Query()] = None,
-    owner: Annotated[str | None, Query(max_length=120)] = None,
-    location: Annotated[str | None, Query(max_length=120)] = None,
-    q: Annotated[str, Query(max_length=120)] = "",
-    offset: Annotated[int, Query(ge=0)] = 0,
-    limit: Annotated[int, Query(ge=1, le=100)] = lead_list.BOARD_LIMIT,
+    owner: _Text = None,
+    location: _Text = None,
+    q: _Text = None,
+    offset: _Offset = 0,
+    limit: Annotated[int, Query(ge=1, le=lead_list.LIST_LIMIT)] = lead_list.BOARD_LIMIT,
 ):
     """Board columns (leads only, no Stride patients): the next cards per column and each column's
     real total. Without `stage` every column's first page; with it, more cards for those columns."""
     with transaction() as conn:
-        columns = lead_list.board_page(conn, actor.practice_id, q=q, owner=owner or None,
+        columns = lead_list.board_page(conn, actor.practice_id, q=q or "", owner=owner or None,
                                        location=location or None, stages=stage, offset=offset, limit=limit)
         leads = _lead_rows(conn, actor.practice_id,
                            [i for column in columns.values() for i in column["ids"]], datetime.now(UTC))

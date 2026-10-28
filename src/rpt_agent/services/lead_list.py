@@ -21,6 +21,7 @@ STAGES = ("new", "cadence", "attention", "booked", "closed")
 SHEET_SOURCE = "google_sheets"
 LIST_LIMIT = 500
 BOARD_LIMIT = 25
+MAX_OFFSET = 10_000_000
 # A Stride visit still on the books (blank status is Stride's default, like appointment_views).
 _ON_BOOKS = ",".join(f"'{s}'" for s in sorted(BOOKED_STATUSES | {""}))
 STRIDE_BOOKED_SQL = (
@@ -112,6 +113,10 @@ def list_page(conn, practice_id: int, *, source: str = "all", q: str = "", owner
             "select count(*) as n from stride_patients sp where " + stride[0], stride[1]).fetchone()["n"]
     sources = {"all": int(counts["all_leads"]) + int(stride_total), "sheet": int(counts["sheet"]),
                "stride": int(stride_total)}
+    # Every row with no filter or search, for "N leads · M in total".
+    overall = sources["all"]
+    if q.strip() or owner or location or stages:
+        overall = list_page(conn, practice_id, limit=0)["sources"]["all"]
     parts, params = [], []
     if source in ("all", "sheet"):
         where, where_params = lead_where(practice_id, q=q, owner=owner, location=location, stages=stages,
@@ -124,13 +129,14 @@ def list_page(conn, practice_id: int, *, source: str = "all", q: str = "", owner
                      "from stride_patients sp where " + stride[0])
         params += stride[1]
     keys = []
-    if parts:
+    if parts and limit:
         keys = conn.execute(
             "select kind,key from (" + " union all ".join(parts) + ") page "
             "order by added desc nulls last,key desc offset %s limit %s",
             [*params, offset, limit],
         ).fetchall()
-    return {"keys": [(r["kind"], r["key"]) for r in keys], "total": sources[source], "sources": sources}
+    return {"keys": [(r["kind"], r["key"]) for r in keys], "total": sources[source], "sources": sources,
+            "overall": overall}
 
 
 def stride_rows(conn, practice_id: int, stride_ids: list[int]) -> dict[int, dict]:

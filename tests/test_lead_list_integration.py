@@ -106,6 +106,7 @@ def test_list_mixes_sheet_leads_and_unlinked_stride_patients(env):  # noqa: F811
 
     page = dashboard.dashboard_lead_list(actor)
     assert page["sources"] == {"all": 5, "sheet": 1, "stride": 3}
+    assert page["overall"] == 5
     assert page["total"] == 5
     by_name = {r["full_name"]: r for r in page["rows"]}
     assert set(by_name) == {"Sheet Booked", "Manual Person", "Walk Upcoming", "Past Visitor", "Never Seen"}
@@ -124,7 +125,9 @@ def test_list_mixes_sheet_leads_and_unlinked_stride_patients(env):  # noqa: F811
     # Stage Booked keeps the booked Stride patient; any other stage drops every Stride row.
     booked = dashboard.dashboard_lead_list(actor, stage=["booked"])
     assert {r["full_name"] for r in booked["rows"]} == {"Sheet Booked", "Walk Upcoming"}
-    assert dashboard.dashboard_lead_list(actor, stage=["new"])["sources"] == {"all": 1, "sheet": 0, "stride": 0}
+    only_new = dashboard.dashboard_lead_list(actor, stage=["new"])
+    assert only_new["sources"] == {"all": 1, "sheet": 0, "stride": 0}
+    assert only_new["overall"] == 5  # the total without filters, for the subtitle
     # Owner: Stride patients have none.
     assert dashboard.dashboard_lead_list(actor, owner="Unassigned")["sources"]["stride"] == 0
     # Search reaches Stride names, emails and phone digits.
@@ -197,6 +200,10 @@ def test_board_columns_have_real_totals_and_page_by_25(env):  # noqa: F811
     flagged = board["columns"]["attention"]["rows"][0]
     assert flagged["stage"] == "attention" and flagged["cadence_total"] == 2
 
+    # The board's refresh re-reads one column as far as it was scrolled (here 60, past the old cap
+    # of 100 it would be 142): only that column comes back, with its real total.
+    refreshed = dashboard.dashboard_lead_board(actor, stage=["cadence"], offset=0, limit=60)
+    assert list(refreshed["columns"]) == ["cadence"] and len(refreshed["columns"]["cadence"]["rows"]) == 60
     more = dashboard.dashboard_lead_board(actor, stage=["cadence"], offset=50)
     assert list(more["columns"]) == ["cadence"]
     assert [r["full_name"] for r in more["columns"]["cadence"]["rows"]] == [
@@ -213,12 +220,21 @@ def test_snapshot_counts_every_lead_not_the_loaded_250(env):  # noqa: F811
     version = _version(ctx)
     old = datetime.now(UTC) - timedelta(days=400)
     flagged = _lead(ctx, "Old Flagged", review=True, version=version, created=old, location="Mission Viejo")
+    old_owner = _lead(ctx, "Old Owned", version=version, created=old, owner="Zed Oldowner")
     for n in range(260):
         _lead(ctx, f"Count Lead{n:03d}", status="new", cadence="pending", events="none", location="Dana Point")
     after = dashboard.dashboard_snapshot(actor)
     assert after["counts"]["new"] - before["counts"]["new"] == 260
     assert after["counts"]["attention"] - before["counts"]["attention"] == 1
-    assert after["metrics"]["total_leads"] - before["metrics"]["total_leads"] == 261
+    assert after["metrics"]["total_leads"] - before["metrics"]["total_leads"] == 262
+    # Owners come from every lead, not the loaded ones (this lead is far past the newest 250).
+    assert old_owner not in {lead["id"] for lead in after["leads"]}
+    assert "Zed Oldowner" in after["owners"] and "Unassigned" in after["owners"]
+    # Leads created per clinic day count every lead (260 today in Dana Point), not the loaded list.
+    def created(snapshot):
+        return sum(r["count"] for r in snapshot["created_by_day"] if r["location"] == "Dana Point")
+    assert created(after) - created(before) == 260
+    assert all(len(r["day"]) == 10 for r in after["created_by_day"])
     assert after["counts_by_location"]["Dana Point"]["new"] - (
         before["counts_by_location"].get("Dana Point", {}).get("new", 0)) == 260
     # An old lead waiting for review is still in the snapshot (the Review queue reads it).
