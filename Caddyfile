@@ -1,40 +1,47 @@
-# Replace with the subdomain you point at this EC2 instance.
-# Caddy obtains and renews the TLS certificate automatically.
+# The domain whose DNS A record points at this server (demo EC2). Caddy gets and renews the
+# HTTPS certificate by itself (ports 80 and 443 must be open). Same layout as production: one
+# host for the backend, the dashboard and Mock Stride. After editing this file run:
+#   docker compose -f docker-compose.prod.yml up -d --force-recreate caddy
 demo.aibolt.ai {
-    request_body /api/v1/dashboard/assistant {
-        max_size 64KB
-    }
-    # While the API restarts (a deploy), hold requests and retry for up to 15 s
-    # instead of answering 502 at once: under Vapi's 20 s tool timeout, so a
-    # live call rides through a deploy.
-    reverse_proxy api:8000 {
-        lb_try_duration 15s
-        lb_try_interval 250ms
-    }
-}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
 
-# Staff dashboard (moved from Vercel). DNS A record -> this server's Elastic IP.
-# The dashboard calls the api inside Docker (http://api:8000), not through this host.
-dashboard.demo.aibolt.ai {
-    header {
-        Strict-Transport-Security "max-age=31536000"
-        X-Content-Type-Options "nosniff"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        -Server
-    }
-    reverse_proxy dashboard:3000 {
-        lb_try_duration 15s
-        lb_try_interval 250ms
-    }
-}
+	request_body /api/v1/dashboard/assistant {
+		max_size 64KB
+	}
 
-# Mock Stride test app (moved from Vercel). DNS A record -> this server's Elastic IP.
-# The app has its own password (Basic auth); the 5-minute cron calls /api/cron/export here.
-mock.demo.aibolt.ai {
-    header {
-        Strict-Transport-Security "max-age=31536000"
-        X-Content-Type-Options "nosniff"
-        -Server
-    }
-    reverse_proxy mock-stride:3100
+	# The Vercel dashboard still calls /api/v1/dashboard/* here until it is retired (a week after
+	# the database move). Then add production's block so that path is internal only:
+	#   handle /api/v1/dashboard/* { respond 404 }
+
+	# Backend: Vapi and Twilio webhooks, Elliot's tools, n8n, Keap OAuth, health checks.
+	@backend path /api/v1/* /health /ready
+	handle @backend {
+		# While the API restarts (a deploy), hold requests for up to 15 s instead of
+		# answering 502: under Vapi's 20 s tool timeout, so a live call rides through.
+		reverse_proxy api:8000 {
+			lb_try_duration 15s
+			lb_try_interval 250ms
+		}
+	}
+
+	# Mock Stride test app, built with basePath /mock-stride (the prefix is kept). Its own
+	# password guards it; the 5-minute cron calls /mock-stride/api/cron/export.
+	@mockstride path /mock-stride /mock-stride/*
+	handle @mockstride {
+		reverse_proxy mock-stride:3100
+	}
+
+	# Everything else is the staff dashboard (login, board, leads, admin). It calls the api
+	# inside Docker (http://api:8000), not through this host.
+	handle {
+		reverse_proxy dashboard:3000 {
+			lb_try_duration 15s
+			lb_try_interval 250ms
+		}
+	}
 }

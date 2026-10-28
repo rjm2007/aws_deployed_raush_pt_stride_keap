@@ -2757,8 +2757,11 @@ patient actually said no.
   buffers, 1 GB limit, healthcheck) and every backend service waits for it; `dashboard` (from `../rpt_frontend`,
   `DASHBOARD_API_ORIGIN=http://api:8000`, `dashboard.env`) and `mock-stride` (from `../mock_stride`,
   `mock-stride.env`, SFTP to the host via `host.docker.internal`). Caddy does not depend on them, so a failed
-  dashboard build never takes the webhook host down. `Caddyfile`: `dashboard.demo.aibolt.ai` and
-  `mock.demo.aibolt.ai`; `demo.aibolt.ai` unchanged.
+  dashboard build never takes the webhook host down. `Caddyfile` (owner: no new subdomains, production's
+  layout): on `demo.aibolt.ai`, `/api/v1/*`, `/health`, `/ready` → api (same retry as before); `/mock-stride` and
+  `/mock-stride/*` → Mock Stride (built with basePath `/mock-stride`, build arg `BASE_PATH`); everything else →
+  dashboard. Every backend route is under those paths. Production's `respond 404` on `/api/v1/dashboard/*`
+  waits until the Vercel dashboard is retired.
 - `config.py`: deployed environments still require `sslmode=require|verify-full`, except for host `db` (the
   in-server container; that hop never leaves the machine). Test in `tests/test_retry.py`.
 - Migration 003 not edited: its only Supabase-role statement already runs only when `rls_auto_enable()` exists;

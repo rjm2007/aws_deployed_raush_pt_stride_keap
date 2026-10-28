@@ -184,8 +184,13 @@ services:
   # Mock Stride test app (was on Vercel). Its own `mock_stride` schema lives in the same db.
   # It uploads CSVs over SFTP to this same server, reached as host.docker.internal.
   # Secrets live in mock-stride.env next to .env, never in git (that repo is public).
+  # Served at https://demo.aibolt.ai/mock-stride (Caddy routes the path; Next needs the
+  # prefix at build time).
   mock-stride:
-    build: ../mock_stride
+    build:
+      context: ../mock_stride
+      args:
+        BASE_PATH: /mock-stride
     image: mock-stride:latest
     container_name: stride-mock
     restart: unless-stopped
