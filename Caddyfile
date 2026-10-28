@@ -12,3 +12,29 @@ demo.aibolt.ai {
         lb_try_interval 250ms
     }
 }
+
+# Staff dashboard (moved from Vercel). DNS A record -> this server's Elastic IP.
+# The dashboard calls the api inside Docker (http://api:8000), not through this host.
+dashboard.demo.aibolt.ai {
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+    reverse_proxy dashboard:3000 {
+        lb_try_duration 15s
+        lb_try_interval 250ms
+    }
+}
+
+# Mock Stride test app (moved from Vercel). DNS A record -> this server's Elastic IP.
+# The app has its own password (Basic auth); the 5-minute cron calls /api/cron/export here.
+mock.demo.aibolt.ai {
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        -Server
+    }
+    reverse_proxy mock-stride:3100
+}

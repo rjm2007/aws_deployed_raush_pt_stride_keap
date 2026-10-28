@@ -1,7 +1,8 @@
 # supabase — database schema
 
 The app talks to hosted Supabase Postgres directly through `SUPABASE_DB_URL` (psycopg, no ORM, no Supabase
-client).
+client). The demo is moving to its own Postgres 17 container (`db`, same env name, `../../DB-Move-Runbook.md`);
+every migration also applies to plain Postgres (003's Supabase-role revoke only runs when that function exists).
 
 | Path | Purpose |
 | --- | --- |

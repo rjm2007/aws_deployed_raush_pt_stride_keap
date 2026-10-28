@@ -1,11 +1,58 @@
 # Production stack. Run with:
 #   docker compose -f docker-compose.prod.yml up -d --build
 # The dev docker-compose.yml stays for local work (mock provider, source mounts).
+# The dashboard and Mock Stride are built from their own repos, cloned next to this one:
+#   ~/aws_deployed_raush_pt_stride_keap  (this repo)
+#   ~/rpt_frontend                       (github.com/rjm2007/rpt_frontend)
+#   ~/mock_stride                        (git clone github.com/rjm2007/stride_mock mock_stride)
+x-db: &needs-db
+  db:
+    condition: service_healthy
+
 services:
+  # The demo's own Postgres (moved off Supabase for HIPAA). No `ports:` on purpose: only
+  # the containers here can reach it. Password comes from POSTGRES_PASSWORD in .env.
+  # Tuned for a 4 GB box shared with about ten other containers.
+  db:
+    image: postgres:17.11
+    container_name: stride-db
+    restart: unless-stopped
+    mem_limit: 1g
+    shm_size: 128mb
+    # Let Postgres finish writing before a stop or reboot kills it.
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_USER: rpt
+      POSTGRES_DB: rpt
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    command:
+      - postgres
+      # Same ceiling as Supabase had; the per-container pools below stay as they were.
+      - -c
+      - max_connections=60
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - timezone=UTC
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rpt -d rpt"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   api:
     build:
       context: .
       dockerfile: Dockerfile.prod
+    depends_on: *needs-db
     container_name: stride-api
     restart: unless-stopped
     env_file: .env
@@ -33,6 +80,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.prod
+    depends_on: *needs-db
     container_name: stride-worker
     restart: unless-stopped
     env_file: .env
@@ -46,6 +94,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.prod
+    depends_on: *needs-db
     container_name: stride-sheet-worker
     restart: unless-stopped
     env_file: .env
@@ -62,6 +111,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.prod
+    depends_on: *needs-db
     container_name: stride-keap-worker
     restart: unless-stopped
     mem_limit: 256m
@@ -82,6 +132,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.prod
+    depends_on: *needs-db
     container_name: stride-booking-worker
     restart: unless-stopped
     mem_limit: 256m
@@ -95,6 +146,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.prod
+    depends_on: *needs-db
     container_name: stride-import-worker
     restart: unless-stopped
     # The importer streams files (flat memory), but if it ever misbehaves only
@@ -112,6 +164,42 @@ services:
       - /srv/stride/archive:/app/stride/archive
       - /srv/stride/error:/app/stride/error
 
+  # Staff dashboard (was on Vercel). Talks to the api inside Docker, like production.
+  # Secrets (token, users, session secret) live in dashboard.env next to .env, never in git.
+  dashboard:
+    build: ../rpt_frontend
+    image: rpt-dashboard:latest
+    container_name: stride-dashboard
+    restart: unless-stopped
+    mem_limit: 384m
+    env_file: dashboard.env
+    environment:
+      DASHBOARD_API_ORIGIN: http://api:8000
+    expose:
+      - "3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # Mock Stride test app (was on Vercel). Its own `mock_stride` schema lives in the same db.
+  # It uploads CSVs over SFTP to this same server, reached as host.docker.internal.
+  # Secrets live in mock-stride.env next to .env, never in git (that repo is public).
+  mock-stride:
+    build: ../mock_stride
+    image: mock-stride:latest
+    container_name: stride-mock
+    restart: unless-stopped
+    mem_limit: 384m
+    env_file: mock-stride.env
+    environment:
+      DATABASE_SSL: disable
+      SFTP_HOST: host.docker.internal
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    expose:
+      - "3100"
+    depends_on: *needs-db
+
   caddy:
     image: caddy:2.11.4-alpine
     container_name: stride-caddy
@@ -127,7 +215,10 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    # No depends_on for dashboard / mock-stride: if either fails to build or start, the API
+    # host (Vapi and Twilio webhooks) must still come up.
 
 volumes:
+  pgdata:
   caddy_data:
   caddy_config:

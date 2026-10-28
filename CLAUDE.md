@@ -48,7 +48,9 @@ CLI: `rpt migrate | verify | seed | demo | test-lead | agent | sheet-check` (`cl
 
 Local Docker stack: `scripts/dev.sh start` (mock providers via the Compose `mock` profile).
 Production: `docker-compose.prod.yml` behind Caddy (`Caddyfile`, domain `demo.aibolt.ai`, demo EC2). See
-`../Deployment.md`.
+`../Deployment.md`. Branch `feature/own-postgres` (not yet live) adds the `db` service (own Postgres 17, no
+public port), `dashboard` (`dashboard.demo.aibolt.ai`, from `../rpt_frontend`) and `mock-stride`
+(`mock.demo.aibolt.ai`, from `../mock_stride`); move steps and backups in `../DB-Move-Runbook.md`.
 
 ## Core concepts (read before editing logic)
 

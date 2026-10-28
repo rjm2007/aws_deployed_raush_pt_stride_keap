@@ -2749,3 +2749,19 @@ patient actually said no.
   location); `lead-list` returns `overall` (total with no filters); `lead-board` accepts `limit` up to 500 so
   the dashboard re-reads each column as far as it was scrolled; snapshot `owners` (every owner on any lead)
   and `created_by_day` (Analytics "Leads created", every lead, per clinic day and clinic).
+
+### 2026-10-28 — Demo database moves off Supabase onto the demo EC2 (branch `feature/own-postgres`, not live)
+- Why: Supabase Pro and Vercel won't sign a BAA on our plans (HIPAA). Owner decided: Postgres 17 in Docker on
+  the same EC2 with no public port; dashboard and Mock Stride move there too; pool sizes stay as they are.
+- `docker-compose.prod.yml`: `db` (postgres:17.11, volume `pgdata`, `max_connections=60`, 256 MB shared
+  buffers, 1 GB limit, healthcheck) and every backend service waits for it; `dashboard` (from `../rpt_frontend`,
+  `DASHBOARD_API_ORIGIN=http://api:8000`, `dashboard.env`) and `mock-stride` (from `../mock_stride`,
+  `mock-stride.env`, SFTP to the host via `host.docker.internal`). Caddy does not depend on them, so a failed
+  dashboard build never takes the webhook host down. `Caddyfile`: `dashboard.demo.aibolt.ai` and
+  `mock.demo.aibolt.ai`; `demo.aibolt.ai` unchanged.
+- `config.py`: deployed environments still require `sslmode=require|verify-full`, except for host `db` (the
+  in-server container; that hop never leaves the machine). Test in `tests/test_retry.py`.
+- Migration 003 not edited: its only Supabase-role statement already runs only when `rls_auto_enable()` exists;
+  all 54 files apply to a fresh plain Postgres 17. `rpt migrate` tracks by file name only.
+- `scripts/db_backup.sh` (nightly pg_dump → S3 SSE-KMS), `db_restore.sh`, `db_row_counts.sh`.
+- Runbook with AWS/DNS prerequisites, cutover, rollback and the local rehearsal results: `../DB-Move-Runbook.md`.

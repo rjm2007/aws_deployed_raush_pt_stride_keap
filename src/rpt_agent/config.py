@@ -2,6 +2,7 @@ from datetime import date
 from functools import cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -296,7 +297,9 @@ class Settings(BaseSettings):
             if self.n8n_intake_auth_disabled:
                 errors.append("N8N_INTAKE_AUTH_DISABLED must be false outside local development")
             database_url = self.supabase_db_url.lower()
-            if not any(
+            # The demo server's own Postgres runs in the same Docker network (service `db`,
+            # no public port), so that hop never leaves the machine. Any other host needs TLS.
+            if urlsplit(database_url).hostname != "db" and not any(
                 value in database_url for value in ("sslmode=require", "sslmode=verify-full")
             ):
                 errors.append("SUPABASE_DB_URL must set sslmode=require or verify-full")

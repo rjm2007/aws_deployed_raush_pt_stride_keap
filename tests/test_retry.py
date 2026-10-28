@@ -63,6 +63,25 @@ def test_preproduction_rejects_disabled_database_tls():
     )
 
 
+def test_in_server_database_may_skip_tls():
+    """The demo server's own Postgres (`db` in Docker, no public port) runs without TLS."""
+    internal = Settings(
+        _env_file=None,
+        app_env="production",
+        supabase_db_url="postgresql://rpt:pw@db:5432/rpt?sslmode=disable",
+    )
+    assert not any("sslmode" in error for error in internal.runtime_errors("api"))
+    for url in (
+        "postgresql://rpt:pw@db.example.org:5432/rpt",
+        "postgresql://rpt:pw@dbhost:5432/rpt?sslmode=disable",
+        "postgresql://db:pw@remote.invalid:5432/rpt",
+    ):
+        settings = Settings(_env_file=None, app_env="production", supabase_db_url=url)
+        assert "SUPABASE_DB_URL must set sslmode=require or verify-full" in settings.runtime_errors(
+            "api"
+        ), url
+
+
 def test_preproduction_rejects_incomplete_real_provider_configuration():
     settings = Settings(
         _env_file=None,

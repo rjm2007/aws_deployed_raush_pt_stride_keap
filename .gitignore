@@ -74,3 +74,7 @@ scripts/voice_tests/results/
 
 # MCP client config can hold API tokens
 .mcp.json
+
+# Server-only env files for the dashboard and Mock Stride containers
+dashboard.env
+mock-stride.env
