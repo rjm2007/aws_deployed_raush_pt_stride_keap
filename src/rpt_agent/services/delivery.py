@@ -471,17 +471,25 @@ WRONG_PERSON_PHRASES = (
     "nobody here by", "no one named", "nobody named", "no such person", "never heard of",
     r"(?:dont|do not) know (?:who|any|that|him|her|them)", "not the patient",
     r"(?:doesnt|does not|dont|do not) live here", "you have the wrong", "youve got the wrong",
-    "you got the wrong",
+    "you got the wrong", "have the wrong", "got the wrong", "the wrong one", r"there(?:s| is) no \w+ here",
 )
 # A family member or someone who knows the patient is not a wrong number (owner, 2026-10-28):
 # "She's not home", "I'm her mom", "Can I take a message?" keep the cadence going.
 _FAMILY = re.compile(
     r"\b(?:mom|mother|dad|father|wife|husband|son|daughter|sister|brother|grandma|grandmother|"
-    r"grandpa|grandfather|aunt|uncle|niece|nephew|partner|girlfriend|boyfriend|not home|"
-    r"not here|not available|not in|take a message|call (?:her|him) back|at work|sleeping|busy)\b"
+    r"grandpa|grandfather|aunt|uncle|niece|nephew|partner|girlfriend|boyfriend|take a message|"
+    r"call (?:her|him) back)\b"
 )
+# Words a family member uses, but a stranger too ("Wrong number, I'm at work"): they keep the cadence
+# going only when the same reply has no plain wrong-number phrase (night QA, 2026-10-29).
+_FAMILY_SOFT = re.compile(r"\b(?:not home|not here|not available|not in|at work|sleeping|busy)\b")
 _WRONG_PERSON = re.compile(r"\b(?:" + "|".join(p.replace(" ", r"\s+") for p in WRONG_PERSON_PHRASES)
                            + r")\b")
+# "No, this is Maria." / "Nope, not Jordan. This is Mike.": a no, then another name (night QA, 2026-10-29).
+_OTHER_NAME = re.compile(
+    r"\b(?:no|nope|nah)\b(?: \w+){0,3} (?:this is|my name is) (?!(?:she|he|me|her|him|it|not|the|a|an|"
+    r"fine|good|ok|okay|just|really|actually|about|for|what|who|why)\b)[a-z]+"
+)
 _IDENTITY_QUESTION = re.compile(r"speaking (?:with|to)|is this|are you")
 _CONFIRM = re.compile(r"\b(?:yes|yeah|yep|yup|speaking|correct|thats right|thats me|its me|this is me|"
                       r"this is (?:she|he))\b")
@@ -505,10 +513,13 @@ def _patient_said_wrong_person(message: dict) -> bool:
         if role != "user" or not reply.strip():
             continue
         text = _refusal_words(reply)
-        if _FAMILY.search(text):
+        if _FAMILY.search(text) or (_FAMILY_SOFT.search(text) and not _WRONG_PERSON.search(text)):
             return False
         if said_wrong:
             continue  # "Yes, bye" after "wrong number" is not a confirmation
+        if i > question and _OTHER_NAME.search(text):
+            said_wrong = True
+            continue
         for sentence in re.findall(r"[^.?!]+", reply):
             words = _refusal_words(sentence)
             if _WRONG_PERSON.search(words):

@@ -297,6 +297,10 @@ def test_wrong_person_needs_the_person_to_say_so(monkeypatch, turns):
 @pytest.mark.parametrize("reply", [
     "No, you have the wrong number.", "No.", "Wrong number.", "There's no one here by that name.",
     "No, this is not Rpt.", "Nope, sorry. Bye.", "I don't know who that is.",
+    # Night QA 2026-10-29: other words, and a stranger who is busy or at work.
+    "No, this is Maria.", "There's no Jordan here.", "You must have the wrong one.",
+    "Nope, not Jordan. This is Mike.", "I think you have the wrong number. I'm busy.",
+    "Wrong number, sorry, I'm at work.",
 ])
 def test_wrong_person_said_by_the_person_is_applied(monkeypatch, reply):
     turns = [("user", "Hello?"), ("bot", "Hi, am I speaking with Rpt Tester?"), ("user", reply)]
@@ -309,6 +313,9 @@ def test_wrong_person_said_by_the_person_is_applied(monkeypatch, reply):
     # A family member is not a wrong number (owner, 2026-10-28).
     [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, she's not home right now.")],
     [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, this is her mom.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, she's at work right now.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, I'm busy, call back later.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, this is fine, who is calling?")],
     # Said yes to the name first, so it is the patient.
     [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yeah."),
      ("bot", "This is Elliot calling from Rausch."), ("user", "Wrong number.")],
