@@ -583,11 +583,33 @@ def test_callback_call_reaches_the_sheet():
 
 
 class _BookedSnapshotConnection(_SnapshotConnection):
+    needs_review = False
+    status_reason = None
+
     def execute(self, query, params=None):
+        if "a.patient_dob" in query:  # no birthday mismatch from a booking call
+            return _Rows()
         rows = super().execute(query, params)
         if query.startswith("select l.id,l.status"):
-            rows.one = {**rows.one, "status": "booked", "cadence_state": "completed"}
+            # mark_booked settles reviews; a booked lead is in review only with a case change card.
+            rows.one = {**rows.one, "status": "booked", "cadence_state": "completed",
+                        "needs_review": self.needs_review, "status_reason": self.status_reason}
         return rows
+
+
+def test_booked_lead_outcome_status_names_a_case_change_card_and_booked_by_front_desk():
+    """Owner, 2026-10-29: a booked lead with a case change card stays Booked and says the card is
+    open; a lead booked from that card says "Booked by front desk"."""
+    flagged = _BookedSnapshotConnection()
+    flagged.needs_review = True
+    snapshot = build_sheet_snapshot(flagged, "00000000-0000-0000-0000-000000000002")
+    assert snapshot["sheet"]["action_status"] == "Booked; needs review: patient wants a different case"
+    assert snapshot["sheet"]["lead_status"] == "Booked"
+    by_desk = _BookedSnapshotConnection()
+    by_desk.status_reason = "Booked by front desk"
+    snapshot = build_sheet_snapshot(by_desk, "00000000-0000-0000-0000-000000000002")
+    assert snapshot["sheet"]["action_status"] == "Booked by front desk"
+    assert snapshot["sheet"]["lead_status"] == "Booked"
 
 
 def test_booked_lead_sets_the_action_cell_too():

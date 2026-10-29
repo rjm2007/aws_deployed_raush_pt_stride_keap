@@ -89,8 +89,17 @@ def _action_label(lead: dict[str, Any]) -> str | None:
     like the status webhook owned start/Lead ID. Only emit labels that outreach can
     set after the fact (completed cadence, voice/tool DNC, declined on the call).
     """
+    from .lead_review import (  # lead_review imports this module
+        BOOKED_BY_FRONT_DESK_REASON,
+        SHEET_BOOKED_CASE_CHANGE,
+    )
     from .review import REPLACED_REASON, RESTARTED_REASON  # review imports this module
 
+    if lead["status"] == "booked" and lead.get("needs_review"):
+        # Only a case change card opens on a booked lead (owner, 2026-10-29): it stays Booked.
+        return SHEET_BOOKED_CASE_CHANGE
+    if lead["status"] == "booked" and lead.get("status_reason") == BOOKED_BY_FRONT_DESK_REASON:
+        return BOOKED_BY_FRONT_DESK_REASON
     if lead["status"] == "booked":
         return "Booked"
     if lead["cadence_state"] == "terminated" and lead.get("status_reason") == REPLACED_REASON:

@@ -367,3 +367,40 @@ def test_continue_cadence_label_shows_in_the_resolution():
     assert resolution_label("continue", "booking_hung_up") == "Continue cadence"
     assert resolution_label("continue", "callback_no_time") == "Continue cadence"
     assert resolution_label("continue", "moved_by_staff") == "Continue"
+
+
+# --- a different case than the referral (owner, 2026-10-29) ----------------------------------------
+
+
+def test_case_change_card_offers_front_desk_booked_by_front_desk_and_continue_cadence():
+    from rpt_agent.services.lead_review import resolution_label, sheet_resolved_text
+
+    row = _review("case_change_asked", asked="spine", referral_case="ankle")
+    card = describe(row, {**LEAD, "status": "needs_attention"})
+    assert (card["group"], card["title"]) == ("call", "Patient wants a different case")
+    assert [(o["choice"], o["label"]) for o in card["options"]] == [
+        ("front_desk", "Front desk will handle"), ("booked_by_front_desk", "Booked by front desk"),
+        ("continue", "Continue cadence")]
+    assert "“spine”" in card["reason"] and "the referral is for ankle" in card["reason"]
+    assert sheet_open_status("case_change_asked", {}) == "Needs review: patient wants a different case"
+    assert sheet_resolved_text("booked_by_front_desk", "case_change_asked") == "Booked by front desk"
+    assert resolution_label("booked_by_front_desk", "case_change_asked") == "Booked by front desk"
+    assert resolution_label("continue", "case_change_asked") == "Continue cadence"
+    # The Sheet's own Case edit stays a different card.
+    assert describe(_review("case_changed", old_value="a", new_value="b"), LEAD)["group"] == "details"
+
+
+def test_case_change_on_a_booked_lead_offers_only_the_front_desk():
+    card = describe(_review("case_change_asked", asked="spine", referral_case="ankle"),
+                    {**LEAD, "status": "booked"})
+    assert [o["choice"] for o in card["options"]] == ["front_desk"]
+    assert card["reason"].startswith("This lead is booked for ankle.")
+    assert "The booking stays" in card["reason"]
+
+
+def test_case_change_review_words():
+    from rpt_agent.services.lead_status import case_change_message
+
+    assert case_change_message("spine", "ankle") == (
+        "Patient asked about a different case: spine (referral is for ankle)")
+    assert case_change_message("", None) == "Patient asked about a different case: not recorded"

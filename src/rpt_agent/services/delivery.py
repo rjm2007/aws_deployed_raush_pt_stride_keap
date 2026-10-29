@@ -671,7 +671,9 @@ def _settle_from_structured_output(
         _patient_refused(message)
         if status == "declined"
         else _patient_replied_after(message, introduction=False)
-        if status in {"do_not_contact", "call_opt_out", "already_booked"}
+        # case_change (owner, 2026-10-29): the patient asked for another case and the call was cut
+        # before Elliot reported it. Needs the patient's own words, like already_booked.
+        if status in {"do_not_contact", "call_opt_out", "already_booked", "case_change"}
         # "manual" is report_lead_status's old name for wrong_person.
         else _patient_said_wrong_person(message)
         if status in {"wrong_person", "manual"}
@@ -694,6 +696,10 @@ def _settle_from_structured_output(
         trace.log("fallback_refusal_without_answer", event_id=event_id, extracted=status)
         status = "no_answer"
         summary_note = f"No answer from the patient; outreach continues. {summary_note}".strip()
+    if status == "case_change" and str(result.get("requested_case") or "").strip():
+        # The case the patient asked for, when the extractor names it, makes the card's words
+        # ("a different case: spine"); otherwise the summary does.
+        summary_note = str(result["requested_case"]).strip()
     try:
         report_lead_status(
             trace,

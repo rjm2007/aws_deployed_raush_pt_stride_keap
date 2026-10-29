@@ -42,8 +42,9 @@ class UpdateLeadStatusBody(BaseModel):
     lead_id: str = Field(examples=["dfd7ec12-8ac4-4dc8-a177-a32e106cb842"])
     status: str = Field(
         description=(
-            "booked, declined, callback_scheduled, booking_link, transferred_human, "
-            "no_answer, wrong_person, call_opt_out, or do_not_contact."
+            "booked, declined, callback_scheduled, booking_link, booking_link_and_transfer, "
+            "transferred_human, no_answer, wrong_person, call_opt_out, do_not_contact, "
+            "already_booked, or case_change (notes = the case the patient asked for)."
         ),
         examples=["no_answer"],
     )

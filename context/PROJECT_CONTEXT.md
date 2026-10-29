@@ -2803,3 +2803,33 @@ Spec and owner decisions: `../Structured-Output-Review.md`. Only `delivery._sett
 - Every end-of-call report with structured outputs stores them (as sent) in `call_logs.structured_output`
   (migration 053, `add column if not exists ... jsonb`; apply on demo before deploying this code).
 
+### 2026-10-29 — A different case than the referral; transfers keep open reviews; front desk hours (branch `feature/own-postgres`, not deployed)
+
+Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, Elliot booked the ankle.
+- New lead-status value `case_change` (notes = the case asked for). Elliot books nothing for it and offers the
+  front desk. Backend (`lead_status.flag_case_change`): review code `case_change_asked` (not `case_changed`,
+  which is the Sheet's Case edit), group call, title "Patient wants a different case", message "Patient asked
+  about a different case: spine (referral is for ankle)" (`leads.lead_type`). Lead paused in Needs Review.
+  Choices: Front desk will handle (Closed) / Booked by front desk (new `booked_by_front_desk`: status booked,
+  `status_reason` "Booked by front desk", planned steps skipped, Sheet Booked like the Sheet's own Booked
+  command, Keap from the status; Stride's file brings the visit) / Continue cadence.
+- Already booked, then a case change: booking kept, status stays booked (Booked column, `stage_of` /
+  `STAGE_SQL` unchanged since booked is checked first), `needs_review` set, card offers only Front desk will
+  handle, which closes the card and keeps the lead Booked. `mark_booked` closes other reviews but keeps an open
+  case change card. The Stride cancel check still watches a booked lead whose only open card is a case change.
+  Sheet Outcome Status: "Needs review: patient wants a different case"; booked: "Booked; needs review: patient
+  wants a different case", then "Booked"; "Booked by front desk" after that choice.
+- A transfer while any review is open (booking failed / patient exists / unconfirmed, case change, ...) is only
+  a history line "Transferred to the front desk; the open review stays": `transferred_human`,
+  `booking_link_and_transfer` (its link text is then dropped by the sender, the lead is not booking_link_sent /
+  transferred_human) and `apply_call_outcome('transferred')`. Before, a transfer set `cadence_state='active'`.
+- Call summary: `case_change` accepted only if the patient spoke after Elliot's first line (like
+  `already_booked`); an optional `requested_case` field becomes the note.
+- Call variable `front_desk_open` ("yes"/"no", `services/front_desk.py`): Elliot offers a live transfer only
+  on "yes". Front desk hours per clinic in clinic time, holidays from `practice_settings.holidays`, "no" in
+  the last 10 minutes before closing.
+- `config/vapi_booking_tools.json` lists the lead-status tool's statuses (`lead_status_statuses`, tested
+  against `REPORTED_STATUSES`); the live Vapi tool, Elliot's prompt and the structured output need
+  `case_change` added separately. No migration (codes and resolutions have no check constraint).
+- Dashboard (`../rpt_frontend`): the Review Queue lists every lead with an open review (a booked lead with a
+  case change card too), new choice type and saved messages.

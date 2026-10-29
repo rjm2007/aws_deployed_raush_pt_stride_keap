@@ -30,7 +30,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from .lead_status import _practice_clock, clamp_to_business_hours, record_status
+from .lead_status import CASE_CHANGE_CODE, _practice_clock, clamp_to_business_hours, record_status
 from .review import (
     PAUSE_SKIP_REASON,
     REPLACED_REASON,
@@ -59,6 +59,11 @@ GROUP_OF = {
     "booking_hung_up": "call",
     # "Call me later" with no time, then the call ended (owner, 2026-10-28).
     "callback_no_time": "call",
+    # The patient asked for a different case than the referral (owner, 2026-10-29; lead_status
+    # flag_case_change). Group "call": it comes from what the patient said on the call, the card
+    # links the transcript (call group only), and its choices come from CODE_CHOICES. Not
+    # "booking": that group's words and Stride auto-close are about a booking the agent tried.
+    CASE_CHANGE_CODE: "call",
     "unrecognized_status": "call",
     "call_failed": "technical",
     "dispatch_failed": "technical",
@@ -113,6 +118,7 @@ TITLES = {
     "call_outcome_not_applied": "Call outcome could not be applied",
     "booking_hung_up": "Patient asked to book, then hung up",
     "callback_no_time": "Asked to be called later, no time given",
+    CASE_CHANGE_CODE: "Patient wants a different case",
     "unrecognized_status": "Unknown call result",
     "call_failed": "Call could not be placed",
     "dispatch_failed": "Call or text could not be sent",
@@ -159,6 +165,9 @@ CHOICE_LABELS = {
     "restart_cadence": "Restart cadence from Day 0",
     "send_booking_link": "Text the booking link",
     "front_desk": "Front desk will handle",
+    # Case change card only (owner, 2026-10-29): the front desk booked the visit; Stride's file
+    # brings its date and time later, so staff enter nothing.
+    "booked_by_front_desk": "Booked by front desk",
 }
 
 # Owner, 2026-10-25: a Restart picked in the Sheet on a lead in review is refused; the review card
@@ -188,9 +197,14 @@ GROUP_CHOICES = {
 CODE_CHOICES = {
     "booking_hung_up": ["continue", "front_desk"],
     "callback_no_time": ["continue", "front_desk"],
+    # Owner, 2026-10-29. On a booked lead only "Front desk will handle" (CASE_CHANGE_BOOKED_CHOICES):
+    # nothing on that card may un-book the lead or start calls again.
+    CASE_CHANGE_CODE: ["front_desk", "booked_by_front_desk", "continue"],
 }
+CASE_CHANGE_BOOKED_CHOICES = ["front_desk"]
 CODE_CHOICE_LABELS = {("booking_hung_up", "continue"): "Continue cadence",
-                      ("callback_no_time", "continue"): "Continue cadence"}
+                      ("callback_no_time", "continue"): "Continue cadence",
+                      (CASE_CHANGE_CODE, "continue"): "Continue cadence"}
 
 RESUME_CHOICES = {"use_new_name", "keep_old_name", "use_new_value", "keep_old_value", "calls_only",
                   "retry_texts", "number_ok", "continue"}
@@ -220,6 +234,8 @@ def choice_label(choice: str, code: str | None = None) -> str:
 WRONG_LEAD_CHOICES = {"different_person", "wrong_number", "close_phone_changed"}
 
 FRONT_DESK_REASON = "Handled by front desk"
+# status_reason of a lead booked from a case change card (dashboard card, Sheet Outcome Status).
+BOOKED_BY_FRONT_DESK_REASON = "Booked by front desk"
 TEXTS_OFF_SKIP_REASON = "texts off (calls only)"
 
 # Outcome Status in the Sheet (no new columns: only the words in the existing cell change).
@@ -243,6 +259,7 @@ SHEET_RESOLVED = {
     "restart_cadence": "Cadence restarted",
     "send_booking_link": "Resolved: booking link texted",
     "front_desk": "Closed: handled by front desk",
+    "booked_by_front_desk": "Booked by front desk",
 }
 # The Action set with the resolution (default "Start cadence"), n8n mode only: direct mode never
 # fills Action (owner, 2026-10-23/25; it only empties it once a command is handled). A restart is shown as the Sheet's own restart is.
@@ -280,6 +297,8 @@ def sheet_open_status(code: str | None, details: dict | None) -> str:
         return "Needs review: patient asked to book, then hung up"
     if code == "callback_no_time":
         return "Needs review: asked to be called later, no time given"
+    if code == CASE_CHANGE_CODE:
+        return SHEET_CASE_CHANGE
     if group == "call":
         return "Needs review: call result unclear"
     if group == "technical":
@@ -296,6 +315,10 @@ def sheet_open_status(code: str | None, details: dict | None) -> str:
     if group == "booking":
         return "Needs review: booking not confirmed in Stride"
     return "Needs review"
+
+SHEET_CASE_CHANGE = "Needs review: patient wants a different case"
+# A booked lead keeps Lead Status Booked; its Outcome Status says the card is open (sheet_sync).
+SHEET_BOOKED_CASE_CHANGE = "Booked; needs review: patient wants a different case"
 
 SOURCE_LABELS = {
     "sheet": "Google Sheet",
@@ -494,6 +517,17 @@ def _plain_reason(row: dict, lead: dict) -> str:
     if code == "callback_no_time":
         return ("The patient asked to be called later but gave no time, and the call ended. Read the "
                 "transcript, then continue the cadence or have the front desk call them.")
+    if code == CASE_CHANGE_CODE:
+        asked = str(details.get("asked") or "").strip() or "not recorded"
+        referral = str(details.get("referral_case") or lead.get("lead_type") or "").strip()
+        if lead.get("status") == "booked":
+            return (f"This lead is booked{f' for {referral}' if referral else ''}. On the call the "
+                    f"patient also asked about a different case: “{asked}”. The booking stays. Elliot "
+                    "does not book another case, so the front desk handles it.")
+        return (f"On the call the patient asked about a different case: “{asked}”"
+                f"{f' (the referral is for {referral})' if referral else ''}. Elliot does not book "
+                "another case: he offered to connect them to the front desk, or said the front desk "
+                "will call. Calls and texts are paused until staff choose.")
     if code == "unrecognized_status":
         return "The agent reported a call result the system does not know. Read the transcript."
     if code == "call_failed":
@@ -588,6 +622,9 @@ def _proof(row: dict, lead_name: str | None = None) -> list[dict[str, str]]:
             proof.append({"label": "Old number", "value": str(details["old_phone"])})
         if details.get("new_phone"):
             proof.append({"label": "New number", "value": str(details["new_phone"])})
+    if code == CASE_CHANGE_CODE:
+        proof += [{"label": "Patient asked for", "value": str(details.get("asked") or "—")},
+                  {"label": "Referral case", "value": str(details.get("referral_case") or "—")}]
     if code in {"sms_failed", "booking_link_failed"}:
         if details.get("day_offset") is not None:
             proof.append({"label": "Step", "value": step_name("sms", details["day_offset"])})
@@ -614,8 +651,11 @@ def describe(row: dict, lead: dict, *, has_calls: bool = False, more: bool = Fal
     group = group_of(code)
     failure = sms_failure(details.get("error_code")) if group == "text" else None
     no_texts = bool(lead.get("sms_opt_out") or lead.get("sms_disabled"))
+    offered = CODE_CHOICES.get(code, GROUP_CHOICES[group])
+    if code == CASE_CHANGE_CODE and lead.get("status") == "booked":
+        offered = CASE_CHANGE_BOOKED_CHOICES
     choices = [
-        choice for choice in CODE_CHOICES.get(code, GROUP_CHOICES[group])
+        choice for choice in offered
         if not (choice == "retry_texts" and failure and failure["permanent"])
         # A pre-048 name review never recorded the new name, so there is nothing to "use".
         and not (choice in {"use_new_name", "use_new_name_restart"} and not details.get("new_name"))
@@ -761,6 +801,11 @@ def _effect(choice: str, details: dict, lead: dict, group: str = "other", code: 
         if group == "technical":
             return "The unconfirmed step is not repeated"
         return "Outreach picks up where it paused"
+    if choice == "booked_by_front_desk":
+        return ("The lead moves to Booked (Booked by front desk) and outreach stops; the visit's date "
+                "and time come in with Stride's next file")
+    if choice == "front_desk" and lead.get("status") == "booked":
+        return "The review closes and the lead stays Booked"
     if choice == "front_desk":
         if group == "booking":
             return ("The lead moves to Closed (Handled by front desk); it still becomes Booked if "
@@ -773,6 +818,12 @@ def _effect(choice: str, details: dict, lead: dict, group: str = "other", code: 
     return "Outreach stops and the lead moves to Closed for good"
 
 
+DONE_MESSAGES = {
+    ("booked_by_front_desk", False): "Lead marked Booked: booked by front desk.",
+    ("front_desk", True): "Review closed. The lead stays Booked.",
+}
+
+
 def options_preview(conn, lead: dict, now: datetime | None = None) -> dict[str, Any]:
     """The review card plus, per choice, what will happen and the next step (confirm pop-up)."""
     now = now or datetime.now(UTC)
@@ -781,6 +832,7 @@ def options_preview(conn, lead: dict, now: datetime | None = None) -> dict[str, 
         return {"review": None, "options": [], "closed": closed_review(conn, lead)}
     rows = open_reviews(conn, str(lead["id"])) or [_legacy_row(lead)]
     details = rows[0].get("details") or {}
+    code_is_case_change = summary["code"] == CASE_CHANGE_CODE
     options = []
     for option in summary["options"]:
         choice = option["choice"]
@@ -790,8 +842,12 @@ def options_preview(conn, lead: dict, now: datetime | None = None) -> dict[str, 
                          "the lead stays paused until every review is resolved.")
         elif choice in RESUME_CHOICES:
             next_step = f"Next step: {_next_step_text(conn, lead, rows, choice, now)}."
+        elif choice == "front_desk" and code_is_case_change:
+            next_step = "Next step: the front desk contacts the patient about the other case."
         elif choice == "front_desk":
             next_step = "Next step: the front desk contacts the patient."
+        elif choice == "booked_by_front_desk":
+            next_step = "Next step: nothing to enter; Stride's next file brings the visit's details."
         elif choice in RESTART_CHOICES:
             next_step = "Next step: the Day 0 call, within calling hours."
         elif choice == "send_booking_link":
@@ -803,6 +859,9 @@ def options_preview(conn, lead: dict, now: datetime | None = None) -> dict[str, 
             "effect": effect,
             "next_step": next_step,
             "confirm": f"{option['label']} for {lead.get('full_name')}. {effect}. {next_step}",
+            # The saved message, where the frontend's own per-choice words would be wrong.
+            **({"done": DONE_MESSAGES[(choice, lead.get("status") == "booked")]}
+               if (choice, lead.get("status") == "booked") in DONE_MESSAGES else {}),
         })
     return {"review": summary, "options": options}
 
@@ -1014,6 +1073,34 @@ def _resume(conn, lead: dict, rows: list[dict], choice: str, now: datetime) -> d
     return {"restored_steps": restored, "shifted_steps": shifted}
 
 
+def _book_by_front_desk(conn, lead: dict) -> None:
+    """"Booked by front desk" on a case change card: the same as the Sheet's Booked command
+    (lead_actions._mark_booked; Keap reads the lead's status, so it tags it Booked the same way)."""
+    lead_id = str(lead["id"])
+    skip_remaining_planned(conn, lead_id, BOOKED_BY_FRONT_DESK_REASON)
+    # Steps the review paused stay stopped: the lead is booked.
+    conn.execute(
+        "update outreach_events set failure_reason=%s,updated_at=now() "
+        "where lead_id=%s and status='skipped' and failure_reason=%s",
+        (BOOKED_BY_FRONT_DESK_REASON, lead_id, PAUSE_SKIP_REASON),
+    )
+    conn.execute(
+        "update leads set status='booked',cadence_state='completed',needs_review=false,"
+        "review_reason=null,review_resolved_at=now(),status_reason=%s,status_changed_at=now() "
+        "where id=%s",
+        (BOOKED_BY_FRONT_DESK_REASON, lead_id),
+    )
+
+
+def _close_on_booked(conn, lead: dict) -> None:
+    """"Front desk will handle" on a booked lead's case change card: the card closes, the booking
+    and everything else stay (booked is final; owner, 2026-10-29)."""
+    conn.execute(
+        "update leads set needs_review=false,review_reason=null,review_resolved_at=now() where id=%s",
+        (str(lead["id"]),),
+    )
+
+
 def _close(conn, lead: dict, choice: str) -> None:
     lead_id = str(lead["id"])
     if choice == "front_desk":
@@ -1210,6 +1297,13 @@ def resolve_review(
         link = _booking_link_guards(conn, lead)
         close_open_reviews(conn, lead_id, choice, by=actor_id, by_name=actor_name, note=note)
         _send_booking_link(conn, lead, link)
+    elif choice == "booked_by_front_desk":
+        close_open_reviews(conn, lead_id, choice, by=actor_id, by_name=actor_name, note=note)
+        _book_by_front_desk(conn, lead)
+    elif lead["status"] == "booked":
+        # Only "Front desk will handle" is offered on a booked lead (describe).
+        close_open_reviews(conn, lead_id, choice, by=actor_id, by_name=actor_name, note=note)
+        _close_on_booked(conn, lead)
     else:
         close_open_reviews(conn, lead_id, choice, by=actor_id, by_name=actor_name, note=note)
         _close(conn, lead, choice)
@@ -1224,6 +1318,10 @@ def resolve_review(
         event_type="review_flagged" if result.get("remaining_reviews") else "review_resolved",
         source_key=f"{lead_id}:{rows[0].get('id')}:{choice}:{now.isoformat()}",
     )
+    if choice == "booked_by_front_desk":
+        # As the Sheet's Booked and Stride's file do (Lead Status Booked, n8n Action "Booked").
+        enqueue_sheet_update(conn, lead_id=lead_id, event_type="lead_booked",
+                             source_key=f"{lead_id}:{rows[0].get('id')}:{now.isoformat()}")
     if choice in KEEP_OLD_NAME and details.get("new_name"):
         # The Sheet's Name cell still shows the new name; this update writes the kept one back.
         enqueue_sheet_update(conn, lead_id=lead_id, event_type="name_kept",

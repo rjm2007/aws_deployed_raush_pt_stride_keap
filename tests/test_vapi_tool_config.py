@@ -114,3 +114,13 @@ def test_book_tool_description_matches_the_in_progress_rule():
     assert "Call it once" not in text
     assert "IN_PROGRESS" in text and "same details, at most twice" in text
     assert "front desk" in text
+
+
+def test_lead_status_tool_statuses_match_the_backend():
+    """case_change (owner, 2026-10-29) and every status the backend handles are in the tool's list;
+    the live Vapi tool's enum must be set to the same list."""
+    from rpt_agent.services.lead_status import REPORTED_STATUSES
+
+    config = json.loads(Path("config/vapi_booking_tools.json").read_text(encoding="utf-8"))
+    assert config["lead_status_statuses"] == list(REPORTED_STATUSES)
+    assert "case_change" in config["lead_status_statuses"]

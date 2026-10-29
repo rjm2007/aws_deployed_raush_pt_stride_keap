@@ -18,12 +18,19 @@ from __future__ import annotations
 
 from typing import Any
 
+from .lead_status import CASE_CHANGE_CODE
 from .review import record_review
 from .sheet_sync import enqueue_sheet_update
 from .stride_import import CANCELLED_STATUSES, LATE_CANCEL_STATUSES, NO_SHOW_STATUSES
 
 # A booking that did not happen: cancelled, late-cancelled or no-show (deletes too).
 _MISSED = tuple(sorted(CANCELLED_STATUSES | NO_SHOW_STATUSES))
+# A booked lead with only a case change card open (owner, 2026-10-29: the patient asked about
+# another case; the booking stays) is still watched: a cancel must not hide behind that card.
+_BOOKED_WATCHED = (
+    "(not l.needs_review or not exists(select 1 from lead_reviews r where r.lead_id=l.id "
+    f"and r.resolved_at is null and r.code<>'{CASE_CHANGE_CODE}'))"
+)
 
 # Staff-facing reasons. The Sheet sync recognises them by the " in Stride" ending.
 REASON_CANCELLED = "Cancelled in Stride"
@@ -235,7 +242,7 @@ def flag_cancelled_bookings(conn, practice_id: int) -> int:
         "join stride_appointments a on a.practice_id=p.practice_id and a.patient_stride_id=p.stride_id "
         " and a.start_utc>l.status_changed_at and a.updated_at>l.status_changed_at "
         " and (a.deleted_at is not null or lower(coalesce(a.status,''))=any(%s)) "
-        "where l.practice_id=%s and l.status='booked' and not l.needs_review "
+        "where l.practice_id=%s and l.status='booked' and " + _BOOKED_WATCHED + " "
         "and not exists(select 1 from stride_appointments g where g.practice_id=p.practice_id "
         " and g.patient_stride_id=p.stride_id and g.start_utc>l.status_changed_at "
         " and g.deleted_at is null and lower(coalesce(g.status,'')) <> all(%s)) "
@@ -245,9 +252,10 @@ def flag_cancelled_bookings(conn, practice_id: int) -> int:
     flagged = 0
     for row in rows:
         lead = conn.execute(
-            "select status,needs_review,status_changed_at from leads where id=%s for update", (row["id"],)
+            "select l.status,l.status_changed_at," + _BOOKED_WATCHED + " as watched from leads l "
+            "where l.id=%s for update", (row["id"],)
         ).fetchone()
-        if lead is None or lead["status"] != "booked" or lead["needs_review"]:
+        if lead is None or lead["status"] != "booked" or not lead["watched"]:
             continue
         reason = _missed_reason(row["removed"], row["appt_status"])
         conn.execute(
@@ -295,7 +303,7 @@ def flag_unclear_deletes(conn, practice_id: int, patient_ids: set[int]) -> int:
         return 0
     rows = conn.execute(
         "select l.id,l.status_changed_at from leads l join stride_patients p on p.lead_id=l.id "
-        "where p.practice_id=%s and p.stride_id=any(%s) and l.status='booked' and not l.needs_review "
+        "where p.practice_id=%s and p.stride_id=any(%s) and l.status='booked' and " + _BOOKED_WATCHED + " "
         "for update of l",
         (practice_id, sorted(patient_ids)),
     ).fetchall()

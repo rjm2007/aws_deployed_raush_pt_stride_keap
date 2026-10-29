@@ -124,6 +124,8 @@ def test_mark_booked_locks_the_lead_for_no_key_update():
     class Conn:
         def execute(self, sql, params=None):
             queries.append(" ".join(sql.split()))
+            if "from lead_reviews" in sql:  # no case change card open
+                return SimpleNamespace(fetchone=lambda: None)
             return SimpleNamespace(fetchone=lambda: {"status": "in_progress"})
 
     mark_booked(Conn(), "11111111-2222-3333-4444-555555555555", "voice_booking")

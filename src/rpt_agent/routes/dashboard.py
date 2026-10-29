@@ -18,6 +18,7 @@ from ..services import appointment_views, lead_list
 from ..services.keap_sync_status import keap_sync_status
 from ..services.lead_actions import _replay_stored_response
 from ..services.lead_review import (
+    BOOKED_BY_FRONT_DESK_REASON,
     CHOICE_LABELS,
     FRONT_DESK_REASON,
     OPEN_REVIEW_DETAIL,
@@ -242,6 +243,8 @@ def _closed_reason(row: dict) -> str:
         return "Closed: another row with this phone number was restarted"
     if reason == FRONT_DESK_REASON:
         return FRONT_DESK_REASON
+    if reason == BOOKED_BY_FRONT_DESK_REASON and row["status"] == "booked":
+        return BOOKED_BY_FRONT_DESK_REASON
     if reason == ALREADY_BOOKED_REASON and row["status"] == "declined":
         return ALREADY_BOOKED_REASON
     if row["status"] == "invalid_phone" and row.get("cadence_state") == "terminated":

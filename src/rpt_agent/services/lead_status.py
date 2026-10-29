@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from ..db import transaction
 from ..observability import WorkflowTrace
-from .review import record_review, skip_remaining_planned
+from .review import flag_lead_for_review, record_review, skip_remaining_planned
 from .sheet_sync import enqueue_sheet_update
 
 CALLBACK_MIN_MINUTES = 5
@@ -20,6 +20,20 @@ CALLBACK_WITHOUT_TIME = "callback_scheduled requires a callback time"
 # A closed lead like `declined`, told apart by this status_reason (dashboard and Sheet name it).
 ALREADY_BOOKED_REASON = "Already booked or already a patient"
 CALLBACK_MAX_MINUTES = 240
+# The patient asked about a different case (body part) than the referral (owner, 2026-10-29: demo
+# call, referral for ankle, "I need an appointment for my spine", and Elliot booked the ankle).
+# Elliot never books it: he offers the front desk and reports `case_change` with notes = what the
+# patient asked for. The lead goes to Needs Review with this code (`case_changed` is the Sheet's
+# Case column edit, a different thing). A booked lead keeps its booking; the card only asks the
+# front desk to handle the other case.
+CASE_CHANGE_STATUS = "case_change"
+CASE_CHANGE_CODE = "case_change_asked"
+# Every status the lead-status tool may send (config/vapi_booking_tools.json lists the same, tested).
+REPORTED_STATUSES = (
+    "booked", "declined", "callback_scheduled", "booking_link", "booking_link_and_transfer",
+    "transferred_human", "no_answer", "wrong_person", "call_opt_out", "do_not_contact",
+    "already_booked", CASE_CHANGE_STATUS,
+)
 
 
 def _practice_clock(conn, lead_id: str) -> tuple[ZoneInfo, dict, list]:
@@ -146,15 +160,75 @@ def mark_booked(conn, lead_id: str, source: str) -> None:
     )
     # A confirmed booking settles any open review, as the Sheet's Booked does (migration 048's
     # trigger records it as "booked"): a booked lead left flagged showed in Needs Review, where
-    # "Continue" would have put it back into calls.
-    conn.execute(
-        "update leads set status='booked',cadence_state='completed',last_call_outcome='booked',"
-        "needs_review=false,review_reason=null,review_resolved_at=case when needs_review then now() "
-        "else review_resolved_at end,status_changed_at=now() where id=%s",
-        (lead_id,),
-    )
+    # "Continue" would have put it back into calls. Except a different case the patient asked for
+    # (owner, 2026-10-29): this booking is not that case, so its card stays open on the booked lead.
+    case_change = conn.execute(
+        "select message from lead_reviews where lead_id=%s and resolved_at is null and code=%s "
+        "order by flagged_at,id limit 1",
+        (lead_id, CASE_CHANGE_CODE),
+    ).fetchone()
+    if case_change:
+        conn.execute(
+            "update lead_reviews set resolved_at=now(),resolved_by='system',resolved_by_name='System',"
+            "resolution='booked',updated_at=now() where lead_id=%s and resolved_at is null and code<>%s",
+            (lead_id, CASE_CHANGE_CODE),
+        )
+        conn.execute(
+            "update leads set status='booked',cadence_state='completed',last_call_outcome='booked',"
+            "needs_review=true,review_reason=%s,review_flagged_at=coalesce(review_flagged_at,now()),"
+            "status_changed_at=now() where id=%s",
+            (case_change["message"], lead_id),
+        )
+    else:
+        conn.execute(
+            "update leads set status='booked',cadence_state='completed',last_call_outcome='booked',"
+            "needs_review=false,review_reason=null,review_resolved_at=case when needs_review then now() "
+            "else review_resolved_at end,status_changed_at=now() where id=%s",
+            (lead_id,),
+        )
     if lead["status"] != "booked":
         record_status(conn, lead_id, lead["status"], "booked", source, "appointment confirmed")
+
+
+def case_change_message(asked: str | None, referral: str | None) -> str:
+    """The review's words: "Patient asked about a different case: spine (referral is for ankle)"."""
+    text = f"Patient asked about a different case: {(asked or '').strip() or 'not recorded'}"
+    if (referral or "").strip():
+        text += f" (referral is for {referral.strip()})"
+    return text[:500]
+
+
+def flag_case_change(
+    conn, lead: dict, *, note: str, source: str, event_id: int | None, call_id: str | None,
+) -> bool:
+    """Needs Review for a different case (owner, 2026-10-29). Returns whether a card is open.
+
+    Not booked: paused and flagged like any call review. Booked: the booking stays (booked is
+    final, the lead stays in the Booked column); only the card opens, and its one choice (front
+    desk) closes it without touching the booking.
+    """
+    lead_id = str(lead["id"])
+    message = case_change_message(note, lead.get("lead_type"))
+    # The call's event goes in details, not outreach_event_id: record_review refreshes the open row
+    # of the same event, which would turn another card raised on this call into this one. The same
+    # report twice (same words) refreshes this card instead of adding a second.
+    details = {"asked": note or None, "referral_case": lead.get("lead_type") or None,
+               "call_id": call_id, "outreach_event_id": event_id,
+               "booked": lead["status"] == "booked" or None}
+    if lead["status"] != "booked":
+        flagged = flag_lead_for_review(conn, lead_id, message, code=CASE_CHANGE_CODE, details=details,
+                                       source="call")
+        if flagged:
+            record_status(conn, lead_id, lead["status"], "needs_attention", source, message)
+        return flagged
+    conn.execute(
+        "update leads set needs_review=true,review_reason=coalesce(case when needs_review "
+        "then review_reason end,%s),review_flagged_at=coalesce(case when needs_review "
+        "then review_flagged_at end,now()) where id=%s",
+        (message, lead_id),
+    )
+    review_id = record_review(conn, lead_id, CASE_CHANGE_CODE, message, details=details, source="call")
+    return review_id is not None
 
 
 def _schedule_callback(conn, lead_id: str, callback_utc: datetime) -> None:
@@ -187,6 +261,13 @@ def _schedule_callback(conn, lead_id: str, callback_utc: datetime) -> None:
     )
 
 
+TRANSFER_WITH_REVIEW = "Transferred to the front desk; the open review stays"
+
+
+def _transfer_with_review(note: str | None) -> str:
+    return (f"{TRANSFER_WITH_REVIEW}. {note}" if note else TRANSFER_WITH_REVIEW)[:500]
+
+
 def report_lead_status(
     trace: WorkflowTrace,
     *,
@@ -217,7 +298,8 @@ def report_lead_status(
     trace.log("validation_started", lead_id=lead_id, event_id=event_id, reported_status=normalized)
     with transaction() as conn:
         lead = conn.execute(
-            "select id,status,cadence_state,phone_e164,sms_opt_out from leads where id=%s for update",
+            "select id,status,cadence_state,phone_e164,sms_opt_out,needs_review,lead_type "
+            "from leads where id=%s for update",
             (lead_id,),
         ).fetchone()
         if not lead:
@@ -266,11 +348,29 @@ def report_lead_status(
         if not receipt:
             trace.log("state_transition_skipped", reason="duplicate_lead_status")
             return "already recorded"
+        if lead["status"] == "booked" and normalized == CASE_CHANGE_STATUS:
+            # Booked, then "also my spine" (owner, 2026-10-29): the booking stays, the card opens.
+            # The call is settled only if the booking has not settled it already.
+            if event:
+                conn.execute(
+                    "update outreach_events set status='delivered',settled_at=now(),settled_by=%s,"
+                    "outcome='manual',updated_at=now() where id=%s and status in ('in_flight','attempted')",
+                    ("tool" if source == "tool" else "webhook", event["id"]),
+                )
+            flag_case_change(conn, lead, note=note, source=source,
+                             event_id=event["id"] if event else None, call_id=stable_call_id)
+            conn.execute("update provider_events set processed_at=now() where id=%s", (receipt["id"],))
+            trace.log("state_transition_applied", reported_status=normalized, booked=True)
+            return "recorded"
         if lead["status"] == "booked" and normalized != "booked":
             conn.execute("update provider_events set processed_at=now() where id=%s", (receipt["id"],))
             trace.log("state_transition_skipped", reason="confirmed_booking_is_terminal")
             return "already booked"
 
+        # A transfer to the front desk while a review is open (a booking that failed on the call, a
+        # different case, ...; owner, 2026-10-29) is only noted: the review and the pause stay, so the
+        # transfer can never put the lead back into calls or hide the card.
+        review_open = bool(lead.get("needs_review"))
         outcome = {
             "booked": "booked",
             "declined": "not_interested",
@@ -408,7 +508,12 @@ def report_lead_status(
                     "updated_at=now() where id=%s",
                     (json.dumps({"with_transfer": True} if with_transfer else {}), existing["id"]),
                 )
-            if with_transfer:
+            if with_transfer and review_open:
+                record_status(
+                    conn, lead_id, lead["status"], lead["status"], source,
+                    _transfer_with_review(note or "booking link texted and transferred to staff"),
+                )
+            elif with_transfer:
                 conn.execute(
                     "update leads set status='transferred_human',cadence_state='active',"
                     "last_call_outcome='transferred',status_reason=%s,status_changed_at=now() where id=%s",
@@ -439,15 +544,22 @@ def report_lead_status(
                 "and payload->>'call_id'=%s",
                 (lead_id, stable_call_id),
             )
-            # Record the handoff, but only an explicit staff booking closes cadence.
-            conn.execute(
-                "update leads set status='transferred_human',cadence_state='active',"
-                "last_call_outcome='transferred',status_reason=%s,status_changed_at=now() where id=%s",
-                (note or "transferred to staff", lead_id),
-            )
-            record_status(
-                conn, lead_id, lead["status"], "transferred_human", source, note or "transferred"
-            )
+            if review_open:
+                record_status(conn, lead_id, lead["status"], lead["status"], source,
+                              _transfer_with_review(note))
+            else:
+                # Record the handoff, but only an explicit staff booking closes cadence.
+                conn.execute(
+                    "update leads set status='transferred_human',cadence_state='active',"
+                    "last_call_outcome='transferred',status_reason=%s,status_changed_at=now() where id=%s",
+                    (note or "transferred to staff", lead_id),
+                )
+                record_status(
+                    conn, lead_id, lead["status"], "transferred_human", source, note or "transferred"
+                )
+        elif normalized == CASE_CHANGE_STATUS:
+            flag_case_change(conn, lead, note=note, source=source,
+                             event_id=event["id"] if event else None, call_id=stable_call_id)
         elif normalized == "no_answer":
             conn.execute(
                 "update leads set last_call_outcome='no_answer',status_reason=%s where id=%s",
@@ -553,7 +665,7 @@ def apply_call_outcome(
         # with a booking finishing as the end-of-call report arrives, and Postgres would abort one
         # side; losing the booking's save leaves a visit in Stride our records do not show.
         lead = conn.execute(
-            "select id,status,phone_e164 from leads where id=%s for update", (lead_id,)
+            "select id,status,phone_e164,needs_review from leads where id=%s for update", (lead_id,)
         ).fetchone()
         event = conn.execute(
             "select id,lead_id,channel,status,outcome,vapi_call_id from outreach_events "
@@ -622,6 +734,10 @@ def apply_call_outcome(
             )
         elif outcome in {"no_answer", "voicemail"}:
             conn.execute("update leads set last_call_outcome=%s where id=%s", (outcome, lead_id))
+        elif outcome == "transferred" and lead.get("needs_review"):
+            # An open review stays open through a transfer (see report_lead_status).
+            record_status(conn, lead_id, lead["status"], lead["status"], source,
+                          _transfer_with_review(None))
         elif outcome == "transferred":
             conn.execute(
                 "update leads set status='transferred_human',cadence_state='active',last_call_outcome=%s,"

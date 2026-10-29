@@ -216,5 +216,11 @@
       }
     }
   ],
-  "lead_status_tool_copy_id": "86c809f8-1bca-4fba-aea8-b27a74c86fc2"
+  "lead_status_tool_copy_id": "86c809f8-1bca-4fba-aea8-b27a74c86fc2",
+  "lead_status_tool_note": "The update_lead_status tool (lead_status_tool_copy_id) lives in Vapi only; its status enum must list exactly lead_status_statuses (tests/test_vapi_tool_config.py checks them against lead_status.REPORTED_STATUSES). case_change (2026-10-29): the patient wants a different case than the referral; notes = what they asked for (e.g. spine).",
+  "lead_status_statuses": [
+    "booked", "declined", "callback_scheduled", "booking_link", "booking_link_and_transfer",
+    "transferred_human", "no_answer", "wrong_person", "call_opt_out", "do_not_contact",
+    "already_booked", "case_change"
+  ]
 }

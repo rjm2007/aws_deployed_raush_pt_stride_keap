@@ -141,6 +141,7 @@ def main() -> None:
 
     from rpt_agent.config import get_settings
     from rpt_agent.db import transaction
+    from rpt_agent.services.front_desk import front_desk_open_word
     from rpt_agent.services.slot_booking import call_case_variables
 
     settings = get_settings()
@@ -162,6 +163,7 @@ def main() -> None:
                 # "date of birth spoken" aloud and booked with "{{date_of_birth}}" (2026-10-27).
                 "date_of_birth": args.dob,
                 "date_of_birth_spoken": f"{dob:%B} {dob.day}, {dob.year}",
+                "front_desk_open": front_desk_open_word(args.clinic),
             }},
         })
         with transaction() as conn:

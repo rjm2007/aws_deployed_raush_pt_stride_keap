@@ -360,6 +360,31 @@ def test_call_sends_clinic_and_case_for_the_booking_agent():
     assert values["lead_id"] == "lead-7" and values["outreach_event_id"] == "7"
     assert values["case_type"] == "Physical Therapy"
     assert values["case_types_offered"] == "Physical Therapy, Pelvic Health"
+    # Elliot offers a live transfer only when the front desk is open (2026-10-29); default "no".
+    assert values["front_desk_open"] == "no"
+
+
+def test_call_sends_whether_the_front_desk_is_open():
+    job = Job(8, "lead-8", "call", "+15555550123", "Test Patient", None, None, 0,
+              "assistant", "phone", clinic="Dana Point", front_desk_open="yes")
+    sent = {}
+
+    class Provider:
+        def create_vapi_call(self, trace, payload):
+            sent.update(payload)
+            return "vapi-call-8"
+
+    dispatch_job(WorkflowTrace("worker", "test"), job, Provider())
+    assert sent["assistantOverrides"]["variableValues"]["front_desk_open"] == "yes"
+
+
+def test_claim_reads_the_clinic_holidays_for_the_front_desk():
+    import inspect
+
+    from rpt_agent import worker
+
+    source = inspect.getsource(worker.claim_jobs)
+    assert "ps.holidays" in source and "front_desk_open=front_desk_open_word(" in source
 
 
 def test_claim_never_texts_a_calls_only_lead():

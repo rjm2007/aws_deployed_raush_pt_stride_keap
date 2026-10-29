@@ -73,6 +73,8 @@ class Job:
     case_type: str = ""
     case_types_offered: str = ""
     service_aliases: str = ""
+    # "yes" / "no": Elliot offers a live transfer only while the front desk is open (2026-10-29).
+    front_desk_open: str = "no"
 
 
 @dataclass(frozen=True)
@@ -379,6 +381,7 @@ def next_due_soon(conn, lead_id: str) -> datetime | None:
 
 
 def claim_jobs(trace: WorkflowTrace, limit: int = 20) -> list[Job]:
+    from .services.front_desk import front_desk_open_word  # local: services import the worker
     from .services.slot_booking import call_case_variables  # local: avoids an import cycle
 
     trace.log("database_operation_started", operation="claim_due_events")
@@ -394,7 +397,7 @@ def claim_jobs(trace: WorkflowTrace, limit: int = 20) -> list[Job]:
             context = conn.execute(
                 "select l.full_name,l.phone_e164,ps.vapi_assistant_id,ps.vapi_phone_number_id,"
                 "ps.booking_link_url,l.date_of_birth,ps.stride_case_title,ps.stride_location_id,"
-                "l.location,l.lead_type,mt.body "
+                "l.location,l.lead_type,mt.body,ps.holidays "
                 "from leads l "
                 "join practice_settings ps on ps.practice_id=l.practice_id "
                 "left join message_templates mt on mt.cadence_step_id=%s and mt.is_active "
@@ -415,6 +418,8 @@ def claim_jobs(trace: WorkflowTrace, limit: int = 20) -> list[Job]:
                 context["location"] or "",
                 context["lead_type"] or "",
                 **(call_case_variables(conn, str(row["lead_id"])) if row["channel"] == "call" else {}),
+                # Claimed and dialled in the same tick, so "now" is the moment of the call.
+                front_desk_open=front_desk_open_word(context["location"], holidays=context.get("holidays")),
             ))
     trace.log("database_operation_completed", operation="claim_due_events", job_count=len(jobs))
     return jobs
@@ -450,6 +455,9 @@ def dispatch_job(trace: WorkflowTrace, job: Job, providers: ProviderClients) -> 
                     "clinic_location": job.clinic, "case_name": job.case_name,
                     "case_type": job.case_type, "case_types_offered": job.case_types_offered,
                     "service_aliases": job.service_aliases,
+                    # Offer a live transfer only when "yes" (front desk hours of the lead's clinic,
+                    # services/front_desk.py); "no" = say the front desk will call them.
+                    "front_desk_open": job.front_desk_open,
                     # Read back for the patient to confirm ("August 9, 1990"), never asked cold.
                     "date_of_birth_spoken": (
                         f"{job.date_of_birth:%B} {job.date_of_birth.day}, {job.date_of_birth.year}"
