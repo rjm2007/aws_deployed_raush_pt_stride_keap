@@ -491,23 +491,49 @@ _OTHER_NAME = re.compile(
     r"fine|good|ok|okay|just|really|actually|about|for|what|who|why)\b)[a-z]+"
 )
 _IDENTITY_QUESTION = re.compile(r"speaking (?:with|to)|is this|are you")
-_CONFIRM = re.compile(r"\b(?:yes|yeah|yep|yup|speaking|correct|thats right|thats me|its me|this is me|"
-                      r"this is (?:she|he))\b")
+# A clear "I am the patient". A bare "Yes" is weaker: people answer the phone with "Yes?" and talk over
+# the greeting (648), so it never outweighs a clear "wrong number" (owner, 2026-10-29).
+_CLEAR_PATIENT = re.compile(r"\b(?:speaking|thats me|its me|this is me|this is (?:she|he)|thats right|"
+                            r"correct|(?:yes|yeah|yep) (?:this is|it is|its|i am|im))\b")
+_BARE_YES = frozenset({"yes", "yeah", "yep", "yup"})
+_YES_FILLER = frozenset({"uh", "um", "oh", "hi", "hello", "hey", "mm", "hmm", "sure", "ok", "okay"})
+_NAME_STOP = frozenset({"am", "i", "is", "this", "speaking", "with", "to", "are", "you", "hi", "hello",
+                        "hey", "please", "the", "a", "mr", "mrs", "ms", "miss", "dr", "there"})
+
+
+def _asked_names(question: str) -> set[str]:
+    """The name Elliot asked for: "Hi, am I speaking with Jordan Lee?" -> {"jordan", "lee"}."""
+    match = re.search(r"(?:speaking (?:with|to)|is this|are you)\s+([^?.!,]+)", question.lower())
+    return set(_refusal_words(match.group(1)).split()) - _NAME_STOP if match else set()
 
 
 def _patient_said_wrong_person(message: dict) -> bool:
-    """Whether the person on the call said they are not the patient (or it is a wrong number) after
-    Elliot asked who he was speaking with, without saying yes to being the patient before that."""
+    """Whether the person on the call said they are not the patient (or it is a wrong number) in answer
+    to Elliot's "Am I speaking with ...?" (owner, 2026-10-29):
+    1. Anything said before that question ("Hello?", "Yes?") is a greeting and is ignored; so is a
+       "Yes?" asked back.
+    2. A clear statement beats a bare word: "wrong number" / "this is Maria" is the wrong person even
+       after a bare "Yes"; "Speaking" / "Yes, this is Jordan" is the patient, nothing after it changes that.
+    3. A bare "No" counts only as the direct answer to the question, with no "Yes" before it (648).
+    4. A family member keeps the cadence going.
+    A wrong person only pauses the lead with a Wrong number card, so staff make the final call when the
+    call contradicts itself ("Yeah..." then "wrong number")."""
     turns = _call_turns(message)
     question = next((i for i, (role, words) in enumerate(turns)
                      if role == "bot" and _IDENTITY_QUESTION.search(words.lower())), None)
     if question is None:
         return False
+    names = _asked_names(turns[question][1])
+    own_name = re.compile(r"\b(?:this is|its|im|i am|yes|yeah|yep) (?:" + "|".join(sorted(names)) + r")\b"
+                          ) if names else None
     last_bot = question
+    said_yes = False
     said_wrong = False
     for i, (role, reply) in enumerate(turns):
+        if i <= question:
+            continue  # rule 1: greetings before the question
         if role == "bot":
-            if i > question and reply.strip():
+            if reply.strip():
                 last_bot = i
             continue
         if role != "user" or not reply.strip():
@@ -517,20 +543,25 @@ def _patient_said_wrong_person(message: dict) -> bool:
             return False
         if said_wrong:
             continue  # "Yes, bye" after "wrong number" is not a confirmation
-        if i > question and _OTHER_NAME.search(text):
+        if _OTHER_NAME.search(text) and not (own_name and own_name.search(text)):
             said_wrong = True
             continue
-        for sentence in re.findall(r"[^.?!]+", reply):
+        for sentence, mark in re.findall(r"([^.?!]+)([.?!]*)", reply):
             words = _refusal_words(sentence)
+            if not words:
+                continue
             if _WRONG_PERSON.search(words):
-                said_wrong = i > question
-                if said_wrong:
-                    break
-            elif _CONFIRM.search(words):
-                # A yes anywhere before the denial (648: "Yes." over the greeting) is the patient.
+                said_wrong = True
+                break
+            if "?" in mark:
+                continue  # "Yes?", "Who am I speaking with?": asked back, not an answer
+            if _CLEAR_PATIENT.search(words) or (own_name and own_name.search(words)):
                 return False
-            elif (i > question and last_bot == question and set(words.split()) & _BARE_NO
-                  and set(words.split()) <= _BARE_NO | _BARE_NO_FILLER):
+            bare = set(words.split())
+            if bare & _BARE_YES and bare <= _BARE_YES | _YES_FILLER:
+                said_yes = True
+            elif (last_bot == question and not said_yes and bare & _BARE_NO
+                  and bare <= _BARE_NO | _BARE_NO_FILLER):
                 said_wrong = True  # a plain "No." to "Am I speaking with ...?"
                 break
     return said_wrong

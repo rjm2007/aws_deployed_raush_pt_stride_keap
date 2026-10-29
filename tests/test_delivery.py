@@ -316,9 +316,17 @@ def test_wrong_person_said_by_the_person_is_applied(monkeypatch, reply):
     [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, she's at work right now.")],
     [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, I'm busy, call back later.")],
     [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, this is fine, who is calling?")],
-    # Said yes to the name first, so it is the patient.
-    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yeah."),
+    # A clear yes to the name: the patient, whatever comes after (owner, 2026-10-29).
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Speaking."),
      ("bot", "This is Elliot calling from Rausch."), ("user", "Wrong number.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yes, this is Rpt."),
+     ("bot", "This is Elliot calling from Rausch."), ("user", "No, this is Maria's phone.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "That's me.")],
+    # Asked back, never an answer.
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Who am I speaking with?")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yes?")],
+    # A bare "no" after a bare "yes" is talking over the greeting (648).
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yeah."), ("user", "No.")],
     # A "no" to a later question is not about who they are.
     [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Speaking."),
      ("bot", "This is Elliot from Rausch. Is now a good time?"), ("user", "No.")],
@@ -327,6 +335,23 @@ def test_wrong_person_said_by_the_person_is_applied(monkeypatch, reply):
 ])
 def test_wrong_person_is_not_a_family_member_or_the_patient(monkeypatch, turns):
     assert _settle_with(monkeypatch, {"status": "wrong_person"}, turns)["status"] == "no_answer"
+
+
+@pytest.mark.parametrize("turns", [
+    # Night QA 2026-10-29: "Yes?" picking up the phone, then a clear wrong number.
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yes?"), ("user", "No, wrong number.")],
+    [("user", "Yes?"), ("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, wrong number.")],
+    # A greeting before the question is ignored, then a plain "No." is the answer.
+    [("user", "Yes."), ("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No.")],
+    # The call contradicts itself: a bare yes, then a clear wrong number. The lead is paused with a
+    # Wrong number card and staff decide (owner, 2026-10-29).
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yeah."),
+     ("bot", "This is Elliot calling from Rausch."), ("user", "Wait, wrong number.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yeah? Who's this?"),
+     ("bot", "This is Elliot calling from Rausch."), ("user", "There's no Rpt here.")],
+])
+def test_clear_wrong_person_beats_a_bare_or_asked_back_yes(monkeypatch, turns):
+    assert _settle_with(monkeypatch, {"status": "wrong_person"}, turns)["status"] == "wrong_person"
 
 
 def test_unknown_status_is_passed_on_for_review(monkeypatch):
