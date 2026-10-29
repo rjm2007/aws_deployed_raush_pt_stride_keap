@@ -327,6 +327,10 @@ def test_wrong_person_said_by_the_person_is_applied(monkeypatch, reply):
     [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yes?")],
     # A bare "no" after a bare "yes" is talking over the greeting (648).
     [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yeah."), ("user", "No.")],
+    # "Not interested" / "not available" are not about who they are.
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, I'm not interested.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yes."),
+     ("bot", "This is Elliot from Rausch. Is now a good time?"), ("user", "No.")],
     # A "no" to a later question is not about who they are.
     [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Speaking."),
      ("bot", "This is Elliot from Rausch. Is now a good time?"), ("user", "No.")],
@@ -349,6 +353,13 @@ def test_wrong_person_is_not_a_family_member_or_the_patient(monkeypatch, turns):
      ("bot", "This is Elliot calling from Rausch."), ("user", "Wait, wrong number.")],
     [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Yeah? Who's this?"),
      ("bot", "This is Elliot calling from Rausch."), ("user", "There's no Rpt here.")],
+    # Night QA re-test 2: other ways a stranger says it.
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "No, I'm not Rpt.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "I just got this number, I don't know a Rpt.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Sorry, I just got this number last month.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Rpt? No, no Rpt here.")],
+    [("bot", "Hi, am I speaking with Rpt Tester?"), ("user", "Who is this?"),
+     ("bot", "This is Elliot from Rausch. Sorry, is this Rpt?"), ("user", "No.")],
 ])
 def test_clear_wrong_person_beats_a_bare_or_asked_back_yes(monkeypatch, turns):
     assert _settle_with(monkeypatch, {"status": "wrong_person"}, turns)["status"] == "wrong_person"

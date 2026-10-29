@@ -472,6 +472,7 @@ WRONG_PERSON_PHRASES = (
     r"(?:dont|do not) know (?:who|any|that|him|her|them)", "not the patient",
     r"(?:doesnt|does not|dont|do not) live here", "you have the wrong", "youve got the wrong",
     "you got the wrong", "have the wrong", "got the wrong", "the wrong one", r"there(?:s| is) no \w+ here",
+    "just got this number", r"(?:dont|do not) know (?:a|an)",
 )
 # A family member or someone who knows the patient is not a wrong number (owner, 2026-10-28):
 # "She's not home", "I'm her mom", "Can I take a message?" keep the cadence going.
@@ -514,7 +515,8 @@ def _patient_said_wrong_person(message: dict) -> bool:
        "Yes?" asked back.
     2. A clear statement beats a bare word: "wrong number" / "this is Maria" is the wrong person even
        after a bare "Yes"; "Speaking" / "Yes, this is Jordan" is the patient, nothing after it changes that.
-    3. A bare "No" counts only as the direct answer to the question, with no "Yes" before it (648).
+    3. A bare "No" counts only as the direct answer to the question (or to Elliot asking the name again),
+       with no "Yes" before it (648).
     4. A family member keeps the cadence going.
     A wrong person only pauses the lead with a Wrong number card, so staff make the final call when the
     call contradicts itself ("Yeah..." then "wrong number")."""
@@ -524,9 +526,13 @@ def _patient_said_wrong_person(message: dict) -> bool:
     if question is None:
         return False
     names = _asked_names(turns[question][1])
-    own_name = re.compile(r"\b(?:this is|its|im|i am|yes|yeah|yep) (?:" + "|".join(sorted(names)) + r")\b"
+    alternatives = "|".join(sorted(names))
+    own_name = re.compile(r"\b(?:this is|its|im|i am|yes|yeah|yep) (?:" + alternatives + r")\b"
                           ) if names else None
-    last_bot = question
+    # "No, I'm not Jordan." / "Jordan? No, no Jordan here." (night QA, 2026-10-29)
+    not_name = re.compile(r"\b(?:(?:im|i am|this is|its) not (?:" + alternatives + r")|no (?:" + alternatives
+                          + r") here)\b") if names else None
+    last_bot = asking = question
     said_yes = False
     said_wrong = False
     for i, (role, reply) in enumerate(turns):
@@ -535,6 +541,8 @@ def _patient_said_wrong_person(message: dict) -> bool:
         if role == "bot":
             if reply.strip():
                 last_bot = i
+                if _IDENTITY_QUESTION.search(reply.lower()) and _asked_names(reply) & names:
+                    asking = i  # Elliot asked the name again ("Sorry, is this Jordan?")
             continue
         if role != "user" or not reply.strip():
             continue
@@ -550,7 +558,7 @@ def _patient_said_wrong_person(message: dict) -> bool:
             words = _refusal_words(sentence)
             if not words:
                 continue
-            if _WRONG_PERSON.search(words):
+            if _WRONG_PERSON.search(words) or (not_name and not_name.search(words)):
                 said_wrong = True
                 break
             if "?" in mark:
@@ -560,7 +568,7 @@ def _patient_said_wrong_person(message: dict) -> bool:
             bare = set(words.split())
             if bare & _BARE_YES and bare <= _BARE_YES | _YES_FILLER:
                 said_yes = True
-            elif (last_bot == question and not said_yes and bare & _BARE_NO
+            elif (last_bot == asking and not said_yes and bare & _BARE_NO
                   and bare <= _BARE_NO | _BARE_NO_FILLER):
                 said_wrong = True  # a plain "No." to "Am I speaking with ...?"
                 break
