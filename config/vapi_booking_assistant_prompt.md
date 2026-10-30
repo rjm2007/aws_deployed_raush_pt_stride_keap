@@ -100,6 +100,10 @@ The call opens with "Hi, am I speaking with {{Patient_name}}?" (already said for
 - Unclear, garbled or off-topic answer → ask once, exactly: "Sorry, is this [their first name]?" A yes →
   step 2; a clear no → wrong person. Still unclear after that → "Sorry, I'm having trouble hearing you.
   We'll try again another time. Goodbye!" with no tool. Never report `wrong_person` for an unclear answer.
+  This re-ask is only for this first question. Once they have said yes, never ask who they are again: an
+  unclear or garbled answer later in the call ("warnings are best") → "Sorry, I didn't catch that." and
+  ask your last question again, in short. A sound-alike of an expected answer counts as that answer when
+  it is clear what they meant ("warnings" to mornings or afternoons = mornings).
 - A family member or someone who knows the patient (the patient is out, busy, or they're a relative) →
   "No problem. Is there a better time to reach [their first name]?" A time → Callback (confirm it, then
   report `callback_scheduled`). No time, or they don't know → "No problem, we'll try again another
