@@ -11,6 +11,7 @@ from ..config import get_settings
 from ..db import transaction
 from ..observability import WorkflowTrace, trace_id_var
 from ..security import require_twilio_auth
+from ..services import sms_inbound
 from ..services.delivery import apply_twilio_message_status
 from ..services.lead_status import explicit_opt_out
 from ..services.sheet_sync import enqueue_sheet_update
@@ -32,39 +33,60 @@ async def twilio_inbound_sms(request: Request):
     phone = form_data.get("From", "").strip()
     message_text = form_data.get("Body", "").strip()
     sid = form_data.get("MessageSid") or f"missing-{uuid4().hex}"
+    try:
+        num_media = int(form_data.get("NumMedia") or 0)
+    except ValueError:
+        num_media = 0
     if not phone:
         raise HTTPException(status_code=400, detail="missing From")
-    await run_in_threadpool(_handle_inbound_sms, trace, phone, message_text, sid)
+    await run_in_threadpool(_handle_inbound_sms, trace, phone, message_text, sid, num_media)
     trace.complete()
     return JSONResponse({"ok": True})
 
 
-def _handle_inbound_sms(trace: WorkflowTrace, phone: str, message_text: str, sid: str) -> None:
+def _handle_inbound_sms(
+    trace: WorkflowTrace, phone: str, message_text: str, sid: str, num_media: int = 0
+) -> None:
+    settings = get_settings()
+    command = sms_inbound.inbound_command(message_text)
     with transaction() as conn:
-        lead = conn.execute(
-            "select id from leads where phone_e164=%s order by created_at desc limit 1", (phone,)
+        # The phone's active lead (one phone = one active lead), not simply the newest row: a
+        # patient's text belongs to the referral we are working.
+        lead_id = sms_inbound.active_lead_id(conn, phone)
+        stored = conn.execute(
+            "insert into sms_messages(lead_id,direction,body,occurred_at,delivery_status,"
+            "provider_message_id,sender) values(%s,'inbound',%s,now(),'received',%s,'patient') "
+            "on conflict(provider_message_id) do nothing returning id",
+            (lead_id, message_text, sid),
         ).fetchone()
-        conn.execute(
-            "insert into sms_messages(lead_id,direction,body,occurred_at,delivery_status,provider_message_id) "
-            "values(%s,'inbound',%s,now(),'received',%s) on conflict(provider_message_id) do nothing",
-            (lead["id"] if lead else None, message_text, sid),
-        )
-    command = message_text.lower()
-    if command in {"stop", "stopall", "unsubscribe", "cancel", "end", "quit"}:
+        # Only the first delivery of a text queues a reply (Twilio retries a slow webhook). The
+        # agent runs in the sms-agent-worker after a quiet window; nothing slow happens here. Off:
+        # the text is stored and nothing is queued. A keyword is code's, never the AI's.
+        if (
+            stored
+            and command is None
+            and settings.sms_agent_enabled
+            and (message_text or num_media > 0)
+        ):
+            job_id = sms_inbound.queue_reply(conn, phone, lead_id, stored["id"], settings=settings)
+            trace.log("sms_agent_reply_queued", job_id=job_id, has_lead=lead_id is not None)
+        if command == "stop":
+            sms_inbound.stop_number(conn, phone, has_lead=lead_id is not None)
+    if command == "stop":
         explicit_opt_out(trace, phone, "sms", "twilio_inbound")
-    elif command == "call" and lead:
+    elif command == "call" and lead_id:
         with transaction() as conn:
             conn.execute(
                 "update leads set status='callback_scheduled',callback_requested_at=now(),status_changed_at=now() "
-                "where id=%s", (lead["id"],),
+                "where id=%s", (lead_id,),
             )
             enqueue_sheet_update(
                 conn,
-                lead_id=str(lead["id"]),
+                lead_id=str(lead_id),
                 event_type="callback_updated",
                 source_key=f"twilio-inbound:{sid}",
             )
-        trace.log("callback_requested", lead_id=str(lead["id"]))
+        trace.log("callback_requested", lead_id=str(lead_id))
 
 
 @router.post("/message-status", include_in_schema=False)

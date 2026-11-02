@@ -6,6 +6,7 @@ from .health import router as health_router
 from .keap import router as keap_router
 from .leads import router as leads_router
 from .n8n import router as n8n_router
+from .sms_agent_test import router as sms_agent_test_router
 from .twilio import router as twilio_router
 from .vapi import router as vapi_router
 
@@ -18,6 +19,7 @@ __all__ = [
     "keap_router",
     "leads_router",
     "n8n_router",
+    "sms_agent_test_router",
     "twilio_router",
     "vapi_router",
 ]

@@ -1,0 +1,384 @@
+[
+  {
+    "type": "function",
+    "name": "send_intro",
+    "description": "Sends our standard first text (who we are, that you can book right here by text, the booking link and the front desk number). Use it once, for your first text in a conversation, when the patient greets us, asks who this is, replies to one of our clinic texts, or says they want to book without saying when. Do not use it when their first text already says when (a day, a time, 'asap') or asks something specific, for a lead who is already booked or in review, or when Elliot has already texted in this conversation. Reply INTRO_SENT: the text is already on its way, so do not write any of it yourself, and do not ask about days or times (it already does).",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "strict": true
+  },
+  {
+    "type": "function",
+    "name": "find_times",
+    "description": "Finds open times for the patient's Initial Evaluation. Use it as soon as you know roughly when suits them ('any', 'whatever is soonest', or a plain 'yes' or 'sure' after your day question or a therapist list = when=earliest; 'tomorrow' or 'tmrw' = when=tomorrow), and again for every new day, week, month, time of day, therapist or clinic they ask about; a question like 'anything Thursday?' is always a new search. Never run the same search twice in a row. Offer only times from the latest reply. Reply codes: OPENINGS = times to offer. NOTHING_IN_RANGE = nothing for what they asked; say so and offer the nearest times it lists. A today or tomorrow search reply starts by naming the day searched ('Searched tomorrow, Thu Nov 5'): name that day in your text, never 'today' for another day. NO_OPENINGS = nothing open at all; offer the booking link and the front desk phone (no hand_off unless they ask for a person). NO_SUCH_THERAPIST or NO_OPENINGS_FOR_THERAPIST = name the therapists we have and offer to search without one. NEED_LOCATION = ask which of our clinics they prefer, then search again with clinic. UNKNOWN_LOCATION = not one of our clinics; name ours. PAST_DATE = that day or month has passed; say so and ask for another day (or search when=earliest if they said 'asap'). NEED_DATE, NEED_MONTH, BAD_WHEN or BAD_TIME_OF_DAY = fix that argument and call again; say nothing about it. CASE_CHANGE = they asked for another service than their referral: report_outcome case_change, then hand_off different_case; never search for it. UNKNOWN_SERVICE = we can't search for this patient; use hand_off with reason booking_problem. NO_CLINICIANS = no therapist sees this service at that clinic: if the reply lists clinics after 'Offered at', offer those clinics in one short line and search again with the one they pick (no hand_off); with no 'Offered at', use hand_off with reason booking_problem. REVIEW_OPEN = the patient is waiting for staff review; use hand_off with reason booking_problem. Only a reply containing the words 'too far ahead' means the day is too far ahead to book. For 'how far ahead can I book?', answer only from 'Last bookable day' in a reply. Each time in a reply looks like 'Tuesday, November 3 (2026-11-03) at 9:00 AM with Alan Smith': keep the YYYY-MM-DD date, the time and the therapist's full name for confirm_visit.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "when": {
+          "type": "string",
+          "enum": [
+            "earliest",
+            "today",
+            "tomorrow",
+            "this_week",
+            "next_week",
+            "in_two_weeks",
+            "specific_date",
+            "next_month",
+            "specific_month"
+          ],
+          "description": "earliest when they gave no day ('anytime', 'asap', only a time of day). specific_date for one named day or date, specific_month for a named month, next_month for 'next month'."
+        },
+        "specific_date": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Only with when=specific_date: the day they named as YYYY-MM-DD, worked out from Now in Context (a day name means the next one on or after today). Otherwise null.",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "month": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Only with when=specific_month: the month they named as YYYY-MM. Otherwise null.",
+          "pattern": "^\\d{4}-\\d{2}$"
+        },
+        "time_of_day": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "morning",
+            "afternoon",
+            "evening",
+            null
+          ],
+          "description": "Only if they asked for a part of the day ('before work' = morning, 'after 5' = evening). Otherwise null."
+        },
+        "therapist": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Only if they asked for a particular therapist: the name as they wrote it. Otherwise null."
+        },
+        "clinic": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Laguna Niguel",
+            "Dana Point",
+            "Mission Viejo",
+            null
+          ],
+          "description": "Only if they want a different clinic than the one in Context, or for a new person: the clinic they chose. Otherwise null (the clinic in Context)."
+        },
+        "service": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Physical Therapy",
+            "Physical Therapy - Pelvic",
+            null
+          ],
+          "description": "Only for someone new (Person texting: someone new) who chose a service: that service as named in Services we book ('pelvic floor' = Physical Therapy - Pelvic). Always null for a patient with a referral: their Service in Context is used, and a different one is a case change."
+        }
+      },
+      "required": [
+        "when",
+        "specific_date",
+        "month",
+        "time_of_day",
+        "therapist",
+        "clinic",
+        "service"
+      ],
+      "additionalProperties": false
+    },
+    "strict": true
+  },
+  {
+    "type": "function",
+    "name": "list_therapists",
+    "description": "Lists the therapists who see this service at a clinic, with short notes. Use it only when the patient asks who the therapists are or asks about one; if a PROVIDERS reply is already in this conversation, answer from it instead. A request to see one ('can I see Alan?') is a search: find_times with therapist. Reply PROVIDERS = the list; name only therapists from it.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "clinic": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Laguna Niguel",
+            "Dana Point",
+            "Mission Viejo",
+            null
+          ],
+          "description": "Only if it is not the clinic in Context. Otherwise null."
+        }
+      },
+      "required": [
+        "clinic"
+      ],
+      "additionalProperties": false
+    },
+    "strict": true
+  },
+  {
+    "type": "function",
+    "name": "confirm_visit",
+    "description": "Checks that a time the patient picked is still open and sends them the visit card (day, time, therapist, clinic, 'Reply YES and I'll book it'). This tool is the only way a card is sent: never write a card, a read-back of the visit or 'I'm holding' yourself. Call it in the same turn the identity step is done: the patient's yes to the birthday check (or their corrected or given date of birth, with a year) right after they picked a time, or at once on a pick when the identity step is already done in this conversation. Also call it when book_visit replied NOT_CONFIRMED, or again for the same time when they answered the card with only a reaction, 'maybe' or a question. Book only after this card. Reply codes: CARD_SENT = the card goes out after anything you write; your final answer is NO_REPLY or one short line (a date of birth read-back or an answer), never a question and never the card's details; a date of birth read-back is month and day only, never the year. TAKEN or NOT_AVAILABLE = that time is gone; say so and offer the other times listed. ALREADY_BOOKED = they already have a visit; never book again. REVIEW_OPEN = use hand_off with reason booking_problem. WHICH_THERAPIST = ask the patient which of the therapists it names they mean. NO_SUCH_THERAPIST = name the therapists it lists and offer to search without one. CASE_CHANGE = another service than their referral: report_outcome case_change, then hand_off different_case; never book it. BAD_DATE or BAD_TIME = send the date and time exactly as the find_times reply wrote them.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "date": {
+          "type": "string",
+          "description": "The picked day as YYYY-MM-DD, from the parentheses in the find_times reply.",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "time": {
+          "type": "string",
+          "description": "The picked time exactly as the reply wrote it, for example '9:00 AM'.",
+          "pattern": "^\\d{1,2}:\\d{2}( ?[AaPp][Mm])?$"
+        },
+        "therapist": {
+          "type": "string",
+          "description": "The therapist's full name for that time, as the reply wrote it.",
+          "pattern": "^\\S.*$"
+        },
+        "clinic": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Laguna Niguel",
+            "Dana Point",
+            "Mission Viejo",
+            null
+          ],
+          "description": "The clinic the times were searched at, if not the clinic in Context. Otherwise null."
+        },
+        "service": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Physical Therapy",
+            "Physical Therapy - Pelvic",
+            null
+          ],
+          "description": "Only for someone new: the same service you searched with. Always null for a patient with a referral."
+        }
+      },
+      "required": [
+        "date",
+        "time",
+        "therapist",
+        "clinic",
+        "service"
+      ],
+      "additionalProperties": false
+    },
+    "strict": true
+  },
+  {
+    "type": "function",
+    "name": "book_visit",
+    "description": "Books the Initial Evaluation. Use it when the patient's newest text is a clear yes ('yes', 'yep', 'book it', 'sounds good') to the visit card, and the card is your latest text in the conversation (it starts 'Great choice! Here's your visit:' and ends 'Reply YES and I'll book it.'; confirm_visit sent it). Call it in that same turn, with exactly the card's date, time, therapist and clinic. Without this tool nothing is booked: never tell the patient they are booked unless this tool replied BOOKED or ALREADY_BOOKED. Our system refuses any other booking (a yes after any other text from you gets NOT_CONFIRMED). Reply codes: BOOKED = done, and our booked text (details and paperwork) is on its way, so never write it yourself. ALREADY_BOOKED = they already have a visit: say only the day, time and therapist the reply gives (if it gives none, use hand_off with reason booking_problem); never book again. TAKEN or NOT_AVAILABLE = the time went; say so and offer the other times listed, then a new card for their new pick. NOT_CONFIRMED = no matching card answered yet; call confirm_visit for that time. IN_PROGRESS ('wait a moment') = an earlier booking is still finishing; call book_visit once more with the same details, and write nothing about waiting. IN_PROGRESS again, ERROR, or an error after IN_PROGRESS = not booked: use hand_off with reason booking_problem and say our front desk will finish setting up the visit; never say it is booked and never offer times again. PATIENT_EXISTS, UNCONFIRMED or FOLLOW_UP = not booked, and our front desk text was already sent; say only that our front desk will finish setting up the visit. REVIEW_OPEN = use hand_off with reason booking_problem. CASE_CHANGE = another service than their referral: report_outcome case_change, then hand_off different_case; never book it. MISSING_NAME = we have no first name: ask once for their first name (never the last name); with their answer call confirm_visit for the same time, then book_visit after their yes with that first_name. BAD_DATE_OF_BIRTH or BAD_NAME = ask for or confirm that detail, then try again.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "date": {
+          "type": "string",
+          "description": "YYYY-MM-DD, as on the card.",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "time": {
+          "type": "string",
+          "description": "As on the card, for example '9:00 AM'.",
+          "pattern": "^\\d{1,2}:\\d{2}( ?[AaPp][Mm])?$"
+        },
+        "therapist": {
+          "type": "string",
+          "description": "The therapist's full name, as on the card.",
+          "pattern": "^\\S.*$"
+        },
+        "first_name": {
+          "type": "string",
+          "description": "First name: from Name on file, or as the patient gave it. Never empty.",
+          "pattern": "^\\S.*$"
+        },
+        "last_name": {
+          "type": "string",
+          "description": "Last name with a capital first letter: from Name on file, or as the patient gave it. Never empty.",
+          "pattern": "^\\S.*$"
+        },
+        "date_of_birth": {
+          "type": "string",
+          "description": "YYYY-MM-DD: the Birthday on file once the patient confirmed it, or the full date the patient gave you (never guess a year).",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "clinic": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Laguna Niguel",
+            "Dana Point",
+            "Mission Viejo",
+            null
+          ],
+          "description": "As on the card, if not the clinic in Context. Otherwise null."
+        },
+        "service": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "Physical Therapy",
+            "Physical Therapy - Pelvic",
+            null
+          ],
+          "description": "Only for someone new: the same service as on the card. Always null for a patient with a referral."
+        }
+      },
+      "required": [
+        "date",
+        "time",
+        "therapist",
+        "first_name",
+        "last_name",
+        "date_of_birth",
+        "clinic",
+        "service"
+      ],
+      "additionalProperties": false
+    },
+    "strict": true
+  },
+  {
+    "type": "function",
+    "name": "report_outcome",
+    "description": "Records an outcome on the lead so the clinic's lists and calls react. Use it once per outcome, in the same turn as your text about it: callback_scheduled only after the patient said yes to the exact time you confirmed; booking_link when they want to book themselves (the reply gives the link to put in your own text; never use it when Booking link in Context is 'not set'); declined for a plain 'not interested'; do_not_contact when they ask us to stop texting or stop all contact (not for 'stop calling, texting is fine': that is hand_off other); the reply says what was stopped, and your text says only that; wrong_person when they say this is not their number or they don't know the patient; case_change when they want a different service, body part or problem than the referral (call it before hand_off with reason different_case; once per conversation, not again when they ask again). Never use it for a booking (book_visit records that). Reply REPORTED = saved. ALREADY_BOOKED = the patient is booked and nothing changed; answer about their visit. ALREADY_REPORTED = the front desk already has this case change and nothing was sent; say nothing more about it (answer anything else, else NO_REPLY). Any other reply: write your text as planned; our team sees the failure.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "callback_scheduled",
+            "booking_link",
+            "declined",
+            "do_not_contact",
+            "wrong_person",
+            "case_change"
+          ],
+          "description": "The outcome to record; see the tool description for when each one applies."
+        },
+        "notes": {
+          "type": "string",
+          "description": "One short sentence for staff, with no medical details. For case_change only what they asked for, in a word or two, e.g. 'spine', 'pelvic'. For do_not_contact 'stop texts only' or 'asked for no contact at all'."
+        },
+        "callback_type": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "relative",
+            "absolute",
+            null
+          ],
+          "description": "Only for callback_scheduled: relative for 'in N minutes or hours' up to 4 hours, absolute for a day, a clock time or anything later. Otherwise null."
+        },
+        "delay_minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Only with callback_type relative: minutes from now, 5 to 240. Otherwise null.",
+          "minimum": 5,
+          "maximum": 240
+        },
+        "callback_datetime_iso": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Only with callback_type absolute: the agreed time in clinic time with its offset (-08:00 up to Mar 13 2027, -07:00 from Mar 14 2027 to Nov 6 2027), e.g. '2026-11-03T10:00:00-08:00'. Otherwise null.",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(:\\d{2})?[+-]\\d{2}:\\d{2}$"
+        }
+      },
+      "required": [
+        "status",
+        "notes",
+        "callback_type",
+        "delay_minutes",
+        "callback_datetime_iso"
+      ],
+      "additionalProperties": false
+    },
+    "strict": true
+  },
+  {
+    "type": "function",
+    "name": "hand_off",
+    "description": "Passes the patient to our front desk: sends our front desk text (their phone number, and that they will reach out) and asks the front desk to contact the patient. Use it for anything you do not handle: insurance, cost, billing or coverage (insurance); a different service, body part or problem than the referral, together with report_outcome case_change (different_case); asking for a person or a call from the office (wants_person); writing in another language (other_language, which sends our English-only text instead); a question whose answer is not in your clinic facts, such as parking, directions or which office is closest (unknown_question); a booking that did not go through, or a booking matter while the lead is in review (booking_problem); rescheduling or cancelling a visit, asking us to stop calling while texting is fine, or anything else (other). For insurance, wants_person, other_language, unknown_question and other, booking by text goes on (the front desk still reaches out). For different_case and booking_problem it puts the lead in review, which pauses booking by text from the next text on, so never offer times after those. If the same text is a clear yes to the card, call book_visit first. Use it once per topic in a conversation: if our front desk text already followed the patient's question on this topic, do not call it again (answer anything else, or NO_REPLY to 'thanks, I'll wait'). For a case change call report_outcome case_change first. Reply HANDED_OFF or HANDED_OFF_PAUSED = the text is on its way, sent before anything you write, so never repeat the phone number or 'they'll reach out'. ALREADY_HANDED_OFF = the front desk already has this and nothing was sent; say nothing more about it (answer anything else they asked, else NO_REPLY).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "enum": [
+            "insurance",
+            "different_case",
+            "wants_person",
+            "other_language",
+            "unknown_question",
+            "booking_problem",
+            "other"
+          ],
+          "description": "Why the front desk is needed; see the tool description for which reason fits."
+        },
+        "notes": {
+          "type": "string",
+          "description": "One short sentence for the front desk on what the patient needs, with no medical details, e.g. 'Asked if Blue Shield is accepted.'"
+        }
+      },
+      "required": [
+        "reason",
+        "notes"
+      ],
+      "additionalProperties": false
+    },
+    "strict": true
+  },
+  {
+    "type": "function",
+    "name": "flag_emergency",
+    "description": "Sends our fixed 'please call 911' text (it also gives 988, the Suicide and Crisis Lifeline) and alerts our staff. Use it at once when a text suggests a medical emergency or danger right now (chest pain, can't breathe, fainted, fell and can't get up, severe bleeding, thoughts of suicide or self-harm). Not for an injury in the past, like the one that led to the referral. Once per conversation: if the emergency text is already in the conversation, do not call it again; write one short caring line instead (our team will reach out; 911, or call or text 988). Reply EMERGENCY_SENT = sent; your final answer in that turn is NO_REPLY. ALREADY_SENT = it was already sent within the hour (nothing sent again); write that one short line.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "strict": true
+  }
+]

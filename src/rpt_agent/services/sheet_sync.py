@@ -92,11 +92,16 @@ def _action_label(lead: dict[str, Any]) -> str | None:
     from .lead_review import (  # lead_review imports this module
         BOOKED_BY_FRONT_DESK_REASON,
         SHEET_BOOKED_CASE_CHANGE,
+        SHEET_BOOKED_FRONT_DESK,
+        SMS_FRONT_DESK_CODE,
     )
     from .review import REPLACED_REASON, RESTARTED_REASON  # review imports this module
 
     if lead["status"] == "booked" and lead.get("needs_review"):
-        # Only a case change card opens on a booked lead (owner, 2026-10-29): it stays Booked.
+        # Only a case change card (owner, 2026-10-29) or Elliot's front-desk card by text
+        # (2026-11-02) stays open on a booked lead: it stays Booked. The case change comes first.
+        if lead.get("open_review_code") == SMS_FRONT_DESK_CODE:
+            return SHEET_BOOKED_FRONT_DESK
         return SHEET_BOOKED_CASE_CHANGE
     if lead["status"] == "booked" and lead.get("status_reason") == BOOKED_BY_FRONT_DESK_REASON:
         return BOOKED_BY_FRONT_DESK_REASON
@@ -340,6 +345,9 @@ def build_sheet_snapshot(
     lead = conn.execute(
         "select l.id,l.status,l.cadence_state,l.needs_review,l.review_reason,l.callback_requested_at,"
         "l.sms_disabled,l.status_reason,l.last_call_outcome,"
+        # Which card a booked lead still has open (Outcome Status words); a case change first.
+        "(select r.code from lead_reviews r where r.lead_id=l.id and r.resolved_at is null "
+        "order by r.code='case_change_asked' desc,r.flagged_at,r.id limit 1) as open_review_code,"
         "coalesce(l.timezone,p.timezone,'America/Los_Angeles') as timezone,"
         # For the board column (Lead Status): is the cadence spent?
         "(select count(*) from outreach_events t where t.lead_id=l.id) as cadence_total,"

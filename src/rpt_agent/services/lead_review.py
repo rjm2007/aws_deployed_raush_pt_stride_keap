@@ -35,12 +35,37 @@ from .review import (
     PAUSE_SKIP_REASON,
     REPLACED_REASON,
     RESTARTED_REASON,
+    SMS_FRONT_DESK_CODE,
     restore_pause_skipped,
     skip_remaining_planned,
 )
 from .sheet_sync import enqueue_sheet_update
 
 # --- codes, groups, choices -----------------------------------------------------------------
+
+# SMS agent ("Elliot by text", demo, 2026-11-02). Elliot never handles insurance, another case, a
+# request for a person, another language or a question he has no fact for: he texts the front desk
+# line and opens this card (group call: it comes from what the patient said). Choices: Front desk
+# will handle / Continue cadence. A lead whose outcome is already final (booked, declined, closed:
+# the owner lets those leads text Elliot too) gets the card with Front desk only, and that choice
+# only closes the card (`details.finished`), never the lead's status. The code lives in review.py:
+# insurance, a person, another language, an unknown question or "other" do not stop booking by text
+# (owner, 2026-11-02, `review_allows_booking`), and a booking keeps the card open
+# (lead_status.mark_booked) so the front desk still calls about the question.
+SMS_FRONT_DESK_REASONS = {
+    "insurance": "insurance or costs",
+    "different_case": "a different case or service",
+    "wants_person": "asked to talk to a person",
+    "other_language": "wrote in another language",
+    "unknown_question": "a question Elliot has no answer for",
+    "booking_problem": "a booking problem",
+    "emergency": "possible emergency (Elliot texted the 911 line)",
+    "other": "something Elliot does not handle",
+}
+# Written by services/sms_inbound.py: the daily AI reply cap was reached, or the agent failed
+# (model timeout, ...) and nothing was sent.
+SMS_REPLY_CAP_CODE = "sms_agent_reply_cap"
+SMS_AGENT_FAILED_CODE = "sms_agent_failed"
 
 GROUP_OF = {
     "name_changed": "name",
@@ -64,6 +89,9 @@ GROUP_OF = {
     # links the transcript (call group only), and its choices come from CODE_CHOICES. Not
     # "booking": that group's words and Stride auto-close are about a booking the agent tried.
     CASE_CHANGE_CODE: "call",
+    SMS_FRONT_DESK_CODE: "call",
+    SMS_REPLY_CAP_CODE: "other",
+    SMS_AGENT_FAILED_CODE: "other",
     "unrecognized_status": "call",
     "call_failed": "technical",
     "dispatch_failed": "technical",
@@ -119,6 +147,9 @@ TITLES = {
     "booking_hung_up": "Patient asked to book, then hung up",
     "callback_no_time": "Asked to be called later, no time given",
     CASE_CHANGE_CODE: "Patient wants a different case",
+    SMS_FRONT_DESK_CODE: "Patient needs the front desk (by text)",
+    SMS_REPLY_CAP_CODE: "Too many AI texts today",
+    SMS_AGENT_FAILED_CODE: "Elliot could not answer a text",
     "unrecognized_status": "Unknown call result",
     "call_failed": "Call could not be placed",
     "dispatch_failed": "Call or text could not be sent",
@@ -200,11 +231,36 @@ CODE_CHOICES = {
     # Owner, 2026-10-29. On a booked lead only "Front desk will handle" (CASE_CHANGE_BOOKED_CHOICES):
     # nothing on that card may un-book the lead or start calls again.
     CASE_CHANGE_CODE: ["front_desk", "booked_by_front_desk", "continue"],
+    SMS_FRONT_DESK_CODE: ["front_desk", "continue"],
 }
 CASE_CHANGE_BOOKED_CHOICES = ["front_desk"]
 CODE_CHOICE_LABELS = {("booking_hung_up", "continue"): "Continue cadence",
                       ("callback_no_time", "continue"): "Continue cadence",
-                      (CASE_CHANGE_CODE, "continue"): "Continue cadence"}
+                      (CASE_CHANGE_CODE, "continue"): "Continue cadence",
+                      (SMS_FRONT_DESK_CODE, "continue"): "Continue cadence"}
+
+
+# Cards the SMS agent opens on a finished lead without pausing it (`details.finished`): Elliot's
+# front-desk card (sms_agent_tools) and the worker's failure cards (sms_agent_worker._flag).
+_SMS_FINISHED_CODES = {SMS_FRONT_DESK_CODE, SMS_REPLY_CAP_CODE, SMS_AGENT_FAILED_CODE}
+
+
+def _finished_card(code: str | None, details: dict | None) -> bool:
+    """An SMS card opened on a lead whose outcome was already final (see above).
+
+    Only "Front desk will handle" is offered, and it only closes the card. A failure card's group
+    choices ("Continue cadence", restart) would otherwise set a booked or closed lead back to In
+    cadence and start calls again (2026-11-02: an unsent booked text, then Continue, un-booked it).
+    """
+    return code in _SMS_FINISHED_CODES and bool((details or {}).get("finished"))
+
+
+# A lead the patient declined (by text or on a call) while a review was open keeps the card (the
+# decline is recorded, like voice: status declined, cadence terminated), but nothing on it may put
+# the patient back into outreach (2026-11-02: "Continue cadence" on such a card restarted calls to
+# someone who had said no). Front desk will handle closes the card and keeps the status.
+DECIDED_STATUSES = {"declined", "do_not_contact"}
+_OUTREACH_CHOICES = {"send_booking_link"}  # with RESUME_CHOICES and RESTART_CHOICES (below)
 
 RESUME_CHOICES = {"use_new_name", "keep_old_name", "use_new_value", "keep_old_value", "calls_only",
                   "retry_texts", "number_ok", "continue"}
@@ -299,6 +355,8 @@ def sheet_open_status(code: str | None, details: dict | None) -> str:
         return "Needs review: asked to be called later, no time given"
     if code == CASE_CHANGE_CODE:
         return SHEET_CASE_CHANGE
+    if code == SMS_FRONT_DESK_CODE:
+        return "Needs review: patient needs the front desk (by text)"
     if group == "call":
         return "Needs review: call result unclear"
     if group == "technical":
@@ -319,6 +377,8 @@ def sheet_open_status(code: str | None, details: dict | None) -> str:
 SHEET_CASE_CHANGE = "Needs review: patient wants a different case"
 # A booked lead keeps Lead Status Booked; its Outcome Status says the card is open (sheet_sync).
 SHEET_BOOKED_CASE_CHANGE = "Booked; needs review: patient wants a different case"
+# Booked by text while Elliot's front-desk card was open (owner, 2026-11-02): the card stays open.
+SHEET_BOOKED_FRONT_DESK = "Booked; needs review: patient needs the front desk (by text)"
 
 SOURCE_LABELS = {
     "sheet": "Google Sheet",
@@ -528,6 +588,26 @@ def _plain_reason(row: dict, lead: dict) -> str:
                 f"{f' (the referral is for {referral})' if referral else ''}. Elliot does not book "
                 "another case: he offered to connect them to the front desk, or said the front desk "
                 "will call. Calls and texts are paused until staff choose.")
+    if code == SMS_FRONT_DESK_CODE:
+        reason = SMS_FRONT_DESK_REASONS.get(str(details.get("reason") or ""), "something Elliot "
+                                            "does not handle")
+        note = str(details.get("notes") or "").strip()
+        text = (f"The patient texted about {reason}. Elliot texted them our front desk number and "
+                "said the front desk will reach out. Read the texts on the lead's page.")
+        if note:
+            text += f" Elliot's note: {note}"
+        if details.get("finished"):
+            return text + " The lead's status stays as it is; this card only asks the front desk to call."
+        return text + " Calls and texts are paused until staff choose."
+    if code == SMS_REPLY_CAP_CODE:
+        return ("Elliot reached today's limit of AI texts for this lead (a long chat, or an "
+                "automatic reply loop). He stops answering until tomorrow. Read the texts.")
+    if code == SMS_AGENT_FAILED_CODE and details.get("booked_text_unsent"):
+        return ("Elliot booked a visit by text, but the confirmation text was not sent. Call the "
+                "patient and confirm the day and time. The lead's status stays as it is.")
+    if code == SMS_AGENT_FAILED_CODE:
+        return ("A patient's text got no answer: Elliot could not reply (for example the AI did not "
+                "answer in time). Read the texts and reply to the patient.")
     if code == "unrecognized_status":
         return "The agent reported a call result the system does not know. Read the transcript."
     if code == "call_failed":
@@ -573,7 +653,8 @@ def _plain_reason(row: dict, lead: dict) -> str:
     if code == "booking_failed" and details.get("on_call"):
         # Owner, 2026-10-26: every booking that fails on the call comes here, never "we'll text you".
         why = f" ({details['why']})" if details.get("why") else ""
-        return (f"The booking agent could not book a visit on the call{why}. The patient was told our "
+        where = "by text" if details.get("by_text") else "on the call"
+        return (f"The booking agent could not book a visit {where}{why}. The patient was told our "
                 "front desk team will take care of the appointment and reach out shortly: call the "
                 "patient and book by hand. Calls and texts stay stopped. If Stride's next file shows "
                 "an appointment, the lead is marked Booked and this review closes by itself.")
@@ -654,6 +735,13 @@ def describe(row: dict, lead: dict, *, has_calls: bool = False, more: bool = Fal
     offered = CODE_CHOICES.get(code, GROUP_CHOICES[group])
     if code == CASE_CHANGE_CODE and lead.get("status") == "booked":
         offered = CASE_CHANGE_BOOKED_CHOICES
+    if _finished_card(code, details) or (code == SMS_FRONT_DESK_CODE
+                                         and lead.get("status") == "booked"):
+        offered = ["front_desk"]
+    if lead.get("status") in DECIDED_STATUSES:
+        offered = [choice for choice in offered
+                   if choice not in RESUME_CHOICES | RESTART_CHOICES | _OUTREACH_CHOICES]
+        offered = offered or ["front_desk"]
     choices = [
         choice for choice in offered
         if not (choice == "retry_texts" and failure and failure["permanent"])
@@ -806,6 +894,9 @@ def _effect(choice: str, details: dict, lead: dict, group: str = "other", code: 
                 "and time come in with Stride's next file")
     if choice == "front_desk" and lead.get("status") == "booked":
         return "The review closes and the lead stays Booked"
+    if choice == "front_desk" and (_finished_card(code, details)
+                                   or lead.get("status") in DECIDED_STATUSES):
+        return "The review closes; the lead's status stays as it is"
     if choice == "front_desk":
         if group == "booking":
             return ("The lead moves to Closed (Handled by front desk); it still becomes Booked if "
@@ -1300,8 +1391,11 @@ def resolve_review(
     elif choice == "booked_by_front_desk":
         close_open_reviews(conn, lead_id, choice, by=actor_id, by_name=actor_name, note=note)
         _book_by_front_desk(conn, lead)
-    elif lead["status"] == "booked":
-        # Only "Front desk will handle" is offered on a booked lead (describe).
+    elif (lead["status"] == "booked" or _finished_card(code, details)
+          or (choice == "front_desk" and lead["status"] in DECIDED_STATUSES)):
+        # Only "Front desk will handle" is offered on a booked lead (describe), and on an SMS front
+        # desk card opened on a finished lead: the card closes, the lead's outcome stays. The same
+        # on a lead that declined while the card was open (DECIDED_STATUSES).
         close_open_reviews(conn, lead_id, choice, by=actor_id, by_name=actor_name, note=note)
         _close_on_booked(conn, lead)
     else:

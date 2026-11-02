@@ -141,6 +141,21 @@ services:
     volumes:
       - ./logs:/app/logs
 
+  # SMS agent (docs/SMS_AGENT.md): answers patients' texts. Separate so a 10-30 s model call
+  # never delays calls/SMS; exactly one instance (advisory lock). Idles while SMS_AGENT_ENABLED is off.
+  sms-agent-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    depends_on: *needs-db
+    container_name: stride-sms-agent-worker
+    restart: unless-stopped
+    mem_limit: 256m
+    env_file: .env
+    command: rpt-sms-agent-worker
+    volumes:
+      - ./logs:/app/logs
+
   # The host cron deletes archive/error files after 30 days.
   stride-worker:
     build:

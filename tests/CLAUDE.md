@@ -40,6 +40,10 @@ Optional suites, skipped by default:
 | `test_api_contract.py`, `test_vapi_contract.py`, `test_vapi_tool_config.py` | HTTP and Vapi tool contracts |
 | `test_availability_offers.py`, `test_providers.py`, `test_mock_server.py` | Booking slots, provider clients, mocks |
 | `test_agent.py` | Staff assistant |
+| `test_sms_agent.py`, `test_sms_agent_tools.py`, `test_sms_agent_texts.py` | SMS agent (2026-11-02) with a fake OpenAI client: loop, fixed-text order (card last), NO_REPLY and copied "(empty answer)" / time stamps never sent, round cap / timeout = nothing sent, booking guard (card resent after a reaction), sandbox pretend outcomes, do_not_contact texts-only vs everything, one card per case change, Studio texts equal migration 054 |
+| `test_sms_agent_integration.py` | SMS agent tools on a real schema (`TEST_DATABASE_URL`, fake Stride): find / card / book with source sms and no second confirmation text, refusals, failed booking by text, every report, opt-outs, hand-off cards, 911, reply_live (reads no patient text after its job's `last_inbound_id`), sandbox writes nothing; Elliot's front-desk card does not stop booking and stays open once booked, other reviews still do (2026-11-02) |
+| `test_sms_inbound.py`, `test_sms_inbound_integration.py` | Inbound texts and the sms-agent-worker: keywords, one job per phone, should_reply order, re-check before sending (Elliot's own opt-out reply still sent), unknown number once a day, cap card, Twilio retry |
+| `test_sms_agent_test_route.py` | Test chat route: off = 404, validation, rate limit, read-only options, agent errors = 502 |
 | `test_stride_import.py`, `test_stride_import_integration.py` | Stride CSV parsing; import edge cases and lead booking/cancel on a real schema (`TEST_DATABASE_URL`) |
 | others | parsing, retry, observability, usage report, fixtures, test-lead reset |
 

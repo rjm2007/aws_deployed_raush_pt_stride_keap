@@ -29,6 +29,27 @@ def restore_pause_skipped(conn, lead_id: str) -> int:
     return len(rows)
 
 
+# Elliot's own front-desk card by text (services/lead_review.py; services/sms_agent_tools.py opens
+# it). Owner, 2026-11-02: a card for something Elliot does not handle (insurance, parking, "call
+# me", another language, anything else) does not stop booking by text: an insurance question must
+# not block the most common next step. The card stays open, so the front desk still calls. A
+# different case, a booking problem and an emergency still stop booking until staff look at it.
+SMS_FRONT_DESK_CODE = "sms_front_desk"
+FRONT_DESK_BOOKABLE_REASONS = ("insurance", "wants_person", "other_language", "unknown_question",
+                               "other")
+# SQL on an open lead_reviews row `r`: it does not stop booking by text.
+BOOKABLE_REVIEW_SQL = (
+    f"(r.code='{SMS_FRONT_DESK_CODE}' and coalesce(r.details->>'reason','') in "
+    f"({','.join(repr(reason) for reason in FRONT_DESK_BOOKABLE_REASONS)}))"
+)
+
+
+def review_allows_booking(code: str | None, details: dict | None) -> bool:
+    """An open review that does not stop booking by text (BOOKABLE_REVIEW_SQL in Python)."""
+    return (code == SMS_FRONT_DESK_CODE
+            and str((details or {}).get("reason") or "") in FRONT_DESK_BOOKABLE_REASONS)
+
+
 # A lead whose outcome is final is never pulled back into review. A terminated or completed
 # cadence (replaced by a newer referral, closed after a review) has nothing left to resume either.
 _FINAL_STATUSES = "('booked','declined','do_not_contact','closed_no_response')"

@@ -14,6 +14,7 @@ from .routes import (
     keap_router,
     leads_router,
     n8n_router,
+    sms_agent_test_router,
     twilio_router,
     vapi_router,
 )
@@ -67,6 +68,8 @@ app.include_router(booking_tools_router)
 app.include_router(dashboard_router)
 app.include_router(dashboard_calendar_router)
 app.include_router(agent_router)
+# SMS agent test chat (sandbox; off unless SMS_AGENT_TEST_ENABLED).
+app.include_router(sms_agent_test_router)
 app.include_router(appointments_router)
 app.include_router(leads_router)
 app.include_router(keap_router)

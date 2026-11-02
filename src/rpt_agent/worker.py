@@ -719,8 +719,8 @@ def run_tick() -> dict[str, int]:
                 )
                 conn.execute(
                     "insert into sms_messages(lead_id,outreach_event_id,direction,body,occurred_at,delivery_status,"
-                    "provider_message_id,delivered_at) values(%s,%s,'outbound',%s,now(),%s,%s,"
-                    "case when %s then now() else null end) "
+                    "provider_message_id,delivered_at,sender) values(%s,%s,'outbound',%s,now(),%s,%s,"
+                    "case when %s then now() else null end,'cadence') "
                     "on conflict(provider_message_id) do nothing",
                     (
                         job.lead_id,

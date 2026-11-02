@@ -494,6 +494,13 @@ def test_sheet_action_status_only_for_system_outcomes():
         "Cadence completed"
     )
     assert _action_label({"status": "booked", "cadence_state": "completed"}) == "Booked"
+    # A card a booking keeps open (2026-10-29 case change, 2026-11-02 Elliot's front-desk card).
+    assert _action_label({"status": "booked", "cadence_state": "completed", "needs_review": True,
+                          "open_review_code": "case_change_asked"}) == (
+        "Booked; needs review: patient wants a different case")
+    assert _action_label({"status": "booked", "cadence_state": "completed", "needs_review": True,
+                          "open_review_code": "sms_front_desk"}) == (
+        "Booked; needs review: patient needs the front desk (by text)")
     assert _action_label({"status": "declined", "cadence_state": "terminated",
                           "last_call_outcome": "not_interested"}) == "Declined on the call"
     # Board close sets 'declined' too, but writes its own text once (board_closed).

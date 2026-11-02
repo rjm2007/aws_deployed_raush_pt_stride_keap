@@ -63,6 +63,14 @@ TIME_OF_DAY = {
 OFFER_COUNT = 3
 # A booking may use any slot this call was offered within this window.
 OFFER_MEMORY = timedelta(minutes=60)
+# A text conversation is slow: the patient may answer the offered times hours later (SMS agent plan
+# 1d, owner 2026-11-02), so offers made by text are kept for a day. Conversation keys "sms:<lead_id>".
+SMS_CONVERSATION_PREFIX = "sms:"
+SMS_OFFER_MEMORY = timedelta(hours=24)
+
+
+def offer_memory(call_key: str) -> timedelta:
+    return SMS_OFFER_MEMORY if call_key.startswith(SMS_CONVERSATION_PREFIX) else OFFER_MEMORY
 NAME_PREFIXES = {"dr", "doctor", "mr", "mrs", "ms", "miss"}
 
 
@@ -150,6 +158,18 @@ from lead
 """
 
 
+# The SMS agent's test chat (sandbox) talks to a made-up lead that is not in the database: the same
+# context query with the lead's fields given instead of read, so clinic, case type, clinicians and the
+# holiday rules are exactly the booking engine's (SMS agent plan section 12).
+SANDBOX_CONTEXT_SQL = """
+with lead as (
+  select null::uuid as id,%(practice_id)s::bigint as practice_id,null::text as status,
+         %(lead_location)s::text as location,%(lead_type)s::text as lead_type,null::text as email,
+         null::text as phone_e164,null::bigint as stride_patient_id,null::bigint as stride_case_id,
+         true as is_test
+""" + CONTEXT_SQL[CONTEXT_SQL.index("), loc as"):]
+
+
 def load_context(
     conn, lead_id: str, *, location_name: str | None = None, case_type_name: str | None = None,
     settings: Settings | None = None,
@@ -162,6 +182,36 @@ def load_context(
     ).fetchone()
     if not row:
         raise BookingToolError("I could not find this patient's record.")
+    return _context_from_row(row, location_name, wanted_case, settings)
+
+
+def sandbox_context(
+    conn, *, practice_id: int, location_name: str | None, case_type_name: str | None,
+    referral_word: str | None = None, settings: Settings | None = None,
+    now_local: datetime | None = None,
+) -> BookingContext:
+    """BookingContext for a made-up lead (SMS agent test chat). Reads only; `now_local` is the test
+    chat's clock (None = the booking calendar's now)."""
+    settings = settings or get_settings()
+    wanted_case = (case_type_name or "").strip()
+    row = conn.execute(
+        SANDBOX_CONTEXT_SQL,
+        {"practice_id": practice_id, "lead_location": (location_name or "").strip(),
+         "lead_type": wanted_case or (referral_word or "").strip(),
+         "location": (location_name or "").strip(), "case_type": wanted_case},
+    ).fetchone()
+    if not row:
+        raise BookingToolError("No practice is set up for the test chat.")
+    context = _context_from_row(row, location_name, wanted_case, settings)
+    if now_local is not None:
+        tz = ZoneInfo(context.timezone)
+        context.now_local = (now_local.replace(tzinfo=tz) if now_local.tzinfo is None
+                             else now_local.astimezone(tz))
+    return context
+
+
+def _context_from_row(row, location_name: str | None, wanted_case: str,
+                      settings: Settings) -> BookingContext:
     lead, names = row["lead"], row["location_names"] or ""
     wanted = (location_name or lead["location"] or "").strip()
     if not wanted:
@@ -528,6 +578,61 @@ def find_slots(
     if time_of_day and time_of_day not in TIME_OF_DAY:
         raise ValueError("BAD_TIME_OF_DAY: time_of_day must be morning, afternoon or evening.")
     call_key = call_id or f"direct:{lead_id}"
+    # Normal case (fresh cache): load, search and remember offers in one transaction.
+    with transaction() as conn:
+        context = load_context(conn, lead_id, location_name=location_name,
+                               case_type_name=case_type_name, settings=settings)
+        search = _search(context, settings, when=when, specific_date=specific_date, month=month,
+                         clinician_name=clinician_name)
+        if isinstance(search, str):
+            return search
+        # A default search reads only the first chunk, as before; a later date or month also
+        # reads the chunk(s) it falls in (its fallbacks use whatever else is cached).
+        needed = sorted({0, *chunks_for(context, search.start,
+                                        min(search.end, _search_limit(context, search.end)))})
+        stale = stale_chunks(context, needed)
+        if not stale:
+            return _offer(trace, conn, context, call_key, search, time_of_day, clinician_name, when)
+    refresh_cache(trace, context, providers, stale)
+    with transaction() as conn:
+        return _offer(trace, conn, context, call_key, search, time_of_day, clinician_name, when)
+
+
+def find_slots_readonly(
+    trace: WorkflowTrace,
+    conn,
+    context: BookingContext,
+    *,
+    when: str,
+    specific_date: date | None = None,
+    time_of_day: str | None = None,
+    clinician_name: str | None = None,
+    month: date | None = None,
+) -> str:
+    """find_slots for the SMS agent's test chat: the same search and reply on the cached openings,
+    but nothing is remembered and Stride is never called (the sandbox writes nothing)."""
+    if time_of_day and time_of_day not in TIME_OF_DAY:
+        raise ValueError("BAD_TIME_OF_DAY: time_of_day must be morning, afternoon or evening.")
+    search = _search(context, context.settings, when=when, specific_date=specific_date,
+                     month=month, clinician_name=clinician_name)
+    if isinstance(search, str):
+        return search
+    return _offer(trace, conn, context, None, search, time_of_day, clinician_name, when)
+
+
+@dataclass
+class _Search:
+    start: date
+    end: date
+    pool: list[dict[str, Any]]
+    asked: str | None
+    moved: str
+
+
+def _search(context: BookingContext, settings: Settings, *, when: str,
+            specific_date: date | None, month: date | None,
+            clinician_name: str | None) -> _Search | str:
+    """The days and clinicians a search looks at, or the NO_SUCH_THERAPIST reply."""
     if when == "specific_month" and month is None and specific_date is not None:
         month = specific_date.replace(day=1)  # the model sent a day of the month instead
     if when != "specific_date":
@@ -537,44 +642,30 @@ def find_slots(
     asked = (_spoken_date(specific_date) if specific_date
              else _spoken_month(month) if month else None)
     asked_date, asked_month = specific_date, month
-    # Normal case (fresh cache): load, search and remember offers in one transaction.
-    with transaction() as conn:
-        context = load_context(conn, lead_id, location_name=location_name,
-                               case_type_name=case_type_name, settings=settings)
-        specific_date = pinned_calendar_date(specific_date, context.now_local,
-                                             settings.booking_today_override,
-                                             settings.booking_cache_days)
-        month = pinned_calendar_month(month, context.now_local, settings.booking_today_override,
-                                      settings.booking_cache_days)
-        # The demo pin moved the asked day or month: the reply says it is the answer to it.
-        moved = (f" for the day asked (on the booking calendar: {_spoken_date(specific_date)})"
-                 if specific_date and specific_date != asked_date
-                 else f" for the month asked (on the booking calendar: {_spoken_month(month)})"
-                 if month and month != asked_month else "")
-        start, end = date_window(when, context.now_local, settings.booking_horizon_days,
-                                 specific_date, month)
-        pool = context.clinicians
-        if clinician_name:
-            pool = match_clinicians(context.clinicians, clinician_name)
-            if not pool:
-                names = ", ".join(c["display_name"] for c in context.clinicians)
-                return (
-                    f"NO_SUCH_THERAPIST: no therapist named {clinician_name} sees "
-                    f"{context.case_type['name']} patients at {context.location['name']}. "
-                    f"Therapists there: {names}. Ask if one of them is fine, or offer the earliest "
-                    "time with any therapist."
-                )
-        # A default search reads only the first chunk, as before; a later date or month also
-        # reads the chunk(s) it falls in (its fallbacks use whatever else is cached).
-        needed = sorted({0, *chunks_for(context, start, min(end, _search_limit(context, end)))})
-        stale = stale_chunks(context, needed)
-        if not stale:
-            return _offer(trace, conn, context, call_key, start, end, pool, time_of_day,
-                          clinician_name, when, asked=asked, moved=moved)
-    refresh_cache(trace, context, providers, stale)
-    with transaction() as conn:
-        return _offer(trace, conn, context, call_key, start, end, pool, time_of_day,
-                      clinician_name, when, asked=asked, moved=moved)
+    specific_date = pinned_calendar_date(specific_date, context.now_local,
+                                         settings.booking_today_override,
+                                         settings.booking_cache_days)
+    month = pinned_calendar_month(month, context.now_local, settings.booking_today_override,
+                                  settings.booking_cache_days)
+    # The demo pin moved the asked day or month: the reply says it is the answer to it.
+    moved = (f" for the day asked (on the booking calendar: {_spoken_date(specific_date)})"
+             if specific_date and specific_date != asked_date
+             else f" for the month asked (on the booking calendar: {_spoken_month(month)})"
+             if month and month != asked_month else "")
+    start, end = date_window(when, context.now_local, settings.booking_horizon_days,
+                             specific_date, month)
+    pool = context.clinicians
+    if clinician_name:
+        pool = match_clinicians(context.clinicians, clinician_name)
+        if not pool:
+            names = ", ".join(c["display_name"] for c in context.clinicians)
+            return (
+                f"NO_SUCH_THERAPIST: no therapist named {clinician_name} sees "
+                f"{context.case_type['name']} patients at {context.location['name']}. "
+                f"Therapists there: {names}. Ask if one of them is fine, or offer the earliest "
+                "time with any therapist."
+            )
+    return _Search(start, end, pool, asked, moved)
 
 
 def _horizon_end(context: BookingContext) -> date:
@@ -601,10 +692,12 @@ def _too_far_note(asked: str, booking_end: date) -> str:
 
 
 def _offer(
-    trace: WorkflowTrace, conn, context: BookingContext, call_key: str, start: date, end: date,
-    pool: list[dict[str, Any]], time_of_day: str | None, clinician_name: str | None, when: str,
-    *, asked: date | None = None, moved: str = "",
+    trace: WorkflowTrace, conn, context: BookingContext, call_key: str | None, search: _Search,
+    time_of_day: str | None, clinician_name: str | None, when: str,
 ) -> str:
+    """The reply to a search; `call_key` None = read-only (the SMS test chat): nothing remembered."""
+    start, end, pool, asked, moved = (search.start, search.end, search.pool, search.asked,
+                                      search.moved)
     ids = [clinician["id"] for clinician in pool]
     where = f"{context.case_type['name']} at {context.location['name']}"
     who = f" with {pool[0]['display_name']}" if clinician_name and len(pool) == 1 else ""
@@ -620,7 +713,8 @@ def _offer(
         slots = search_slots(conn, context, start=start, end=min(end, horizon_end),
                              clinician_ids=ids, time_of_day=time_of_day)
         if slots:
-            _remember_offers(conn, call_key, context, slots)
+            if call_key is not None:
+                _remember_offers(conn, call_key, context, slots)
             trace.log("slots_offered", count=len(slots), when=when)
             return f"OPENINGS for {where}{who}{moved}: {_offer_text(slots)}. {BOOK_HINT}{limits}"
     # Nothing in the wished-for range: the next times after it (the time of day first), else the
@@ -644,7 +738,8 @@ def _offer(
     if not later:
         return _no_openings(context, pool, clinician_name, note,
                             days=(horizon_end - today).days + 1)
-    _remember_offers(conn, call_key, context, later)
+    if call_key is not None:
+        _remember_offers(conn, call_key, context, later)
     trace.log("slots_offered", count=len(later), when=when, fallback=True, too_far=too_far)
     if too_far:
         # NOTHING_IN_RANGE is a code the prompt already offers the listed times for.
@@ -687,6 +782,11 @@ def list_providers(
     with transaction() as conn:
         context = load_context(conn, lead_id, location_name=location_name,
                                case_type_name=case_type_name, settings=settings)
+    return providers_text(context)
+
+
+def providers_text(context: BookingContext) -> str:
+    """The PROVIDERS reply for a loaded context (voice tool, SMS agent and its test chat)."""
     people = []
     for clinician in context.clinicians:
         details = "; ".join(
@@ -792,7 +892,8 @@ def _find_slot_for_booking(
         "and s.local_date=%s and s.local_time=%s and s.status='open' "
         "and (%s::bigint is null or s.id=%s) and " + NOT_ON_HOLIDAY_SQL + " "
         "order by offered desc,c.display_name",
-        (call_key, OFFER_MEMORY, context.location["id"], context.case_type["duration_minutes"],
+        (call_key, offer_memory(call_key), context.location["id"],
+         context.case_type["duration_minutes"],
          [c["id"] for c in pool], wanted_date, wanted_time, slot_id, slot_id),
     ).fetchall()
     earliest = context.now_local + timedelta(minutes=context.settings.booking_min_notice_minutes)
@@ -802,7 +903,21 @@ def _find_slot_for_booking(
     return None
 
 
-def _alternatives(trace: WorkflowTrace, context: BookingContext, call_key: str, day: date) -> str:
+def open_slot(conn, context: BookingContext, call_key: str, wanted_date: date,
+              wanted_time: clock_time, clinician_name: str | None) -> dict[str, Any] | None:
+    """The open cached slot at that date and time (with that therapist, if named), or None. Read
+    only: the SMS agent's read-back card checks the time is still open before showing it."""
+    return _find_slot_for_booking(conn, context, call_key, wanted_date, wanted_time, clinician_name)
+
+
+def alternatives(trace: WorkflowTrace, context: BookingContext, call_key: str | None,
+                 day: date) -> str:
+    """Other openings from that day on; `call_key` None = read-only (nothing remembered)."""
+    return _alternatives(trace, context, call_key, day)
+
+
+def _alternatives(trace: WorkflowTrace, context: BookingContext, call_key: str | None,
+                  day: date) -> str:
     horizon_end = _search_limit(context, day)
     too_far = (_too_far_note(_spoken_date(day), horizon_end) + " "
                if day > _booking_end(context) else "")
@@ -815,7 +930,7 @@ def _alternatives(trace: WorkflowTrace, context: BookingContext, call_key: str, 
             # Nothing on or after that day: the nearest times from today (it said "no other
             # openings soon" while earlier days were open, QA 2026-10-22).
             slots = search_slots(conn, context, start=today, end=horizon_end, clinician_ids=ids)
-        if slots:
+        if slots and call_key is not None:
             _remember_offers(conn, call_key, context, slots)
     if not slots:
         return "There are no other openings soon. Offer to text the booking link or transfer."
@@ -935,8 +1050,13 @@ def _close_attempt(appointment_id: int, hold_id: int, *, state: str, error: str,
 # appointments.booking_source has a check constraint (link, call, sms, manual, voice_agent): a staff
 # booking from the dashboard is stored as 'manual'. (A first version stored 'staff' and every
 # calendar booking failed on demo, 2026-10-14; migration 038 now puts the constraint in our files.)
+# The SMS agent ("Elliot by text", 2026-11-02) books with source 'sms' (allowed by the constraint).
 BOOKING_SOURCES = {"voice_agent": ("voice_agent", "voice_booking", "voice booking"),
-                   "staff": ("manual", "staff_booking", "staff booking")}
+                   "staff": ("manual", "staff_booking", "staff booking"),
+                   "sms": ("sms", "sms_booking", "text booking")}
+# Sources whose patient hears or reads "our front desk team will take care of it" when a booking is
+# not made, so the lead must reach Needs Review. A staff booking shows its error to the staff member.
+PATIENT_TOLD_SOURCES = {"voice_agent", "sms"}
 
 
 def _booked_elsewhere(conn, lead_id: str) -> str | None:
@@ -978,17 +1098,23 @@ def flag_booking_error(lead_id: str) -> None:
 NOT_MADE_REASON = "Booking did not go through on the call; book with the patient"
 
 
-def _flag_not_made(lead_id: str, why: str) -> None:
+NOT_MADE_BY_TEXT_REASON = "Booking did not go through by text; book with the patient"
+
+
+def _flag_not_made(lead_id: str, why: str, *, by_text: bool = False) -> None:
     # The booking surely was not made (Stride refused, or we stopped before the appointment
     # step), but the patient heard "our front desk team will take care of your appointment"
     # (owner, 2026-10-26): Needs Review, "Booking" group (front desk only). A booking later on this
     # call, or in Stride's next file, settles it (mark_booked clears the review).
     with transaction() as conn:
-        flag_lead_for_review(conn, lead_id, f"{NOT_MADE_REASON} ({why})", code="booking_failed",
-                             source="booking", details={"on_call": True, "why": why})
+        # by_text: the SMS agent's booking; the card says "by text" instead of "on the call".
+        reason = NOT_MADE_BY_TEXT_REASON if by_text else NOT_MADE_REASON
+        details = {"on_call": True, "why": why, **({"by_text": True} if by_text else {})}
+        flag_lead_for_review(conn, lead_id, f"{reason} ({why})", code="booking_failed",
+                             source="booking", details=details)
 
 
-def _after_running_attempt(lead_id: str, *, voice: bool, again) -> str:
+def _after_running_attempt(lead_id: str, *, voice: bool, again, by_text: bool = False) -> str:
     """Wait for this patient's running attempt, then answer as if it had just finished.
 
     Booked, unclear or still running: `again()` (this request once more, without waiting) gives
@@ -1005,7 +1131,8 @@ def _after_running_attempt(lead_id: str, *, voice: bool, again) -> str:
         with transaction() as conn:
             lead = conn.execute("select needs_review from leads where id=%s", (lead_id,)).fetchone()
         if not (lead and lead["needs_review"]):
-            _flag_not_made(lead_id, "booking did not go through while the caller waited")
+            _flag_not_made(lead_id, "booking did not go through while the caller waited",
+                           by_text=by_text)
     return f"FOLLOW_UP: I could not finish the booking just now. {FRONT_DESK_LINE}"
 
 
@@ -1027,7 +1154,8 @@ def book_slot(
     # twice, and the tool deadline still counts from the start of the request.
     may_wait = _deadline is None
     deadline = _deadline or _Deadline(settings)
-    voice = source == "voice_agent"
+    # "voice" = a patient was told the front desk will take care of it (voice call or text).
+    voice = source in PATIENT_TOLD_SOURCES
 
     def again() -> str:
         return book_slot(trace, lead_id=lead_id, call_id=call_id, arguments=arguments,
@@ -1071,7 +1199,8 @@ def book_slot(
             slot = _find_slot_for_booking(conn, context, call_key, wanted_date, wanted_time,
                                           clinician_name, slot_id=slot_id)
     if running:
-        return _after_running_attempt(lead_id, voice=voice, again=again)
+        return _after_running_attempt(lead_id, voice=voice, again=again,
+                                      by_text=source == "sms")
     if slot is None:
         return (
             f"NOT_AVAILABLE: {_spoken_time(wanted_time)} on {_spoken_date(wanted_date)} is not "
@@ -1155,7 +1284,8 @@ def book_slot(
                 conn.execute("update appointments set patient_dob=%s where id=%s",
                              (patient.date_of_birth, appointment_id))
     if running:
-        return _after_running_attempt(lead_id, voice=voice, again=again)
+        return _after_running_attempt(lead_id, voice=voice, again=again,
+                                      by_text=source == "sms")
     if taken:
         return (
             f"TAKEN: someone is booking {_spoken_time(wanted_time)} on {_spoken_date(wanted_date)} "
@@ -1174,13 +1304,13 @@ def book_slot(
         # Elliot offers other times, so no review: unless this attempt already answered
         # IN_PROGRESS, after which the patient may have heard "the front desk will take care".
         if give_up("failed", error, gone=True) and voice:
-            _flag_not_made(lead_id, "time taken while the caller waited")
+            _flag_not_made(lead_id, "time taken while the caller waited", by_text=source == "sms")
         return f"TAKEN: that time was just taken. {_alternatives(trace, context, call_key, wanted_date)}"
 
     def follow_up(error: str, why: str) -> str:
         give_up("failed", error)
         if voice:
-            _flag_not_made(lead_id, why)
+            _flag_not_made(lead_id, why, by_text=source == "sms")
         return f"FOLLOW_UP: I could not finish the booking just now. {FRONT_DESK_LINE}"
 
     stage = "availability"
@@ -1332,7 +1462,10 @@ def book_slot(
     _finish_booking(trace, context, slot, appointment_id, hold_id, stride_appointment_id,
                     patient_id, case_id, patient,
                     event_id=int(raw_event) if raw_event.isdigit() else None,
-                    history_source=history_source)
+                    history_source=history_source,
+                    # Booked by text: the agent's "booked" text is the confirmation (plan section 5),
+                    # so the separate confirmation SMS sent after a voice booking is not queued.
+                    confirmation_text=source != "sms")
     duration = context.case_type["duration_minutes"]
     return (
         f"BOOKED: {_spoken_date(slot['local_date'])} at {_spoken_time(slot['local_time'])} with "
@@ -1346,6 +1479,7 @@ def _finish_booking(
     trace: WorkflowTrace, context: BookingContext, slot: dict[str, Any], appointment_id: int,
     hold_id: int, stride_appointment_id: int, patient_id: int, case_id: int, patient: Patient,
     *, event_id: int | None = None, history_source: str = "voice_booking",
+    confirmation_text: bool = True,
 ) -> None:
     lead = context.lead
     lead_id = str(lead["id"])
@@ -1371,13 +1505,14 @@ def _finish_booking(
                     "and channel='call' and status not in ('delivered','failed','skipped')",
                     (event_id, lead_id),
                 )
-            conn.execute(
-                "insert into notification_log(lead_id,appointment_id,notification_type,channel,"
-                "status,payload) values(%s,%s,'sms_appointment_booked','sms','queued',%s) "
-                "on conflict do nothing",
-                (lead_id, appointment_id,
-                 Jsonb({"start_utc": slot["start_utc"].astimezone(UTC).isoformat()})),
-            )
+            if confirmation_text:
+                conn.execute(
+                    "insert into notification_log(lead_id,appointment_id,notification_type,channel,"
+                    "status,payload) values(%s,%s,'sms_appointment_booked','sms','queued',%s) "
+                    "on conflict do nothing",
+                    (lead_id, appointment_id,
+                     Jsonb({"start_utc": slot["start_utc"].astimezone(UTC).isoformat()})),
+                )
             enqueue_sheet_update(conn, lead_id=lead_id, event_type="lead_booked",
                                  source_key=f"appointment:{appointment_id}")
             # Test leads are synthetic; they must never reach the client's CRM.

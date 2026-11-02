@@ -7,7 +7,12 @@ from zoneinfo import ZoneInfo
 
 from ..db import transaction
 from ..observability import WorkflowTrace
-from .review import flag_lead_for_review, record_review, skip_remaining_planned
+from .review import (
+    SMS_FRONT_DESK_CODE,
+    flag_lead_for_review,
+    record_review,
+    skip_remaining_planned,
+)
 from .sheet_sync import enqueue_sheet_update
 
 CALLBACK_MIN_MINUTES = 5
@@ -28,7 +33,18 @@ CALLBACK_MAX_MINUTES = 240
 # front desk to handle the other case.
 CASE_CHANGE_STATUS = "case_change"
 CASE_CHANGE_CODE = "case_change_asked"
+# SQL on an open lead_reviews row `r`: a card a booking does not settle. The case change (this
+# booking is not that case) and Elliot's front-desk card by text (owner, 2026-11-02: the front desk
+# still calls about the insurance or other question), except its booking problem, which a booking
+# settles.
+KEPT_ON_BOOKING_SQL = (
+    f"(r.code='{CASE_CHANGE_CODE}' or (r.code='{SMS_FRONT_DESK_CODE}' "
+    "and coalesce(r.details->>'reason','')<>'booking_problem'))"
+)
 # Every status the lead-status tool may send (config/vapi_booking_tools.json lists the same, tested).
+# The SMS agent ("Elliot by text", 2026-11-02) reports with this source and a conversation key
+# "sms:<lead_id>:<job_id>" as call_id (no outreach event); its review cards say "Text message".
+SMS_AGENT_SOURCE = "sms agent"
 REPORTED_STATUSES = (
     "booked", "declined", "callback_scheduled", "booking_link", "booking_link_and_transfer",
     "transferred_human", "no_answer", "wrong_person", "call_opt_out", "do_not_contact",
@@ -161,23 +177,26 @@ def mark_booked(conn, lead_id: str, source: str) -> None:
     # A confirmed booking settles any open review, as the Sheet's Booked does (migration 048's
     # trigger records it as "booked"): a booked lead left flagged showed in Needs Review, where
     # "Continue" would have put it back into calls. Except a different case the patient asked for
-    # (owner, 2026-10-29): this booking is not that case, so its card stays open on the booked lead.
-    case_change = conn.execute(
-        "select message from lead_reviews where lead_id=%s and resolved_at is null and code=%s "
-        "order by flagged_at,id limit 1",
-        (lead_id, CASE_CHANGE_CODE),
+    # (owner, 2026-10-29): this booking is not that case, so its card stays open on the booked lead;
+    # and Elliot's front-desk card by text (owner, 2026-11-02: booking by text goes on while it is
+    # open, and the front desk still calls about the question). KEPT_ON_BOOKING_SQL.
+    kept = conn.execute(
+        "select r.message from lead_reviews r where r.lead_id=%s and r.resolved_at is null and "
+        + KEPT_ON_BOOKING_SQL + " order by r.flagged_at,r.id limit 1",
+        (lead_id,),
     ).fetchone()
-    if case_change:
+    if kept:
         conn.execute(
-            "update lead_reviews set resolved_at=now(),resolved_by='system',resolved_by_name='System',"
-            "resolution='booked',updated_at=now() where lead_id=%s and resolved_at is null and code<>%s",
-            (lead_id, CASE_CHANGE_CODE),
+            "update lead_reviews r set resolved_at=now(),resolved_by='system',resolved_by_name='System',"
+            "resolution='booked',updated_at=now() where r.lead_id=%s and r.resolved_at is null "
+            "and not " + KEPT_ON_BOOKING_SQL,
+            (lead_id,),
         )
         conn.execute(
             "update leads set status='booked',cadence_state='completed',last_call_outcome='booked',"
             "needs_review=true,review_reason=%s,review_flagged_at=coalesce(review_flagged_at,now()),"
             "status_changed_at=now() where id=%s",
-            (case_change["message"], lead_id),
+            (kept["message"], lead_id),
         )
     else:
         conn.execute(
@@ -200,6 +219,7 @@ def case_change_message(asked: str | None, referral: str | None) -> str:
 
 def flag_case_change(
     conn, lead: dict, *, note: str, source: str, event_id: int | None, call_id: str | None,
+    review_source: str = "call",
 ) -> bool:
     """Needs Review for a different case (owner, 2026-10-29). Returns whether a card is open.
 
@@ -217,7 +237,7 @@ def flag_case_change(
                "booked": lead["status"] == "booked" or None}
     if lead["status"] != "booked":
         flagged = flag_lead_for_review(conn, lead_id, message, code=CASE_CHANGE_CODE, details=details,
-                                       source="call")
+                                       source=review_source)
         if flagged:
             record_status(conn, lead_id, lead["status"], "needs_attention", source, message)
         return flagged
@@ -227,7 +247,8 @@ def flag_case_change(
         "then review_flagged_at end,now()) where id=%s",
         (message, lead_id),
     )
-    review_id = record_review(conn, lead_id, CASE_CHANGE_CODE, message, details=details, source="call")
+    review_id = record_review(conn, lead_id, CASE_CHANGE_CODE, message, details=details,
+                              source=review_source)
     return review_id is not None
 
 
@@ -268,6 +289,46 @@ def _transfer_with_review(note: str | None) -> str:
     return (f"{TRANSFER_WITH_REVIEW}. {note}" if note else TRANSFER_WITH_REVIEW)[:500]
 
 
+# The patient declined, already booked elsewhere or is the wrong person (by text or on a call)
+# while Elliot's own front-desk card by text was open (owner, 2026-11-02): the front desk no longer
+# calls about the insurance or other question, so the card closes with this note. Before, the card
+# kept the lead in Needs Review and its "Continue cadence" put a patient who had declined back into
+# calls. An emergency card stays: staff still see it. Other cards stay open on the declined lead,
+# and lead_review offers no choice there that restarts outreach (DECIDED_STATUSES).
+FRONT_DESK_CARD_SETTLED = "Closed: the patient {what} before the front desk reached out"
+
+
+def settle_front_desk_cards(conn, lead_id: str, what: str) -> int:
+    """Close Elliot's open `sms_front_desk` cards (not an emergency) in the caller's transaction.
+
+    The lead's needs_review follows the cards left: none -> cleared (migration 048's trigger finds
+    nothing open), else review_reason names the oldest one still open."""
+    closed = conn.execute(
+        "update lead_reviews set resolved_at=now(),resolved_by='system',"
+        "resolved_by_name='Elliot (text)',resolution='closed',note=%s,updated_at=now() "
+        "where lead_id=%s and resolved_at is null and code=%s "
+        "and coalesce(details->>'reason','')<>'emergency' returning id",
+        (FRONT_DESK_CARD_SETTLED.format(what=what)[:500], lead_id, SMS_FRONT_DESK_CODE),
+    ).fetchall()
+    if not closed:
+        return 0
+    left = conn.execute(
+        "select message from lead_reviews where lead_id=%s and resolved_at is null "
+        "order by flagged_at,id limit 1",
+        (lead_id,),
+    ).fetchone()
+    if left:
+        conn.execute("update leads set review_reason=%s where id=%s",
+                     (str(left["message"] or "Needs review")[:500], lead_id))
+    else:
+        conn.execute(
+            "update leads set needs_review=false,review_reason=null,review_resolved_at=now() "
+            "where id=%s and needs_review",
+            (lead_id,),
+        )
+    return len(closed)
+
+
 def report_lead_status(
     trace: WorkflowTrace,
     *,
@@ -282,11 +343,14 @@ def report_lead_status(
     delay_minutes: str | int | None = None,
     callback_datetime_iso: str | None = None,
     source: str = "tool",
+    queue_link_text: bool = True,
 ) -> str:
     """Apply the direct Vapi lead-status contract with per-call/status idempotency.
 
     ``source`` labels the lead's history: "tool" when the agent reported during
-    the call, "call summary" when the post-call summary settled it instead.
+    the call, "call summary" when the post-call summary settled it instead, SMS_AGENT_SOURCE for
+    the SMS agent. ``queue_link_text`` False: the SMS agent puts the booking link in its own reply,
+    so no separate booking-link text is queued (the patient would get the link twice).
     """
     normalized = {
         "not_interested": "declined",
@@ -295,6 +359,7 @@ def report_lead_status(
         "manual": "wrong_person",
     }.get(status.strip().lower(), status.strip().lower())
     note = (notes or "").strip()[:500]
+    review_source = "text" if source == SMS_AGENT_SOURCE else "call"
     trace.log("validation_started", lead_id=lead_id, event_id=event_id, reported_status=normalized)
     with transaction() as conn:
         lead = conn.execute(
@@ -358,7 +423,8 @@ def report_lead_status(
                     ("tool" if source == "tool" else "webhook", event["id"]),
                 )
             flag_case_change(conn, lead, note=note, source=source,
-                             event_id=event["id"] if event else None, call_id=stable_call_id)
+                             event_id=event["id"] if event else None, call_id=stable_call_id,
+                             review_source=review_source)
             conn.execute("update provider_events set processed_at=now() where id=%s", (receipt["id"],))
             trace.log("state_transition_applied", reported_status=normalized, booked=True)
             return "recorded"
@@ -414,6 +480,7 @@ def report_lead_status(
                 (lead_id,),
             )
             record_status(conn, lead_id, lead["status"], "declined", source, note or "declined")
+            settle_front_desk_cards(conn, lead_id, "declined")
         elif normalized == "already_booked":
             history = f"{ALREADY_BOOKED_REASON}. {note}" if note else ALREADY_BOOKED_REASON
             conn.execute(
@@ -427,6 +494,7 @@ def report_lead_status(
                 (lead_id,),
             )
             record_status(conn, lead_id, lead["status"], "declined", source, history[:500])
+            settle_front_desk_cards(conn, lead_id, "said they are already booked")
         elif normalized == "callback_scheduled":
             tz, hours, holidays = _practice_clock(conn, lead_id)
             now = datetime.now(UTC)
@@ -478,13 +546,16 @@ def report_lead_status(
             # call: the sender drops the text if the lead has moved off
             # booking_link_sent by then. One link per call, so asking again after
             # a change of mind re-arms this call's text instead of adding another.
+            # (The SMS agent's reply carries the link itself: nothing to queue, queue_link_text.)
             existing = conn.execute(
                 "select id,status from notification_log where lead_id=%s "
                 "and notification_type='sms_booking_link' and payload->>'call_id'=%s "
                 "order by id desc limit 1",
                 (lead_id, stable_call_id),
-            ).fetchone()
-            if existing is None:
+            ).fetchone() if queue_link_text else None
+            if not queue_link_text:
+                pass
+            elif existing is None:
                 conn.execute(
                     "insert into notification_log(lead_id,notification_type,channel,status,payload,"
                     "next_attempt_at) values(%s,'sms_booking_link','sms','queued',%s,"
@@ -559,7 +630,8 @@ def report_lead_status(
                 )
         elif normalized == CASE_CHANGE_STATUS:
             flag_case_change(conn, lead, note=note, source=source,
-                             event_id=event["id"] if event else None, call_id=stable_call_id)
+                             event_id=event["id"] if event else None, call_id=stable_call_id,
+                             review_source=review_source)
         elif normalized == "no_answer":
             conn.execute(
                 "update leads set last_call_outcome='no_answer',status_reason=%s where id=%s",
@@ -576,10 +648,11 @@ def report_lead_status(
             skip_remaining_planned(conn, lead_id)
             record_status(conn, lead_id, lead["status"], "invalid_phone", source, reason)
             record_review(
-                conn, lead_id, "wrong_person", reason, source="call",
+                conn, lead_id, "wrong_person", reason, source=review_source,
                 outreach_event_id=event["id"] if event else None,
                 details={"note": note or None, "call_id": stable_call_id},
             )
+            settle_front_desk_cards(conn, lead_id, "said this is the wrong person")
         elif normalized == "call_opt_out":
             conn.execute(
                 "update leads set call_opt_out=true,last_call_outcome='call_opt_out',"
@@ -628,7 +701,7 @@ def report_lead_status(
             skip_remaining_planned(conn, lead_id)
             record_status(conn, lead_id, lead["status"], "needs_attention", source, reason)
             record_review(
-                conn, lead_id, "unrecognized_status", reason, source="call",
+                conn, lead_id, "unrecognized_status", reason, source=review_source,
                 outreach_event_id=event["id"] if event else None,
                 details={"reported_status": normalized, "note": note or None, "call_id": stable_call_id},
             )
@@ -722,6 +795,7 @@ def apply_call_outcome(
                 "where lead_id=%s and status='planned'", (lead_id,),
             )
             record_status(conn, lead_id, lead["status"], "declined", source, "not interested")
+            settle_front_desk_cards(conn, lead_id, "declined")
         elif outcome == "callback":
             conn.execute(
                 "update leads set status='callback_scheduled',cadence_state='active',last_call_outcome=%s,"

@@ -18,18 +18,19 @@ from __future__ import annotations
 
 from typing import Any
 
-from .lead_status import CASE_CHANGE_CODE
+from .lead_status import KEPT_ON_BOOKING_SQL
 from .review import record_review
 from .sheet_sync import enqueue_sheet_update
 from .stride_import import CANCELLED_STATUSES, LATE_CANCEL_STATUSES, NO_SHOW_STATUSES
 
 # A booking that did not happen: cancelled, late-cancelled or no-show (deletes too).
 _MISSED = tuple(sorted(CANCELLED_STATUSES | NO_SHOW_STATUSES))
-# A booked lead with only a case change card open (owner, 2026-10-29: the patient asked about
-# another case; the booking stays) is still watched: a cancel must not hide behind that card.
+# A booked lead with only cards a booking keeps open (owner, 2026-10-29: the patient asked about
+# another case; 2026-11-02: Elliot's front-desk card by text) is still watched: a cancel must not
+# hide behind those cards.
 _BOOKED_WATCHED = (
     "(not l.needs_review or not exists(select 1 from lead_reviews r where r.lead_id=l.id "
-    f"and r.resolved_at is null and r.code<>'{CASE_CHANGE_CODE}'))"
+    "and r.resolved_at is null and not " + KEPT_ON_BOOKING_SQL + "))"
 )
 
 # Staff-facing reasons. The Sheet sync recognises them by the " in Stride" ending.

@@ -4,6 +4,8 @@
 | --- | --- |
 | `vapi_tools.json` | Vapi tool definitions (`check_availability`, `create_appointment`, `update_lead_status`). Pushed to the Vapi assistant by `scripts/sync_vapi.py`. |
 | `vapi_assistant_prompt.md` | The voice assistant's system prompt. Also synced by `scripts/sync_vapi.py`. |
+| `sms_agent_prompt.md` | SMS agent ("Elliot by text") prompt, loaded at runtime by `services/sms_agent.py` (no sync step). Reads the Context labels `services/sms_agent_context.context_block` writes and the tool reply codes. |
+| `sms_agent_tools.json` | The SMS agent's 8 function tools (strict JSON schema); names and parameters fixed by `docs/SMS_AGENT.md`, dispatched by `services/sms_agent_tools.call_tool`. |
 | `n8n/workflows/*.json` | **Older** exports of the n8n workflows (intake, recovery, Sheet webhook, profile sync). |
 
 ## Notes

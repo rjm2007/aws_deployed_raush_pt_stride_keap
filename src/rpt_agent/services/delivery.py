@@ -141,7 +141,7 @@ def process_pending_integrations(
                 # itself with no extra work.
                 conn.execute(
                     "insert into sms_messages(lead_id,direction,body,occurred_at,delivery_status,"
-                    "provider_message_id) values(%s,'outbound',%s,now(),'queued',%s) "
+                    "provider_message_id,sender) values(%s,'outbound',%s,now(),'queued',%s,'system') "
                     "on conflict (provider_message_id) do nothing",
                     (row["lead_id"], body, sid),
                 )

@@ -2399,8 +2399,9 @@ def send_manual_sms(
             (provider_ref, request_id),
         )
         conn.execute(
-            "insert into sms_messages(lead_id,direction,body,occurred_at,delivery_status,provider_message_id) "
-            "values(%s,'outbound',%s,now(),'sent',%s)",
+            # 'staff': the SMS agent goes quiet for this lead a while (services/sms_inbound.py).
+            "insert into sms_messages(lead_id,direction,body,occurred_at,delivery_status,provider_message_id,"
+            "sender) values(%s,'outbound',%s,now(),'sent',%s,'staff')",
             (lead_id, payload.body, provider_ref),
         )
         _audit(

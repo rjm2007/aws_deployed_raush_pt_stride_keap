@@ -58,6 +58,17 @@ services:
       - ./src:/app/src
       - ./logs:/app/logs
       - ./local/stride:/app/stride
+  sms-agent-worker:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MOCK_BASE_URL: http://mock-provider:9000
+    command: rpt-sms-agent-worker
+    volumes:
+      - ./src:/app/src
+      - ./logs:/app/logs
   mock-provider:
     profiles: ["mock"]
     build: .

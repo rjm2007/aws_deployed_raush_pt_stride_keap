@@ -40,6 +40,27 @@ class Settings(BaseSettings):
     assistant_model: str = "gpt-5.6-luna"
     assistant_phi_approved: bool = False
     assistant_phi_approval_reference: str = ""
+    # SMS agent ("Elliot by text", demo/SMS-Agent-Plan.md): replies to patients' texts, answers and
+    # books. Off by default; the dashboard's test chat tab is a separate switch and never sends a
+    # text. Same OpenAI key and base URL as the assistant.
+    sms_agent_enabled: bool = False
+    sms_agent_test_enabled: bool = False
+    sms_agent_model: str = "gpt-5.5"
+    # Only `is_test` leads get AI replies while this is on (demo). Real patients need the client's
+    # decision about sending their texts to the AI first (SMS_AGENT_PHI_APPROVED).
+    sms_agent_test_leads_only: bool = True
+    sms_agent_phi_approved: bool = False
+    # Texts that arrive within this many seconds of each other get one reply.
+    sms_agent_quiet_seconds: int = Field(default=15, ge=0, le=300)
+    # A runaway chat (another bot, an auto-reply loop) stops here and goes to staff.
+    sms_agent_daily_reply_cap: int = Field(default=10, ge=1, le=100)
+    sms_agent_timeout_seconds: float = Field(default=35.0, ge=5.0, le=120.0)
+    sms_agent_max_rounds: int = Field(default=5, ge=1, le=10)
+    sms_agent_poll_seconds: float = Field(default=2.0, ge=0.5, le=60.0)
+    # Staff texting a patient from the dashboard takes over: no AI reply to that lead for this long.
+    sms_agent_staff_quiet_hours: int = Field(default=24, ge=1, le=720)
+    sms_agent_test_requests_per_minute: int = Field(default=30, ge=1, le=120)
+    clinic_front_desk_phone: str = "(949) 276-5401"
     dashboard_public_url: str = ""
     # The Google Sheet is the only way leads come in (client, 2026-10-15): the dashboard's "Add
     # lead" is switched off unless this is turned on (local tests, emergencies).
@@ -291,6 +312,17 @@ class Settings(BaseSettings):
                 errors.append(
                     "ASSISTANT_PHI_APPROVAL_REFERENCE is required for real-patient assistant use"
                 )
+        if self.sms_agent_enabled or (service == "api" and self.sms_agent_test_enabled):
+            if self.langsmith_tracing or self.langchain_tracing_v2:
+                errors.append("LangChain/LangSmith tracing must be disabled for the SMS agent")
+            if not self.openai_api_key:
+                errors.append("OPENAI_API_KEY is required when the SMS agent is enabled")
+            if not self.sms_agent_model.strip():
+                errors.append("SMS_AGENT_MODEL is required when the SMS agent is enabled")
+            if self.sms_agent_enabled and not self.sms_agent_test_leads_only and not (
+                self.sms_agent_phi_approved
+            ):
+                errors.append("SMS_AGENT_PHI_APPROVED must be true before the SMS agent texts real patients")
         if deployment_env:
             if self.test_mode:
                 errors.append("TEST_MODE must be false outside local development")

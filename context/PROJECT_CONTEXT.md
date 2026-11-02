@@ -2833,3 +2833,47 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
   `case_change` added separately. No migration (codes and resolutions have no check constraint).
 - Dashboard (`../rpt_frontend`): the Review Queue lists every lead with an open review (a booked lead with a
   case change card too), new choice type and saved messages.
+
+### 2026-11-02 — SMS agent "Elliot by text" built (branch `feature/own-postgres`, demo, not deployed, off by default)
+
+- A patient texts the clinic number; Elliot answers by text, answers questions and books the Initial
+  Evaluation with the voice rules, written for text. Plan and owner decisions: `demo/SMS-Agent-Plan.md`;
+  build contract and status: `docs/SMS_AGENT.md`.
+- Migration 054: `sms_messages.sender` (patient / cadence / ai / staff / system; every insert sets it now),
+  `sms_agent_jobs` (one pending job per phone, quiet window so 3 quick texts get one reply),
+  `sms_agent_actions` (tool + result code only), and the editable `sms_agent.*` texts in the SMS Template
+  Studio.
+- Inbound (`routes/twilio.py`, `services/sms_inbound.py`): texts are stored, STOP/START/HELP/CALL unchanged,
+  anything else queues a reply. `sms-agent-worker` (`rpt-sms-agent-worker`, own container, one instance)
+  decides whether to reply (opt-outs, test leads only, staff texted in the last 24 h, a call in flight,
+  daily cap with a Needs Review card), runs the agent and sends each text as `ai`. A number with no lead
+  gets one fixed text a day, never the AI.
+- Agent (`services/sms_agent*.py`, `config/sms_agent_prompt.md`, `config/sms_agent_tools.json`): OpenAI
+  Responses API (`SMS_AGENT_MODEL`, `store=False`), 8 tools. Fixed texts (intro, read-back card, booked,
+  front desk, English only, 911) are sent word for word. Booking only after the read-back card and a reply
+  to it (checked in code); booking source `sms`, no second confirmation text. Anything Elliot can't handle
+  opens the new demo review card `sms_front_desk` (Front desk will handle / Continue cadence; Front desk only
+  on a finished lead, which keeps its status). New codes `sms_agent_reply_cap`, `sms_agent_failed`.
+- "Stop texting" = SMS opt-out; "no contact at all" = texts and calls off (Do Not Contact). Elliot's own
+  opt-out reply is still sent; nothing after it.
+- Dashboard test chat (`/administration/sms-agent-test`, `routes/sms_agent_test.py`): chat with Elliot as a
+  made-up patient on the real slot cache; nothing is sent or saved. Off unless `SMS_AGENT_TEST_ENABLED`.
+- Not yet: a real model run of the prompt (scenario tests), owner decisions in `docs/SMS_AGENT.md` "Open".
+
+### 2026-11-02 — SMS agent: front-desk card no longer blocks booking; 988 in the emergency text (owner decisions)
+
+- Elliot's own front-desk card by text (`sms_front_desk`) for insurance, wants_person, other_language,
+  unknown_question or other no longer stops `confirm_visit` / `book_visit` (live and sandbox): the card stays
+  open so the front desk still calls (`review.FRONT_DESK_BOOKABLE_REASONS`, `review_allows_booking`,
+  `LeadView.front_desk_only` / `booking_paused`). Every other open review still stops booking, also a card
+  opened earlier in the same reply. The Context says "Needs review: front desk only (...; booking by text
+  still works)"; the prompt and the hand_off tool description changed only where they said a front-desk card
+  stops booking.
+- `lead_status.mark_booked` keeps that card open (like the case change card; `KEPT_ON_BOOKING_SQL`), except
+  its booking_problem reason. Booked lead with it open: Sheet Outcome Status "Booked; needs review: patient
+  needs the front desk (by text)" (`SHEET_BOOKED_FRONT_DESK`, snapshot `open_review_code`); a Stride cancel is
+  still seen (`stride_leads._BOOKED_WATCHED`).
+- Emergency text adds "If you're thinking about harming yourself, call or text 988 any time."
+- Tests: unit (`test_sms_agent*.py`, `test_n8n_integration.py`) and local pgserver
+  (`test_sms_agent_integration.py`: booked behind the card with the card kept, other reviews still block,
+  a booking settles the booking-problem card). Docs: `docs/SMS_AGENT.md`.

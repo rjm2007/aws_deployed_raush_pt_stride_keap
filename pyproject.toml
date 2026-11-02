@@ -13,6 +13,7 @@ dependencies = [
   "httpx>=0.27,<1",
   "langchain>=1,<2",
   "langchain-openai>=1,<2",
+  "openai>=2,<4",
   "psycopg[binary,pool]>=3.2,<4",
   "pydantic-settings>=2.6,<3",
   "python-multipart>=0.0.12,<1",
@@ -34,6 +35,7 @@ rpt-sheet-worker = "rpt_agent.sheet_sync_worker:main"
 rpt-stride-worker = "rpt_agent.stride_import_worker:main"
 rpt-booking-worker = "rpt_agent.booking_worker:main"
 rpt-keap-worker = "rpt_agent.keap_sync_worker:main"
+rpt-sms-agent-worker = "rpt_agent.sms_agent_worker:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rpt_agent"]
