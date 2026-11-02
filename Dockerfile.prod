@@ -11,6 +11,9 @@ RUN pip install --no-cache-dir . \
 # supabase/dev/ stays: this box runs synthetic test leads, and `rpt test-lead`
 # needs reset_test_lead_by_name.sql. Fixtures and tests are not needed.
 COPY supabase ./supabase
+# The SMS agent reads its prompt and tools at runtime (services/sms_agent.py CONFIG_DIR = /app/config);
+# without them every reply failed with FileNotFoundError on the demo server (2026-11-02).
+COPY config/sms_agent_prompt.md config/sms_agent_tools.json ./config/
 RUN mkdir -p /app/logs
 
 CMD ["uvicorn", "rpt_agent.api:app", "--host", "0.0.0.0", "--port", "8000"]
