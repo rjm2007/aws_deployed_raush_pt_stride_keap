@@ -508,6 +508,9 @@ def test_last_name_from_the_call_only_when_clear():
 
     assert last("It's makhija.") == "Makhija"
     assert last("M A K H I J A") == "Makhija"
+    assert last("Fry, f r y e.") == "Frye"  # said one way, spelled another: the spelling wins
+    assert last("Fry.", "That's F-R-Y-E.") == "Frye"
+    assert last("O'Brien, O apostrophe B R I E N") is None
     assert last("De La Cruz") is None
     assert last("Makhija", after="Sorry, could you spell that?") is None
 

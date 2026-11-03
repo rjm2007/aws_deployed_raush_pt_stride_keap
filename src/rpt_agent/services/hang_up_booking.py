@@ -347,7 +347,7 @@ def _matches(slot: dict[str, Any], what: str, names: set[str]) -> bool:
 
 
 _NAME_FILLER = frozenset({"its", "it", "is", "my", "last", "name", "uh", "um", "sure", "yeah", "yes",
-                          "oh", "so", "okay", "ok"})
+                          "oh", "so", "okay", "ok", "thats", "spelled"})
 
 
 def _last_name_from_call(turns: list[tuple[str, str]], before: int) -> str | None:
@@ -367,8 +367,10 @@ def _last_name_from_call(turns: list[tuple[str, str]], before: int) -> str | Non
     said = " ".join(w for role, w in turns[start + 1:end] if role == "user").replace("\u2019", "'")
     tokens = [t.strip("'-") for t in re.findall(r"[A-Za-z][A-Za-z'-]*", said)]
     tokens = [t for t in tokens if t and _plain(t) not in _NAME_FILLER]
-    if len(tokens) > 1 and all(len(t) == 1 for t in tokens):
-        tokens = ["".join(tokens).lower()]  # spelled out letter by letter
+    spelled = [t for t in tokens if len(t) == 1 or re.fullmatch(r"[A-Za-z](?:-[A-Za-z])+", t)]
+    letters = "".join(spelled).replace("-", "")
+    if len(letters) > 1 and len(tokens) - len(spelled) <= 1:
+        tokens = [letters.lower()]  # spelled out letter by letter; the spelling wins over the spoken word
     if len(tokens) != 1 or len(tokens[0]) < 2:
         return None
     name = tokens[0]
