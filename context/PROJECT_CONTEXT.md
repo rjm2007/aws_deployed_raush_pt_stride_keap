@@ -2877,3 +2877,21 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
 - Tests: unit (`test_sms_agent*.py`, `test_n8n_integration.py`) and local pgserver
   (`test_sms_agent_integration.py`: booked behind the card with the card kept, other reviews still block,
   a booking settles the booking-problem card). Docs: `docs/SMS_AGENT.md`.
+
+### 2026-11-03 — SMS agent birthday step (owner decision; not committed, not deployed)
+
+- Bug (demo test chat, booking calendar pinned to 2026-07-15, test lead born 2026-11-01): "is your birthday
+  November 1?" -> card -> yes -> "send your date of birth with the year" -> same card -> yes -> the same
+  question, never booked. `slot_booking.validate_patient` compared the birthday with the pinned calendar's
+  today (BAD_DATE_OF_BIRTH) and Elliot kept asking and re-sending the card.
+- Elliot now asks once "To confirm it's you, what's your date of birth?", never reads the date on file (no
+  longer in the model's Context), and never asks again once the chat has a valid one. New
+  `services/sms_agent_birthday.py` (US date parsing, 1-120 years against the real clinic date, MATCH /
+  DIFFERENT / CONFIRMED_DIFFERENT / NEED_YEAR / NOT_POSSIBLE / NEW / UNREADABLE), new tool
+  `check_birthday`, Context "Date of birth confirmed in this chat". `confirm_visit` needs a confirmed date
+  (NEED_BIRTH_DATE) and never sends the same card twice in a row (CARD_ALREADY_SENT); `book_visit` uses the
+  confirmed date; a second failed booking for the same reason in a chat hands off booking_problem.
+- `book_slot` (voice and text) checks the date of birth against the real date (`birth_date_today`), not
+  `BOOKING_TODAY_OVERRIDE`; production (no pinned day) is unchanged.
+- Test chat setup birthday must be at least 1 year back (route 422 + tab). Docs: `docs/SMS_AGENT.md`
+  "Birthday step". Tests: `test_sms_agent_birthday.py`, integration cases on local pgserver.

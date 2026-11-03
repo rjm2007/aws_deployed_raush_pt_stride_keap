@@ -4,13 +4,14 @@ and the new review code's card (services/lead_review.py, sms_front_desk)."""
 from __future__ import annotations
 
 import logging
-from datetime import date, time
+from datetime import date, datetime, time
 
 import pytest
 
 from rpt_agent.observability import WorkflowTrace
 from rpt_agent.services import lead_review
 from rpt_agent.services import sms_agent_texts as texts
+from rpt_agent.services.front_desk import CLINIC_TZ
 from rpt_agent.services.sms_agent_context import MEDIA_ONLY, LeadView, Turn, scrub
 from rpt_agent.services.sms_agent_tools import (
     LiveTools,
@@ -97,6 +98,8 @@ def test_book_visit_without_card_is_refused_before_any_database_access(monkeypat
                      practice_id=1, now_local=None),
     ):
         monkeypatch.setattr(tools, "_conn", lambda: pytest.fail("no DB before the guard"))
+        # Only the count of earlier failed bookings reads (live: sms_agent_actions).
+        monkeypatch.setattr(tools, "_earlier_failures", lambda code: 0)
         result = call_tool(tools, "book_visit", {"date": "2026-11-03", "time": "9:00 AM",
                                                  "therapist": "Alan Rome", "first_name": "Sam",
                                                  "last_name": "Test",
@@ -369,6 +372,8 @@ def test_book_visit_after_a_photo_is_refused_live_and_sandbox(monkeypatch):
         SandboxTools(trace, lead=lead(), history=turns, practice_id=1, now_local=None),
     ):
         monkeypatch.setattr(tools, "_conn", lambda: pytest.fail("no DB before the guard"))
+        # Only the count of earlier failed bookings reads (live: sms_agent_actions).
+        monkeypatch.setattr(tools, "_earlier_failures", lambda code: 0)
         result = call_tool(tools, "book_visit", {"date": "2026-11-03", "time": "9:00 AM"})
         assert result.code == "NOT_CONFIRMED" and "in words" in result.output
 
@@ -733,6 +738,8 @@ def test_book_visit_without_a_first_name_is_refused_before_any_booking(monkeypat
         SandboxTools(trace, lead=no_first, history=ANSWERED, practice_id=1, now_local=None),
     ):
         monkeypatch.setattr(tools, "_conn", lambda: pytest.fail("no DB without a first name"))
+        # Only the count of earlier failed bookings reads (live: sms_agent_actions).
+        monkeypatch.setattr(tools, "_earlier_failures", lambda code: 0)
         result = call_tool(tools, "book_visit", {**BOOK_ARGS, "first_name": "Quill",
                                                  "last_name": "Quill"})
         assert result.code == "MISSING_NAME" and not result.fixed_texts
@@ -945,3 +952,163 @@ def test_missing_name_asks_only_for_the_first_name_and_sends_the_card_again():
 
     assert "never ask for it" in MISSING_FIRST_NAME
     assert "call confirm_visit again for the same time in that turn" in MISSING_FIRST_NAME
+
+
+# --- eval 2026-11-03 (results-gpt-5.5-dob.json) -------------------------------------------------------
+
+TODAY_NOV4 = date(2026, 11, 4)
+NOW_NOV4 = datetime(2026, 11, 4, 10, 30, tzinfo=CLINIC_TZ)
+
+
+@pytest.mark.parametrize("latest,when,specific,expected", [
+    # book-12: "tmrw aftrnoon" searched as when=specific_date with today's date.
+    ("yo can i get in tmrw aftrnoon at lagna nigel", "specific_date", "2026-11-04", "tomorrow"),
+    ("tmrw?", "today", None, "tomorrow"),
+    # Another day, or a text that also says today, is left as asked.
+    ("tmrw?", "specific_date", "2026-11-05", "specific_date"),
+    ("today or tmrw", "specific_date", "2026-11-04", "specific_date"),
+    ("next friday", "specific_date", "2026-11-04", "specific_date"),
+    ("tmrw?", "specific_date", "not a date", "specific_date"),
+])
+def test_search_when_a_specific_date_today_after_tmrw_is_tomorrow(latest, when, specific, expected):
+    from rpt_agent.services.sms_agent_tools import search_when
+
+    turns = history(("patient", latest))
+    assert search_when(when, turns, specific, {TODAY_NOV4}) == expected
+
+
+def test_find_times_specific_date_today_after_tmrw_searches_tomorrow_and_names_it(monkeypatch):
+    from contextlib import contextmanager
+
+    @contextmanager
+    def no_conn():
+        yield None
+
+    turns = history(("patient", "yo can i get in tmrw aftrnoon at lagna nigel"))
+    asked: list = []
+    module = slot_booking_module()
+
+    def readonly(trace, conn, context, **kw):
+        asked.append((kw["when"], kw["specific_date"]))
+        return OPENINGS
+
+    def live_find(trace, **kw):
+        asked.append((kw["when"], kw["specific_date"]))
+        return OPENINGS
+
+    monkeypatch.setattr(module, "find_slots_readonly", readonly)
+    monkeypatch.setattr(module, "find_slots", live_find)
+    # The test chat's clock is the day searched; live uses the clinic's real date.
+    sandbox_tools = SandboxTools(WorkflowTrace("test", "test"), lead=lead(), history=turns,
+                                 practice_id=1, now_local=NOW_NOV4)
+    monkeypatch.setattr(sandbox_tools, "_conn", no_conn)
+    monkeypatch.setattr(sandbox_tools, "_context", lambda conn, clinic, service=None: FakeContext())
+    live = LiveTools(WorkflowTrace("test", "test"), lead_id="00000000-0000-0000-0000-000000000001",
+                     job_id=1, lead=lead(), history=turns)
+    monkeypatch.setattr(live, "search_todays", lambda: {TODAY_NOV4})
+    for tools in (sandbox_tools, live):
+        result = call_tool(tools, "find_times", {"when": "specific_date",
+                                                 "specific_date": "2026-11-04",
+                                                 "time_of_day": "afternoon"})
+        assert result.summary.startswith("Looked for times (tomorrow)")
+        assert result.output.startswith("OPENINGS: Searched tomorrow, Thu Nov 5 (the patient said "
+                                        "tomorrow). Name that day in your text (\"Thu Nov 5\")")
+    assert asked == [("tomorrow", None), ("tomorrow", None)]
+    # Without "tmrw" the date is searched as asked.
+    asked.clear()
+    plain = SandboxTools(WorkflowTrace("test", "test"), lead=lead(),
+                         history=history(("patient", "anything wed afternoon?")), practice_id=1,
+                         now_local=NOW_NOV4)
+    monkeypatch.setattr(plain, "_conn", no_conn)
+    monkeypatch.setattr(plain, "_context", lambda conn, clinic, service=None: FakeContext())
+    call_tool(plain, "find_times", {"when": "specific_date", "specific_date": "2026-11-04"})
+    assert asked == [("specific_date", date(2026, 11, 4))]
+
+
+def test_search_todays_include_the_pinned_calendar_day(monkeypatch):
+    from rpt_agent.config import get_settings
+
+    settings = get_settings().model_copy(update={"booking_today_override": date(2026, 7, 15)})
+    live = LiveTools(WorkflowTrace("test", "test"), lead_id="00000000-0000-0000-0000-000000000001",
+                     job_id=1, lead=lead(), history=[], settings=settings)
+    assert date(2026, 7, 15) in live.search_todays() and len(live.search_todays()) == 2
+    sandbox_tools = SandboxTools(WorkflowTrace("test", "test"), lead=lead(), history=[],
+                                 practice_id=1, now_local=NOW_NOV4)
+    assert sandbox_tools.search_todays() == {TODAY_NOV4}
+
+
+ASK_FIRST = "Thanks! What's your first name?"
+
+
+@pytest.mark.parametrize("turns,given,expected", [
+    (history(("elliot", ASK_FIRST), ("patient", "Dana")), None, "Dana"),
+    (history(("elliot", ASK_FIRST), ("patient", "it's dana")), None, "Dana"),
+    (history(("elliot", ASK_FIRST), ("patient", "Dana Quill")), None, "Dana"),
+    (history(("elliot", ASK_FIRST), ("patient", "Dana")), "Dana", "Dana"),
+    # x-04: the last name passed as first_name, with the answer in the chat: the answer.
+    (history(("elliot", ASK_FIRST), ("patient", "Dana")), "Quill", "Dana"),
+    # Not an answer to the question, the last name, a yes, a sentence: none.
+    (history(("elliot", "What's your last name?"), ("patient", "Quill")), "Quill", ""),
+    (history(("elliot", ASK_FIRST), ("patient", "Quill")), None, ""),
+    (history(("elliot", ASK_FIRST), ("patient", "yes")), None, ""),
+    (history(("elliot", ASK_FIRST), ("patient", "why do you need that")), None, ""),
+    (history(("patient", "Dana")), None, ""),
+])
+def test_first_name_in_chat(turns, given, expected):
+    from rpt_agent.services.sms_agent_tools import first_name_in_chat
+
+    assert first_name_in_chat(lead(first_name="", last_name="Quill"), turns, given) == expected
+
+
+def card_tools(monkeypatch, view, turns):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    @contextmanager
+    def conn():
+        yield SimpleNamespace(execute=lambda *a, **k: SimpleNamespace(
+            fetchone=lambda: {"name": "Physical Therapy"}))
+
+    module = slot_booking_module()
+    monkeypatch.setattr(module, "open_slot", lambda *a, **k: {
+        "local_date": date(2026, 11, 3), "local_time": time(9, 0), "display_name": "Alan Rome"})
+    tools = SandboxTools(WorkflowTrace("test", "test"), lead=view, history=turns, practice_id=1,
+                         now_local=None, today=date(2026, 11, 3))
+    monkeypatch.setattr(tools, "_conn", conn)
+    monkeypatch.setattr(tools, "_context", lambda *a, **k: FakeContext())
+    return tools
+
+
+def test_no_first_name_on_file_asks_for_it_before_the_card(monkeypatch):
+    # x-04 (2026-11-03): MISSING_NAME came only after the yes to the card; Elliot then asked for
+    # the last name (on file). Now the card waits for the first name.
+    no_first = lead(first_name="", last_name="Quill")
+    picked = history(("elliot", "Fri Nov 6, 9:00 AM with Alan"), ("patient", "9am"),
+                     ("elliot", "To confirm it's you, what's your date of birth?"),
+                     ("patient", "3/14/1990"))
+    args = {"date": "2026-11-03", "time": "9:00 AM", "therapist": "Alan"}
+    result = call_tool(card_tools(monkeypatch, no_first, picked), "confirm_visit", args)
+    assert result.code == "MISSING_NAME" and not result.fixed_texts
+    assert "first name only" in result.output and "never ask for it" in result.output
+    # A first name the patient never wrote, or the last name, does not open the card.
+    for name in ("Jordan", "Quill"):
+        result = call_tool(card_tools(monkeypatch, no_first, picked), "confirm_visit",
+                           {**args, "first_name": name})
+        assert result.code == "MISSING_NAME"
+    named = [*picked, *history(("elliot", ASK_FIRST), ("patient", "Dana"))]
+    for extra in ({"first_name": "Dana"}, {}):
+        result = call_tool(card_tools(monkeypatch, no_first, named), "confirm_visit",
+                           {**args, **extra})
+        assert result.code == "CARD_SENT" and result.fixed_texts == [CARD]
+    # A first name on file, or someone new: no name step.
+    for view in (lead(), lead(is_new_person=True, first_name="", last_name="")):
+        result = call_tool(card_tools(monkeypatch, view, picked), "confirm_visit", args)
+        assert result.code == "CARD_SENT"
+
+
+def test_booking_names_use_the_first_name_answer_when_the_model_passes_the_last_name():
+    from rpt_agent.services.sms_agent_tools import booking_names
+
+    turns = history(("elliot", ASK_FIRST), ("patient", "Dana"), ("elliot", CARD), ("patient", "yes"))
+    assert booking_names(lead(first_name="", last_name="Quill"), turns, "Quill", "Quill") == (
+        "Dana", "Quill")

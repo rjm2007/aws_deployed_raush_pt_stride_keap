@@ -20,6 +20,9 @@ from .lead_review import SMS_FRONT_DESK_REASONS, TITLES
 from .review import BOOKABLE_REVIEW_SQL
 
 HISTORY_LIMIT = 20
+# Texts read for the birthday step only (code, never the model): a date of birth given more than
+# HISTORY_LIMIT texts ago still counts, so it is never asked again (owner, 2026-11-03).
+BIRTHDAY_HISTORY_LIMIT = 200
 CALL_LIMIT = 3
 SUMMARY_CHARS = 200
 MEDIA_ONLY = "(sent a picture or file, no text)"
@@ -69,6 +72,8 @@ class LiveContext:
     timezone: str
     services: str = ""          # every service we book ("Pelvic Health, Physical Therapy")
     service_aliases: str = ""   # everyday words per service ("Physical Therapy = ortho, PT")
+    # The longer history the birthday step reads (BIRTHDAY_HISTORY_LIMIT); None = `history`.
+    birthday_history: list[Turn] | None = None
 
 
 # --- helpers ---------------------------------------------------------------------------------------
@@ -185,6 +190,8 @@ def load_live(conn, lead_id: str, *, now: datetime | None = None,
         holidays=row["holidays"] or [], booking_link=row["booking_link_url"],
         timezone=row["clinic_tz"] or str(CLINIC_TZ),
         services=case.get("case_types_offered", ""), service_aliases=case.get("service_aliases", ""),
+        birthday_history=text_history(conn, lead_id, BIRTHDAY_HISTORY_LIMIT,
+                                      up_to_inbound_id=up_to_inbound_id),
     )
 
 
@@ -251,8 +258,13 @@ def text_history(conn, lead_id: str, limit: int = HISTORY_LIMIT, *,
 
 def context_block(lead: LeadView, *, now: datetime, front_desk_open: bool,
                   booking_link: str | None, front_desk_phone: str, timezone: str | None = None,
-                  services: str = "", service_aliases: str = "") -> str:
-    """The developer "Context" message (built by code, changes every reply)."""
+                  services: str = "", service_aliases: str = "",
+                  birthday_confirmed: str | None = None) -> str:
+    """The developer "Context" message (built by code, changes every reply).
+
+    `birthday_confirmed`: sms_agent_birthday.context_line for this chat (None = not computed: "no").
+    The date of birth on file is never shown (owner, 2026-11-03: Elliot never reads it to the
+    patient; check_birthday compares in code)."""
     tz = ZoneInfo(timezone or str(CLINIC_TZ))
     local = now.astimezone(tz)
     tomorrow = local.date() + timedelta(days=1)
@@ -272,11 +284,13 @@ def context_block(lead: LeadView, *, now: datetime, front_desk_open: bool,
     else:
         lines.append("- Person texting: a patient with a referral on file")
     name = " ".join(part for part in (lead.first_name, lead.last_name) if part)
+    if name and not lead.is_new_person and not (lead.first_name or "").strip():
+        # x-04 (2026-11-03): "Quill" alone read as a first name; the model asked for the last name.
+        name += " (last name only: no first name on file)"
     lines.append(f"- Name on file: {name or 'unknown'}")
-    if lead.date_of_birth:
-        dob = lead.date_of_birth
-        lines.append(f"- Birthday on file (only to confirm identity before booking): "
-                     f"{dob:%B} {dob.day}, {dob.year}")
+    if lead.date_of_birth and not lead.is_new_person:
+        lines.append("- Birthday on file: yes (check_birthday compares; you never see or say it)")
+    lines.append(f"- Date of birth confirmed in this chat: {birthday_confirmed or 'no'}")
     lines += [
         f"- Clinic: {lead.clinic or 'unknown'}",
         f"- Service: {lead.service or 'unknown'}",

@@ -37,9 +37,9 @@ def _objects(schema):
             yield from _objects(value)
 
 
-def test_tools_are_the_eight_tools_the_code_dispatches():
+def test_tools_are_the_nine_tools_the_code_dispatches():
     assert set(BY_NAME) == set(KINDS)
-    assert len(TOOLS) == len(BY_NAME) == 8
+    assert len(TOOLS) == len(BY_NAME) == 9
 
 
 @pytest.mark.parametrize("name", sorted(KINDS))
@@ -135,15 +135,28 @@ def test_examples_never_write_a_card_a_hold_or_a_booking():
         assert "[" not in sent.split("Patient:", 1)[-1].replace("[Front desk phone]", "")
 
 
-def test_no_example_answers_the_birthday_yes_with_silence():
-    # book-01, ls-02, book-06, x-01 ...: NO_REPLY after "yes" to the birthday check, card never sent.
+def test_examples_never_read_a_birthday_to_the_patient_and_check_it_in_code():
+    # Owner, 2026-11-03 (test chat looped on "is your birthday November 1?"): the patient types
+    # their date of birth; check_birthday compares; confirm_visit follows in the same turn.
+    assert "is your birthday" not in PROMPT
+    assert "To confirm it's you, what's your date of birth?" in PROMPT
+    checked = 0
     for example in EXAMPLES:
         lines = example.splitlines()
         for i, line in enumerate(lines):
-            if "is your birthday" in line and line.startswith("Text:"):
-                answer = lines[i + 1]
-                assert answer.startswith("Patient:")
-                assert lines[i + 2].startswith("Tool: confirm_visit"), example
+            if line.startswith("Tool: check_birthday") and line.endswith(
+                    ("-> MATCH", "-> NEW", "-> CONFIRMED_DIFFERENT")):
+                checked += 1
+                assert lines[i + 1].startswith("Tool: confirm_visit"), example
+    assert checked >= 3
+
+
+def test_prompt_never_asks_for_the_date_of_birth_again_once_confirmed():
+    flat = " ".join(PROMPT.split())
+    assert "Date of birth confirmed in this chat: yes = the identity step is done" in flat
+    assert "Never ask for the date of birth again" in flat
+    assert "Never send the same card twice in a row" in flat
+    assert "HANDED_OFF from book_visit = it failed twice for the same reason" in flat
 
 
 def test_every_example_tool_line_names_a_real_tool():

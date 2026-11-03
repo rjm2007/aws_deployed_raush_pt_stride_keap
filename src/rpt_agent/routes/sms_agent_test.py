@@ -12,7 +12,7 @@ import importlib
 import threading
 import time
 from collections import deque
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -178,8 +178,12 @@ class SandboxSetupIn(BaseModel):
     @field_validator("date_of_birth")
     @classmethod
     def sensible_birthday(cls, value: date | None) -> date | None:
-        if value is not None and not date(1900, 1, 1) <= value <= datetime.now(UTC).date():
-            raise ValueError("date_of_birth must be between 1900 and today")
+        # At least a year back (owner, 2026-11-03): a test lead born "2026-11-01" could never be
+        # booked, and Elliot looped asking for the year. The same rule as check_birthday.
+        if value is not None and not (date(1900, 1, 1) <= value
+                                      and _birthday().possible(value, _birthday().real_today())):
+            raise ValueError("the birthday must be a real date of birth, at least 1 year ago "
+                             "(and after 1900)")
         return value
 
     @field_validator("model")
@@ -244,6 +248,11 @@ class ReplyResponse(BaseModel):
     no_reply: bool
     model: str
     ms: int
+
+
+def _birthday():
+    return importlib.import_module(
+        f"{__package__.rsplit('.', 1)[0]}.services.sms_agent_birthday")
 
 
 def _setup_extras():

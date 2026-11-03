@@ -138,8 +138,28 @@
   },
   {
     "type": "function",
+    "name": "check_birthday",
+    "description": "Checks the date of birth the patient typed against our records (the identity step before the card). Use it in the turn they send their date of birth, with their words as written (or YYYY-MM-DD). Never use it when Context says Date of birth confirmed in this chat: yes. You never see the date on file: never say a date of birth, month, day or year to them. Reply codes: MATCH = it matches; identity done: call confirm_visit now for the time they picked. NEW = noted (no date on file, or someone new); identity done: confirm_visit now (for someone new, once you have their name, clinic and service). CONFIRMED_DIFFERENT = they confirmed a date that differs from our records; we use theirs and staff will see it; identity done: confirm_visit now, say nothing about our records. DIFFERENT = a real date, but not the one on file: ask them once to double-check it, with the words the reply gives; never hint at the date on file. NEED_YEAR = no year: ask once for the year. NOT_POSSIBLE = in the future, less than a year ago or over 120 years ago: ask them kindly to check it and type it again. UNREADABLE = ask them to type it like 3/14/1988.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "date_of_birth": {
+          "type": "string",
+          "description": "The patient's date of birth exactly as they typed it in their latest text ('march 14 1988', '3/14/88'), or as YYYY-MM-DD.",
+          "pattern": "^\\S.*$"
+        }
+      },
+      "required": [
+        "date_of_birth"
+      ],
+      "additionalProperties": false
+    },
+    "strict": true
+  },
+  {
+    "type": "function",
     "name": "confirm_visit",
-    "description": "Checks that a time the patient picked is still open and sends them the visit card (day, time, therapist, clinic, 'Reply YES and I'll book it'). This tool is the only way a card is sent: never write a card, a read-back of the visit or 'I'm holding' yourself. Call it in the same turn the identity step is done: the patient's yes to the birthday check (or their corrected or given date of birth, with a year) right after they picked a time, or at once on a pick when the identity step is already done in this conversation. Also call it when book_visit replied NOT_CONFIRMED, or again for the same time when they answered the card with only a reaction, 'maybe' or a question. Book only after this card. Reply codes: CARD_SENT = the card goes out after anything you write; your final answer is NO_REPLY or one short line (a date of birth read-back or an answer), never a question and never the card's details; a date of birth read-back is month and day only, never the year. TAKEN or NOT_AVAILABLE = that time is gone; say so and offer the other times listed. ALREADY_BOOKED = they already have a visit; never book again. REVIEW_OPEN = use hand_off with reason booking_problem. WHICH_THERAPIST = ask the patient which of the therapists it names they mean. NO_SUCH_THERAPIST = name the therapists it lists and offer to search without one. CASE_CHANGE = another service than their referral: report_outcome case_change, then hand_off different_case; never book it. BAD_DATE or BAD_TIME = send the date and time exactly as the find_times reply wrote them.",
+    "description": "Checks that a time the patient picked is still open and sends them the visit card (day, time, therapist, clinic, 'Reply YES and I'll book it'). This tool is the only way a card is sent: never write a card, a read-back of the visit or 'I'm holding' yourself. Call it in the same turn the identity step is done (check_birthday replied MATCH, NEW or CONFIRMED_DIFFERENT) right after they picked a time, or at once on a pick when Context says Date of birth confirmed in this chat: yes. Also call it when book_visit replied NOT_CONFIRMED, or for the same time after a new step (their first name, their date of birth) when the card is no longer your latest text. Book only after this card. Reply codes: CARD_SENT = the card goes out after anything you write; your final answer is NO_REPLY or one short line (a thank-you for their date of birth, or an answer), never a question, never the card's details and never their date of birth. MISSING_NAME = no card was sent: we have no first name on file; ask once \"What's your first name?\" (never the last name: it is on file), then confirm_visit again for the same time with first_name. NEED_BIRTH_DATE = no card was sent: do what it says (ask once for their date of birth, or once to double-check it), then check_birthday. CARD_ALREADY_SENT = the same card is already your latest text: book_visit on a clear yes, else one short line or NO_REPLY; never ask for anything the card already covers. TAKEN or NOT_AVAILABLE = that time is gone; say so and offer the other times listed. ALREADY_BOOKED = they already have a visit; never book again. REVIEW_OPEN = use hand_off with reason booking_problem. WHICH_THERAPIST = ask the patient which of the therapists it names they mean. NO_SUCH_THERAPIST = name the therapists it lists and offer to search without one. CASE_CHANGE = another service than their referral: report_outcome case_change, then hand_off different_case; never book it. BAD_DATE or BAD_TIME = send the date and time exactly as the find_times reply wrote them.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -182,6 +202,13 @@
             null
           ],
           "description": "Only for someone new: the same service you searched with. Always null for a patient with a referral."
+        },
+        "first_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Only when Name on file has no first name: the first name the patient wrote in this chat (never their last name, which is on file). Otherwise null."
         }
       },
       "required": [
@@ -189,7 +216,8 @@
         "time",
         "therapist",
         "clinic",
-        "service"
+        "service",
+        "first_name"
       ],
       "additionalProperties": false
     },
@@ -198,7 +226,7 @@
   {
     "type": "function",
     "name": "book_visit",
-    "description": "Books the Initial Evaluation. Use it when the patient's newest text is a clear yes ('yes', 'yep', 'book it', 'sounds good') to the visit card, and the card is your latest text in the conversation (it starts 'Great choice! Here's your visit:' and ends 'Reply YES and I'll book it.'; confirm_visit sent it). Call it in that same turn, with exactly the card's date, time, therapist and clinic. Without this tool nothing is booked: never tell the patient they are booked unless this tool replied BOOKED or ALREADY_BOOKED. Our system refuses any other booking (a yes after any other text from you gets NOT_CONFIRMED). Reply codes: BOOKED = done, and our booked text (details and paperwork) is on its way, so never write it yourself. ALREADY_BOOKED = they already have a visit: say only the day, time and therapist the reply gives (if it gives none, use hand_off with reason booking_problem); never book again. TAKEN or NOT_AVAILABLE = the time went; say so and offer the other times listed, then a new card for their new pick. NOT_CONFIRMED = no matching card answered yet; call confirm_visit for that time. IN_PROGRESS ('wait a moment') = an earlier booking is still finishing; call book_visit once more with the same details, and write nothing about waiting. IN_PROGRESS again, ERROR, or an error after IN_PROGRESS = not booked: use hand_off with reason booking_problem and say our front desk will finish setting up the visit; never say it is booked and never offer times again. PATIENT_EXISTS, UNCONFIRMED or FOLLOW_UP = not booked, and our front desk text was already sent; say only that our front desk will finish setting up the visit. REVIEW_OPEN = use hand_off with reason booking_problem. CASE_CHANGE = another service than their referral: report_outcome case_change, then hand_off different_case; never book it. MISSING_NAME = we have no first name: ask once for their first name (never the last name); with their answer call confirm_visit for the same time, then book_visit after their yes with that first_name. BAD_DATE_OF_BIRTH or BAD_NAME = ask for or confirm that detail, then try again.",
+    "description": "Books the Initial Evaluation. Use it when the patient's newest text is a clear yes ('yes', 'yep', 'book it', 'sounds good') to the visit card, and the card is your latest text in the conversation (it starts 'Great choice! Here's your visit:' and ends 'Reply YES and I'll book it.'; confirm_visit sent it). Call it in that same turn, with exactly the card's date, time, therapist and clinic. Without this tool nothing is booked: never tell the patient they are booked unless this tool replied BOOKED or ALREADY_BOOKED. Our system refuses any other booking (a yes after any other text from you gets NOT_CONFIRMED). Reply codes: BOOKED = done, and our booked text (details and paperwork) is on its way, so never write it yourself. ALREADY_BOOKED = they already have a visit: say only the day, time and therapist the reply gives (if it gives none, use hand_off with reason booking_problem); never book again. TAKEN or NOT_AVAILABLE = the time went; say so and offer the other times listed, then a new card for their new pick. NOT_CONFIRMED = no matching card answered yet; call confirm_visit for that time. IN_PROGRESS ('wait a moment') = an earlier booking is still finishing; call book_visit once more with the same details, and write nothing about waiting. IN_PROGRESS again, ERROR, or an error after IN_PROGRESS = not booked: use hand_off with reason booking_problem and say our front desk will finish setting up the visit; never say it is booked and never offer times again. PATIENT_EXISTS, UNCONFIRMED or FOLLOW_UP = not booked, and our front desk text was already sent; say only that our front desk will finish setting up the visit. REVIEW_OPEN = use hand_off with reason booking_problem. CASE_CHANGE = another service than their referral: report_outcome case_change, then hand_off different_case; never book it. MISSING_NAME = we have no first name: ask once for their first name only (never the last name: it is on file); with their answer call confirm_visit for the same time with first_name, then book_visit after their yes with that first_name. BAD_DATE_OF_BIRTH or BAD_NAME = ask for that detail once, then check_birthday (for a date of birth) and confirm_visit again. HANDED_OFF = booking failed twice for the same reason and our front desk text was sent: ask nothing more about the booking; NO_REPLY or one short line.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -229,7 +257,7 @@
         },
         "date_of_birth": {
           "type": "string",
-          "description": "YYYY-MM-DD: the Birthday on file once the patient confirmed it, or the full date the patient gave you (never guess a year).",
+          "description": "YYYY-MM-DD: the date of birth the patient typed in this chat (check_birthday checked it). Our system books with the date confirmed in this chat, whatever is passed; never guess a year.",
           "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
         },
         "clinic": {

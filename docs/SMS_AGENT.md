@@ -4,6 +4,7 @@ A patient texts the clinic number; Elliot answers by text, answers questions and
 Evaluation with the same business rules as voice Elliot, but written for text. Plan, decisions and owner
 questions: `../../SMS-Agent-Plan.md` (workspace `demo/SMS-Agent-Plan.md`). Demo only; production later.
 
+Status (2026-11-03): birthday step rebuilt (below, "Birthday step"), not committed or deployed.
 Status (2026-11-02): built and integrated on branch `feature/own-postgres`, not committed, not deployed,
 off by default (`SMS_AGENT_ENABLED`, `SMS_AGENT_TEST_ENABLED`). Unit and local-Postgres tests pass; the
 prompt has not been run against a real model yet (next: scenario tests in the test chat). This file is the
@@ -16,9 +17,9 @@ changes.
 | --- | --- |
 | Settings, dependency, entry point, schema | `config.py` (`SMS_AGENT_*`, `CLINIC_FRONT_DESK_PHONE`), `pyproject.toml` (`openai`, `rpt-sms-agent-worker`), `supabase/migrations/054_sms_agent.sql` — done, do not change without need |
 | Prompt and tool descriptions | `config/sms_agent_prompt.md`, `config/sms_agent_tools.json` |
-| Agent core | `services/sms_agent.py` (loop), `services/sms_agent_context.py` (lead view + history), `services/sms_agent_tools.py` (live + sandbox tools), `services/sms_agent_texts.py` (editable texts), small changes in `services/slot_booking.py`, `services/lead_status.py`, `services/lead_review.py` |
+| Agent core | `services/sms_agent.py` (loop), `services/sms_agent_context.py` (lead view + history), `services/sms_agent_tools.py` (live + sandbox tools), `services/sms_agent_birthday.py` (birthday step, 2026-11-03), `services/sms_agent_texts.py` (editable texts), small changes in `services/slot_booking.py`, `services/lead_status.py`, `services/lead_review.py` |
 | Inbound + worker | `routes/twilio.py`, `services/sms_inbound.py` (queue + "should we reply"), `sms_agent_worker.py`, `docker-compose*.yml`, `sender` on existing SMS inserts (`worker.py`, `routes/dashboard.py` manual SMS, `services/delivery.py`) |
-| Test chat tab | `routes/sms_agent_test.py` (+ `api.py`, `routes/__init__.py`), `services/sms_agent_sandbox_setup.py` (booked visit + open review), frontend `../rpt_frontend` page; real-model scenario run: workspace `test/sms-agent-eval-2026-11-02/` (`run_eval.py`, `scenarios.json`; the AI patient gpt-5.4-mini is costed apart, `patient_sim`; each reply gets the earlier replies' actions as `prior_actions` like the tab; harness-only flags `force_booking_failure`, `slot_gone`, `slot_taken_at_booking` (after the card, its slot is marked booked in the local DB so `book_visit` gets TAKEN: book-09), expect `booked_clinic` (np-03: no pelvic therapist at Dana Point, so the patient picks Laguna Niguel); x-04's AI patient has a first name in its persona (Dana) while the lead's first name on file stays empty (round 3: with none it answered with its last name)) |
+| Test chat tab | `routes/sms_agent_test.py` (+ `api.py`, `routes/__init__.py`), `services/sms_agent_sandbox_setup.py` (booked visit + open review), frontend `../rpt_frontend` page; real-model scenario run: workspace `test/sms-agent-eval-2026-11-02/` (`run_eval.py`, `scenarios.json`; the AI patient gpt-5.4-mini is costed apart, `patient_sim`; each reply gets the earlier replies' actions as `prior_actions` like the tab; a scenario with `patient.script` sends those fixed texts with no AI patient (dob-01) and can check `max_cards` / `must_book` / `dob_asks`; harness-only flags `force_booking_failure`, `slot_gone`, `slot_taken_at_booking` (after the card, its slot is marked booked in the local DB so `book_visit` gets TAKEN: book-09), expect `booked_clinic` (np-03: no pelvic therapist at Dana Point, so the patient picks Laguna Niguel); x-04's AI patient has a first name in its persona (Dana) while the lead's first name on file stays empty (round 3: with none it answered with its last name)) |
 
 ## Flow (real texts, phase 1)
 
@@ -70,7 +71,7 @@ class Turn:
 
 @dataclass
 class AgentAction:                   # shown in the test tab; kinds below
-    kind: str                        # 'find_times' | 'list_therapists' | 'confirm_visit' | 'book' | 'report' | 'hand_off' | 'emergency' | 'fixed_text'
+    kind: str                        # 'find_times' | 'list_therapists' | 'check_birthday' | 'confirm_visit' | 'book' | 'report' | 'hand_off' | 'emergency' | 'fixed_text'
     summary: str                     # plain words, e.g. "Would book Tue Nov 3 9:00 AM with Alan"
     result_code: str                 # first word of the tool reply (OPENINGS, BOOKED, ...), except
                                      # ToolResult.action_code: REPORTED_<STATUS> (REPORTED_CASE_CHANGE,
@@ -120,7 +121,8 @@ clinic facts that change rarely stay in the prompt), then the history as user (p
 (elliot) turns; cadence and staff texts are given as labelled context lines, not as assistant turns.
 Patient and Elliot turns start with their clinic time, `[Mon Nov 2, 3:14 PM] `, so old texts read as old;
 a copied stamp is removed before sending. Context labels (the prompt relies on them; `tests/test_sms_agent_config.py` checks the list): Now, Tomorrow, Front desk open
-now, Front desk phone, Booking link, Person texting, Name on file, Birthday on file, Clinic, Service,
+now, Front desk phone, Booking link, Person texting, Name on file, Birthday on file ("yes" only, never the
+date, since 2026-11-03), Date of birth confirmed in this chat (below, "Birthday step"), Clinic, Service,
 Referral is for, Services we book, Other words for services, Lead status, Cadence, Needs review, Booked
 visit, Recent calls. "Needs review" is `yes (<reason>)`, `no`, or `front desk only (<reasons>; booking by text still
 works)` when every open review is Elliot's own front-desk card that allows booking (see Rules); the Lead status
@@ -135,7 +137,9 @@ Nov 5 (the patient said tomorrow). Name that day in your text ("Thu Nov 5"); nev
 bracket only when `search_when` moved the day; `sms_agent_tools.name_search_day`). The code word stays
 first (the prompt and the side panel branch on it). The day is read from the reply's own "Calendar today"
 note (`calendar_today`, the pinned demo calendar included), so no extra database read; without that note
-the reply still says "Searched tomorrow". Other `when` values and other codes are left as they were.
+the reply still says "Searched tomorrow". Other `when` values and other codes are left as they were. Eval
+2026-11-03 (book-12 again: "tmrw aftrnoon" came as `when="specific_date"` with today's date): a
+`specific_date` equal to the calendar's today counts as a search for today (`search_todays()`).
 The model's final answer `NO_REPLY` (or a copy like "(empty answer)") = no text, but only when the code
 guards below allow it.
 
@@ -167,6 +171,9 @@ a fixed text from a tool):
   question (`finished_before`: the booked, front desk, English-only or emergency text, the opt-out
   line, or a lead that is booked / callback / link sent / declined / in a review that stops booking).
   Else one re-run with the note "the patient expects a reply; continue the step you were on".
+- **Reaction to the card** (2026-11-03): an empty answer is also fine when Elliot's last text is the card and
+  the patient's latest text is a reaction to it ('Liked "..."', 'Reacted 👍 to "..."', `reacted_to_card`), or
+  when confirm_visit replied CARD_ALREADY_SENT in this run.
 - **Birth date** (round 2, book-11 "Got it, Aug 23, 1985."): a model text holding the patient's full date
   of birth with the year (the one on file, or a date at least a year back in the patient's own texts, as
   8/23/1985, 08-23-85, 1985-08-23, Aug 23, 1985, 23 August 1985; `writes_birth_date`) is dropped and re-run
@@ -209,6 +216,7 @@ a fixed text from a tool):
 | `hand_off` | `reason` (insurance, different_case, wants_person, other_language, unknown_question, booking_problem, other), `notes` | opens a Needs Review card (new code `sms_front_desk`, group call, source `text`, choices Front desk will handle / Continue cadence); no second card when this job already opened one for the same thing (`different_case` after `report_outcome case_change`, `booking_problem` after a failed booking); reply = `sms_agent.front_desk` (or `english_only`) word for word. insurance, wants_person, other_language, unknown_question and other do not stop booking (Rules) | "Would open a Needs Review card: ..." |
 | `flag_emergency` | — | reply = the fixed emergency text (code, not editable): 911, and 988 (Suicide and Crisis Lifeline) for thoughts of harming themselves; + Needs Review card (`sms_front_desk`, reason emergency: stops booking) | "Would flag an emergency" |
 | `send_intro` | — | reply = `sms_agent.intro` (`new_person_intro` for a new person) word for word | same |
+| `check_birthday` | `date_of_birth` (the patient's words as typed, or YYYY-MM-DD) | `sms_agent_birthday.check` (code, no model, no database): MATCH / NEW / CONFIRMED_DIFFERENT / DIFFERENT / NEED_YEAR / NOT_POSSIBLE / UNREADABLE (below) | same |
 
 `service` (find_times, confirm_visit, book_visit; strict, nullable, enum "Physical Therapy", "Physical
 Therapy - Pelvic", null): only for someone new who chose a service; always null for a lead with a referral
@@ -232,7 +240,8 @@ callback hours, else 8:00 AM (holidays listed with names, cb-04); "can I see Ala
 yes / sure / any after the day question or a therapist list searches when=earliest at once (book-06); a date
 of birth is only ever written as month and day (book-11); NO_CLINICIANS with "Offered at" offers those clinics
 in one line and searches again (no hand-off), without it hand_off booking_problem (np-03); MISSING_NAME on
-book_visit asks for the first name once, then book_visit again.
+book_visit asks for the first name once, then book_visit again. (Since 2026-11-03 MISSING_NAME comes from
+confirm_visit, before the card: see Birthday step, "Fixes after that eval".)
 
 Prompt fixes after eval round 3 (2026-11-02, `results-gpt-5.5-round3.json`, also in
 `tests/test_sms_agent_prompt_round2.py`): MISSING_NAME asks for the first name only (never the last name, on
@@ -282,6 +291,120 @@ agent core sets it (`ToolResult.reason` -> `AgentAction.reason`, on HANDED_OFF, 
 ALREADY_HANDED_OFF), and `earlier_in_chat` turns a known reason into `hand_off:<reason>`, so the test chat
 compares the reason like live (insurance then wants_person is a new hand-off). An action without a reason
 (or an unknown one) still counts by its kind.
+
+## Birthday step (owner, 2026-11-03)
+
+Test chat that started it (demo booking calendar pinned to 2026-07-15, test lead born 2026-11-01): "is
+your birthday November 1?" -> "yep" -> card -> "yes" -> "Could you send your date of birth with the
+month, day and year?" -> "nov 1, 2026" -> "Got it, Nov 1." + the same card -> "yes" -> "Could you send
+your date of birth again with the year?" ... never booked. Cause: `slot_booking.validate_patient` compared
+the birthday with the pinned calendar's today (2026-11-01 > 2026-07-15 = BAD_DATE_OF_BIRTH "not
+possible"), and the prompt let Elliot ask again and send the same card again.
+
+Owner decision: Elliot asks once for the complete date of birth ("To confirm it's you, what's your date
+of birth?"), never reads the date on file, and once a valid date was given in the chat never asks again.
+
+- `services/sms_agent_birthday.py` (deterministic): `parse_birth_date` reads the first date in the
+  patient's words: 3/14/1988, 03-14-1988, 3.14.88, March 14 1988, Mar 14, 1988, March 14th, 1988,
+  14 March 1988, 1988-03-14, mar 14 '88; month first, a first number over 12 is the day; a 2-digit year
+  is 20xx only when that is at least a year back, else 19xx, except last year to 2 years ahead ("26",
+  "27" in 2026): a visit day like "can I come 11/20/26?", read as no date (review: it was 1926 and
+  settled the date of birth). A month and day alone = need year. Times
+  are never years ("Nov 20 10:30", "Nov 20, 10am"). `possible`: at least 1 and at most 120 years old,
+  against the REAL clinic date (`real_today`), never `BOOKING_TODAY_OVERRIDE`.
+- `check_birthday` codes: MATCH (= on file), NEW (no date on file / someone new), DIFFERENT (a possible
+  date that is not on file: Elliot asks once, "Could you double-check that date of birth for me?"),
+  CONFIRMED_DIFFERENT (settled after the double-check: the patient's own date is used, like voice; the
+  booking summary says it differs and `appointments.patient_dob` keeps it for staff), NEED_YEAR,
+  NOT_POSSIBLE, UNREADABLE (no date, or a date the model worked out that the patient never typed in a
+  readable form). Tool replies never hold the date on file.
+- `birthday_state(lead, history)` reads only the patient's own texts (live and test chat alike), and only
+  a date given as a date of birth (`given_as_birth_date`, review 2026-11-03: "I hurt my knee on 3/2/2024"
+  settled someone new's date of birth and they were never asked): the text names it (birthday, born,
+  DOB, birth...), our latest text before it asked about it, or the text has at most 3 other words
+  ("Ana Ruiz 8/23/1985"). check_birthday on any other date replies UNREADABLE with the DOB question. A
+  date equal to the file (or any possible date when none is on file) confirms; a different one is pending
+  until the patient types it again, says yes right after the double-check text, or gives a second date
+  (that one is used). A later explicit correction replaces a confirmed date. `run_agent` writes
+  "Date of birth confirmed in this chat: yes (never ask for it again)" / "no" / "not yet: ... ask once to
+  double-check it" (`context_line`; through the tools' `birthday_state`, so Context and booking agree).
+  Live gives the model the last 20 texts, but the birthday step reads the last 200
+  (`BIRTHDAY_HISTORY_LIMIT`, `LiveContext.birthday_history` -> `LiveTools(birthday_history=...)`), so a
+  date of birth given further back is still never asked again (review 2026-11-03).
+- Year sent alone (eval x-07, 2026-11-03: "June 3", "Could you send the year too?", "1989" was UNREADABLE
+  and the whole question came again): a patient text that is only a year ("1989", "'89", "it's 89")
+  right after their month-and-day text, when our text before it asked about the year or the date of
+  birth, is that full date (`month_day_only` + `year_for` in `birthday_state`). A "10" after "nov 20"
+  answering "what time?" is not. `check_birthday` with only the year (or the joined date) then gives
+  MATCH / NEW like a full date.
+- Never asked again, in code (review 2026-11-03): when the chat has a confirmed date of birth, a model
+  text that asks for one (`asks_birth_date`: date of birth / birthday / DOB / born with a "?" or send /
+  type / text / share / tell / confirm / what's / give, in one sentence) is dropped and re-run with
+  `ASKED_BIRTH_DATE_NOTE`; second miss: `error="guard:asked_birth_date"`. Checked right after the birth
+  date guard.
+- `confirm_visit` sends no card until the chat has a confirmed date of birth (`NEED_BIRTH_DATE`, with the
+  double-check wording when one is pending). `book_visit` books with the confirmed date whatever the
+  model passes (else the model's, else the one on file).
+- Booking engine: `slot_booking.birth_date_today(context)` = the real clinic date; `book_slot` (voice and
+  text) checks the date of birth against it, so BAD_DATE_OF_BIRTH is only a truly impossible date (the
+  future, or over 120 years). The same fix is right for voice: a date of birth is a real-world date and
+  production has no pinned day (no change there). The sandbox checks the same way.
+- Never the same card twice in a row: when Elliot's latest text is that same card, `confirm_visit` replies
+  `CARD_ALREADY_SENT` (nothing sent). A new step in between (an answer, a name question) allows it again.
+  A reaction to the card gets NO_REPLY.
+- Loop stop: book_visit refusals BAD_DATE_OF_BIRTH, NOT_CONFIRMED, MISSING_NAME, BAD_NAME, BAD_EMAIL
+  (`sms_agent_tools.REPEATED_FAILURES`) are counted per code over this reply and earlier in the chat (live:
+  `sms_agent_actions` rows `tool='book'` for the lead in the last 24 h; test chat: `prior_actions` with
+  kind `book`, `EarlierInChat.failures`). The second one for the same code does `hand_off booking_problem`
+  in code (front desk text + card, booking paused) and replies `HANDED_OFF` (side panel
+  `HANDED_OFF_PAUSED`, reason booking_problem; ALREADY_HANDED_OFF when the front desk already has it). Log
+  `sms_agent_booking_gave_up` (code only).
+- Test chat setup: the birthday must be at least 1 year back (route 422 "at least 1 year ago", tab
+  `setupProblems` / `latestBirthday`, date input `max`).
+- Tests: `tests/test_sms_agent_birthday.py` (parser, 2-digit visit years, dates not given as a date of
+  birth, a year sent alone after the month and day, state, codes, tools, loop, never asked again, live reads further back, engine date),
+  `tests/test_sms_agent_integration.py` (the test chat end to end on the pinned calendar, engine accepts a
+  birthday after the pinned day, live hand-off after a stored failure, live double-checked date books and
+  the card is not sent twice, a date of birth more than 20 texts back still counts), route and tab tests.
+- Eval (2026-11-03, gpt-5.5, `test/sms-agent-eval-2026-11-02/results-gpt-5.5-dob.json`): the 22
+  scenarios that reach the birthday step plus dob-01 (the reported loop: "nov 1, 2026" then the real
+  date) and dob-02 (the date without a year, then with it). Existing patients: asked once, "To confirm
+  it's you, what's your date of birth?", never read back, never asked again, booked. The model often
+  goes straight from the typed date to `confirm_visit` without `check_birthday`: safe, since the card
+  and the booking use `birthday_state` from the patient's texts.
+- Fixes after that eval (2026-11-03, 4 failures; tests in brackets):
+  - np-03 (someone new wrote "I'd like to book. Brooke Tanner, 02/09/1993"; the date was not counted and
+    Elliot asked for it again, against the owner rule): `given_as_birth_date` also counts a possible full
+    date that can only be a date of birth, unless the text is about something that happened (hurt,
+    injury, surgery, accident, fell, broke, sprain, tore, since, happened, operation, diagnosed:
+    `_EVENT_WORDS`): one at least 10 years back (`ONLY_BIRTH_YEARS`), one right after a name (the name on
+    file or a capitalised first + last name, not a month / weekday / "Labor Day": `next_to_name`), or one
+    sent while an earlier date of birth question is still unanswered (`asked_before`). Still not counted:
+    "can I come 11/20/26?", "I hurt my knee on 3/2/2024", "after Labor Day 9/1/2025"
+    (`test_a_date_that_can_only_be_a_date_of_birth_counts`, `test_np03_check_birthday_is_new_not_asked_again`).
+  - book-12 ("tmrw aftrnoon" searched as `when="specific_date"` with today's date): `search_when` also
+    moves a `specific_date` equal to the calendar's today (`search_todays()`: the clinic's real date and
+    the demo's pinned day; the test chat's clock) to "tomorrow", and the reply names the day like the
+    when="today" case (`test_search_when_a_specific_date_today_after_tmrw_is_tomorrow`,
+    `test_find_times_specific_date_today_after_tmrw_searches_tomorrow_and_names_it`).
+  - x-04 (no first name on file: after the yes Elliot asked "what's your last name?" and booked the last
+    name as first_name): the first name now comes BEFORE the card. `confirm_visit` replies MISSING_NAME
+    (`MISSING_FIRST_NAME_CARD`, "ask for their first name only", no card) until a first name is in the
+    chat: the model's `first_name` when the patient wrote it and it is not the last name, or the patient's
+    short answer right after "What's your first name?" (`first_name_in_chat`; also used by
+    `booking_names`, so the last name passed as first_name books the answer). `book_visit` keeps its own
+    MISSING_NAME guard. A model text asking for the last name when it is on file (`asks_last_name`) is
+    dropped and re-run once with `ASKED_LAST_NAME_NOTE`; second miss `error="guard:asked_last_name"`
+    (`test_no_first_name_on_file_asks_for_it_before_the_card`, `test_first_name_in_chat`,
+    `test_asks_last_name`, `test_a_lead_with_no_first_name_books_only_under_a_name_it_wrote`).
+  - dob-01 (the AI patient sent the date of birth before Elliot asked, so the loop was never tested):
+    `run_eval.py` takes a scripted patient (`"patient": {"script": [...]}`: fixed texts in order, no AI
+    patient) and optional checks `max_cards`, `must_book`, `dob_asks` ({turn: [min, max]} Elliot texts
+    asking for the date of birth). dob-01 now sends "Hi, I'd like to book my first visit, mornings
+    please", "the first one", "nov 1, 2026", "nov 1, 1990", "yes" and expects one card, a booking, the
+    question once after the pick and once after 2026, never after 1990. The prompt also says never to
+    remark on whether the date matches our records ("identity confirmed", "that matches")
+    (`test_no_remark_on_whether_the_date_of_birth_matches_the_file`).
 
 ## Editable texts (`services/sms_agent_texts.py`)
 
@@ -401,8 +524,8 @@ in words; nothing is trimmed.
 
 - Done 2026-11-02 (owner): Elliot's own front-desk card for insurance, parking, "call me" and the like no
   longer blocks booking by text (Rules).
-- Identity check by text names the month and day on file ("is your birthday March 14?"), like voice. Owner:
-  or ask for the date of birth and compare in code.
+- Done 2026-11-03 (owner): the identity check asks for the date of birth and compares it in code
+  (Birthday step). Voice still asks "is your birthday March 14?".
 - Done 2026-11-02 (owner): the emergency text also gives 988 (Rules).
 - `book_visit` could take only name and date of birth (code reads the rest from the card).
 - Reasoning effort / verbosity are not set on the model call; measure in the test chat (35 s overall,

@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date
+from datetime import date, datetime, timedelta
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
@@ -34,6 +35,9 @@ pytestmark = pytest.mark.integration
 TODAY = date(2026, 6, 15)  # pinned demo "today" (Monday)
 DAY1 = "2026-06-16"
 LINK = "https://book.example/rpt"
+# The identity step (owner, 2026-11-03): the patient types their date of birth before any card. The
+# test lead's date on file is 1990-04-26.
+DOB_TURN = Turn("patient", "my birthday is 4/26/1990", None)
 TOOL_SPECS = [{"type": "function", "name": "book_visit", "description": "", "parameters": {}}]
 
 
@@ -108,11 +112,13 @@ def env(monkeypatch):
             run_sync(self.trace, providers=self.stride, settings=self.settings(),
                      practice_id=practice)
 
-        def live(self, lead_id, history, job_id=1):
+        def live(self, lead_id, history, job_id=1, dob=True):
+            """`dob`: the chat starts with the patient's date of birth (the card needs it)."""
             with get_pool().connection() as c:
                 view = load_live(c, lead_id)
             return LiveTools(self.trace, lead_id=lead_id, job_id=job_id, lead=view.lead,
-                             history=history, settings=self.settings(),
+                             history=[DOB_TURN, *history] if dob else history,
+                             settings=self.settings(),
                              practice_id=practice, providers=self.stride)
 
         def one(self, sql, *args):
@@ -518,7 +524,7 @@ def test_reply_live_books_from_the_database_history(env):
     card = texts.confirm_card(date(2026, 6, 16), slot_booking.parse_clock("9:00"), "Thao Nguyen",
                               "Laguna Niguel")
     for direction, sender, body in (("outbound", "cadence", "Day 0 text"),
-                                    ("inbound", "patient", "can I do tue 9?"),
+                                    ("inbound", "patient", "can I do tue 9? bday 4/26/1990"),
                                     ("outbound", "ai", card),
                                     ("inbound", "patient", "yes please")):
         env.db.execute(
@@ -541,7 +547,10 @@ def test_reply_live_books_from_the_database_history(env):
     assert roles == ["developer", "developer", "developer", "user", "assistant", "user"]
     phone = env.one("select phone_e164 from leads where id=%s", lead_id)["phone_e164"]
     assert phone not in json.dumps(request["input"], default=str)
-    assert "April 26, 1990" in request["input"][1]["content"]
+    # The date on file is never shown to the model; the one typed in the chat is confirmed.
+    context = request["input"][1]["content"]
+    assert "1990" not in context and "Birthday on file: yes" in context
+    assert "Date of birth confirmed in this chat: yes" in context
     assert env.one("select booking_source from appointments where lead_id=%s",
                    lead_id)["booking_source"] == "sms"
 
@@ -570,6 +579,34 @@ def test_reply_live_reads_no_text_after_its_jobs_last_inbound(env):
     assert "first question" in sent and "late question" not in sent
 
 
+def test_reply_live_never_asks_again_for_a_date_of_birth_given_long_ago(env):
+    # Owner, 2026-11-03: once given in the chat, never asked again; the model sees 20 texts, the
+    # birthday step reads further back (BIRTHDAY_HISTORY_LIMIT).
+    lead_id = env.lead()
+    rows = [("inbound", "patient", "my birthday is 4/26/1990")]
+    rows += [("inbound", "patient", f"question {n}") if n % 2 == 0
+             else ("outbound", "ai", f"answer {n}") for n in range(24)]
+    for minutes, (direction, sender, body) in enumerate(rows):
+        env.db.execute(
+            "insert into sms_messages(lead_id,direction,sender,body,occurred_at,delivery_status) "
+            "values(%s,%s,%s,%s,now()-%s::interval,%s)",
+            (lead_id, direction, sender, body, f"{len(rows) - minutes} minutes",
+             "received" if direction == "inbound" else "sent"))
+    with get_pool().connection() as c:
+        view = load_live(c, lead_id)
+    assert len(view.history) == 20 and "4/26/1990" not in json.dumps([t.text for t in view.history])
+    assert view.birthday_history[0].text == "my birthday is 4/26/1990"
+    client = FakeClient(
+        {"output": [{"type": "message", "content": [{"type": "output_text",
+                                                     "text": "What's your date of birth?"}]}]},
+        {"output": [{"type": "message", "content": [{"type": "output_text", "text": "Sure."}]}]})
+    reply = reply_live(env.trace, lead_id=lead_id, job_id=6, settings=env.settings(),
+                       client=client, providers=env.stride)
+    assert reply.texts == ["Sure."]
+    context = client.responses.requests[0]["input"][1]["content"]
+    assert "Date of birth confirmed in this chat: yes" in context and "1990" not in context
+
+
 # --- sandbox ---------------------------------------------------------------------------------------
 
 def counts(env):
@@ -585,7 +622,8 @@ def test_sandbox_reads_the_real_cache_and_writes_nothing(env):
                          last_name="Test", date_of_birth=date(1990, 3, 14),
                          practice_slug=env.practice_slug)
     from rpt_agent.services.sms_agent import sandbox_lead
-    tools = SandboxTools(env.trace, lead=sandbox_lead(setup), history=[],
+    tools = SandboxTools(env.trace, lead=sandbox_lead(setup),
+                         history=[Turn("patient", "3/14/1990", None)],
                          practice_id=env.practice_id, now_local=None, settings=env.settings())
     found = call_tool(tools, "find_times", {"when": "earliest"})
     assert found.code == "OPENINGS" and "Thao Nguyen" in found.output
@@ -828,7 +866,8 @@ def test_a_new_persons_service_reaches_the_card_and_the_booking(env):
                          last_name="Tanner", date_of_birth=date(1993, 2, 9),
                          practice_slug=env.practice_slug)
     from rpt_agent.services.sms_agent import sandbox_lead
-    tools = SandboxTools(env.trace, lead=sandbox_lead(setup), history=[],
+    tools = SandboxTools(env.trace, lead=sandbox_lead(setup),
+                         history=[Turn("patient", "Feb 9, 1993", None)],
                          practice_id=env.practice_id, now_local=None, settings=env.settings())
     found = call_tool(tools, "find_times", {"when": "earliest", "service": "pelvic floor"})
     assert found.code == "OPENINGS" and "Alan" not in found.output
@@ -844,6 +883,7 @@ def test_a_new_persons_service_reaches_the_card_and_the_booking(env):
     assert booked.code == "BOOKED", booked.output
     assert call_tool(tools, "book_visit", {**BOOK}).code == "BOOKED"  # the card's service
     # A default-service card has no service line.
+    tools.history = [Turn("patient", "Feb 9, 1993", None)]
     plain = call_tool(tools, "confirm_visit", {"date": DAY1, "time": "11:00 AM"})
     assert plain.code == "CARD_SENT" and "Physical Therapy" not in plain.fixed_texts[0]
     assert counts(env) == before
@@ -896,10 +936,16 @@ def test_a_lead_with_no_first_name_books_only_under_a_name_it_wrote(env):
     with get_pool().connection() as c:
         view = load_live(c, lead_id).lead
     assert (view.first_name, view.last_name) == ("", "Tester")
+    pick = {"date": DAY1, "time": "9:00 AM", "therapist": "Thao Nguyen"}
+    # Eval 2026-11-03 (x-04): the first name is asked BEFORE the card, never after the yes.
     tools = env.live(lead_id, [Turn("patient", "tue morning?", None)])
-    card = call_tool(tools, "confirm_visit", {"date": DAY1, "time": "9:00 AM",
-                                              "therapist": "Thao Nguyen"})
+    asked = call_tool(tools, "confirm_visit", pick)
+    assert asked.code == "MISSING_NAME" and not asked.fixed_texts
+    assert "first name only" in asked.output
+    tools = env.live(lead_id, [Turn("patient", "it's Robin, tue morning?", None)])
+    card = call_tool(tools, "confirm_visit", {**pick, "first_name": "Robin"})
     assert card.code == "CARD_SENT" and "No first name is on file" in card.output
+    # book_visit keeps its own guard: a yes with no first name in the chat is still refused.
     yes = [Turn("patient", "tue morning?", None), Turn("elliot", card.fixed_texts[0], None),
            Turn("patient", "YES", None)]
     refused = call_tool(env.live(lead_id, yes), "book_visit", {**BOOK, "first_name": "Tester"})
@@ -930,7 +976,7 @@ def test_sandbox_missing_name_then_first_name_sends_the_card_again_and_books(env
     card = texts.confirm_card(date(2026, 6, 16), slot_booking.parse_clock("9:00"), "Thao Nguyen",
                               "Laguna Niguel")
     pick = {"date": DAY1, "time": "9:00 AM", "therapist": "Thao Nguyen", "clinic": None}
-    chat = [Turn("patient", "tue 9am", None), Turn("elliot", card, None),
+    chat = [Turn("patient", "tue 9am, born 7/8/1992", None), Turn("elliot", card, None),
             Turn("patient", "yes", None)]
     asked = "What's your first name?"
     reply = reply_sandbox(setup=setup, history=chat, settings=env.settings(), client=FakeClient(
@@ -961,7 +1007,8 @@ def test_sandbox_promise_of_the_front_desk_without_a_hand_off_is_not_sent(env):
     setup = SandboxSetup(clinic="Laguna Niguel", first_name="", last_name="Quill",
                          date_of_birth=date(1992, 7, 8), practice_slug=env.practice_slug)
     pick = {"date": DAY1, "time": "9:00 AM", "therapist": "Thao Nguyen", "clinic": None}
-    chat = [Turn("elliot", "What's your first name?", None), Turn("patient", "Dana", None)]
+    chat = [Turn("patient", "7/8/1992", None), Turn("elliot", "What's your first name?", None),
+            Turn("patient", "Dana", None)]
     client = FakeClient(
         say("I couldn't finish booking that by text, so our front desk will finish setting up "
             "your visit."),
@@ -987,3 +1034,114 @@ def test_sandbox_tomorrow_search_names_the_day_on_the_calendar(env):
                                    "said tomorrow).")
     morning = call_tool(tools, "find_times", {"when": "tomorrow"})
     assert morning.output.startswith("OPENINGS: Searched tomorrow, Tue Jun 16. Name that day")
+
+
+# --- birthday step (owner, 2026-11-03) ---------------------------------------------------------------
+#
+# Test chat: "is your birthday November 1?" -> card -> "yes" -> "send your date of birth with the
+# year" -> "nov 1, 2026" -> the same card -> "yes" -> the same question, never booked: the booking
+# engine compared the birthday with the demo's pinned calendar day. The patient now types their date
+# of birth, code checks it, and a second failed booking for the same reason hands off.
+
+def test_sandbox_birthday_step_end_to_end_on_the_pinned_calendar(env):
+    env.open_and_sync()
+    before = counts(env)
+    setup = SandboxSetup(clinic="Laguna Niguel", first_name="Sam", last_name="Test",
+                         date_of_birth=date(1990, 3, 14), practice_slug=env.practice_slug)
+    pick = {"date": DAY1, "time": "9:00 AM", "therapist": "Thao Nguyen", "clinic": None}
+    asked = "To confirm it's you, what's your date of birth?"
+    chat = [Turn("patient", "tue 9am", None), Turn("elliot", asked, None),
+            Turn("patient", "nov 1, 2026", None)]
+    client = FakeClient(tool("check_birthday", date_of_birth="nov 1, 2026"),
+                        tool("confirm_visit", **pick), say("Could you check it and send it again?"))
+    reply = reply_sandbox(setup=setup, history=chat, settings=env.settings(), client=client)
+    assert [a.result_code for a in reply.actions] == ["NOT_POSSIBLE", "NEED_BIRTH_DATE"]
+    assert reply.texts == ["Could you check it and send it again?"]
+    assert "Date of birth confirmed in this chat: no" in client.responses.requests[0]["input"][1][
+        "content"]
+
+    chat += [Turn("elliot", reply.texts[0], None), Turn("patient", "3/14/1990", None)]
+    client = FakeClient(tool("check_birthday", date_of_birth="3/14/1990"),
+                        tool("confirm_visit", **pick), say("NO_REPLY"))
+    reply = reply_sandbox(setup=setup, history=chat, settings=env.settings(), client=client)
+    assert [a.result_code for a in reply.actions] == ["MATCH", "CARD_SENT"]
+    [card] = reply.texts
+    context = client.responses.requests[0]["input"][1]["content"]
+    assert "Date of birth confirmed in this chat: yes" in context and "1990" not in context
+
+    chat += [Turn("elliot", card, None), Turn("patient", "yes", None)]
+    client = FakeClient(tool("book_visit", **pick, date_of_birth="2026-11-01"), say("NO_REPLY"))
+    reply = reply_sandbox(setup=setup, history=chat, settings=env.settings(), client=client)
+    # The chat's confirmed date is used, whatever the model passes.
+    assert [a.result_code for a in reply.actions] == ["BOOKED"]
+    assert reply.texts[0].startswith("You're all set, Sam!")
+    assert counts(env) == before
+
+
+def test_booking_engine_accepts_a_birthday_after_the_pinned_calendar_day(env):
+    # The demo calendar is pinned to Jun 15 2026 (BOOKING_TODAY_OVERRIDE); a date of birth after it
+    # but before the real today is real and books (voice and text use the same check).
+    env.open_and_sync()
+    lead_id = env.lead()
+    tools = env.live(lead_id, [Turn("patient", "tue morning?", None)])
+    assert call_tool(tools, "find_times", {"when": "specific_date",
+                                           "specific_date": DAY1}).code == "OPENINGS"
+    real_today = datetime.now(ZoneInfo("America/Los_Angeles")).date()
+    dob = real_today - timedelta(days=10)
+    assert dob > TODAY
+    output = slot_booking.book_slot(
+        env.trace, lead_id=lead_id, call_id=f"sms:{lead_id}", settings=env.settings(),
+        providers=env.stride, source="sms",
+        arguments={"date": DAY1, "time": "9:00 AM", "clinician_name": "Thao Nguyen",
+                   "location": "Laguna Niguel", "first_name": "Rpt", "last_name": "Tester",
+                   "date_of_birth": dob.isoformat()})
+    assert output.startswith("BOOKED"), output
+    assert env.one("select patient_dob from appointments where lead_id=%s",
+                   lead_id)["patient_dob"] == dob
+
+
+def test_live_a_second_failed_booking_for_the_same_reason_hands_off(env):
+    env.open_and_sync()
+    lead_id = env.lead()
+    # An earlier reply of this chat was refused NOT_CONFIRMED (the worker stores tool + code).
+    env.db.execute("insert into sms_agent_actions(lead_id,tool,result_code) "
+                   "values(%s,'book','NOT_CONFIRMED')", (lead_id,))
+    tools = env.live(lead_id, [Turn("patient", "just book it", None)])
+    result = call_tool(tools, "book_visit", BOOK)
+    assert result.code == "HANDED_OFF" and result.action_code == "HANDED_OFF_PAUSED"
+    assert result.fixed_texts and "front desk" in result.fixed_texts[0]
+    review = env.one("select code,details from lead_reviews where lead_id=%s "
+                     "and resolved_at is null", lead_id)
+    assert review["code"] == lead_review.SMS_FRONT_DESK_CODE
+    assert review["details"]["reason"] == "booking_problem"
+    # Another lead's failures do not count.
+    other = env.lead()
+    assert call_tool(env.live(other, [Turn("patient", "book", None)]), "book_visit",
+                     BOOK).code == "NOT_CONFIRMED"
+
+
+def test_live_card_is_not_sent_twice_and_books_with_the_patients_double_checked_date(env):
+    env.open_and_sync()
+    lead_id = env.lead()   # 1990-04-26 on file
+    typed = [Turn("patient", "tue 9am, born 5/5/1985", None)]
+    first = call_tool(env.live(lead_id, typed, dob=False), "confirm_visit",
+                      {"date": DAY1, "time": "9:00 AM", "therapist": "Thao"})
+    assert first.code == "NEED_BIRTH_DATE" and "double-check" in first.output
+    checked = [*typed, Turn("elliot", "Could you double-check that date of birth for me?", None),
+               Turn("patient", "yes it's 5/5/1985", None)]
+    tools = env.live(lead_id, checked, dob=False)
+    assert call_tool(tools, "check_birthday", {"date_of_birth": "5/5/1985"}).code == \
+        "CONFIRMED_DIFFERENT"
+    card = call_tool(tools, "confirm_visit", {"date": DAY1, "time": "9:00 AM", "therapist": "Thao"})
+    assert card.code == "CARD_SENT"
+    again = call_tool(env.live(lead_id, [*checked, Turn("elliot", card.fixed_texts[0], None)],
+                               dob=False),
+                      "confirm_visit", {"date": DAY1, "time": "9:00 AM", "therapist": "Thao"})
+    assert again.code == "CARD_ALREADY_SENT" and not again.fixed_texts
+    yes = [*checked, Turn("elliot", card.fixed_texts[0], None), Turn("patient", "yes", None)]
+    booked = call_tool(env.live(lead_id, yes, dob=False), "book_visit",
+                       {**BOOK, "date_of_birth": "1990-04-26"})
+    assert booked.code == "BOOKED", booked.output
+    assert "differs from our records" in booked.summary
+    assert env.one("select patient_dob from appointments where lead_id=%s",
+                   lead_id)["patient_dob"] == date(1985, 5, 5)

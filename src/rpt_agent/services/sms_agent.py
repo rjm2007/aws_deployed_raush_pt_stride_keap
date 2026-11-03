@@ -44,7 +44,7 @@ from zoneinfo import ZoneInfo
 from ..config import Settings, get_settings
 from ..db import transaction
 from ..observability import WorkflowTrace
-from . import sms_agent_sandbox_setup
+from . import sms_agent_birthday, sms_agent_sandbox_setup
 from . import sms_agent_texts as texts
 from .front_desk import CLINIC_TZ
 from .front_desk import front_desk_open as clinic_front_desk_open
@@ -54,6 +54,7 @@ from .sms_agent_tools import (
     EMERGENCY_REPEAT_WINDOW,
     FINAL_STATUSES,
     FRONT_DESK_CODES,
+    REPEATED_FAILURES,
     AgentTools,
     LiveTools,
     SandboxTools,
@@ -311,9 +312,17 @@ FRONT_DESK_NOTE = ("Code check: your last answer said our front desk will reach 
                    "the front desk, call hand_off now with the right reason (it sends the front "
                    "desk text); otherwise do not promise it and continue the step you were on.")
 BIRTH_DATE_NOTE = ("Code check: your last answer wrote the patient's full date of birth with the "
-                   "year, so it was not sent. Never put a birth year in a text; to check a birthday "
-                   "name only the month and day (\"is your birthday March 14?\"). Continue the step "
-                   "you were on.")
+                   "year, so it was not sent. Never put a birth year in a text, and never read a "
+                   "date of birth to the patient: they type theirs and check_birthday checks it. "
+                   "Continue the step you were on.")
+ASKED_BIRTH_DATE_NOTE = ("Code check: your last answer asked for the patient's date of birth, so it "
+                         "was not sent. Context says it is already confirmed in this chat: never ask "
+                         "for it again. Continue the step you were on (confirm_visit for their pick, "
+                         "book_visit after a yes to the card), or NO_REPLY.")
+ASKED_LAST_NAME_NOTE = ("Code check: your last answer asked for the patient's last name, so it was "
+                        "not sent. Their last name is on file: never ask for it. If no first name "
+                        "is on file, ask only \"What's your first name?\"; otherwise continue the "
+                        "step you were on.")
 # How many of Elliot's own texts a model text may not repeat (x-02, x-05: the same text twice).
 REPEAT_LOOKBACK = 3
 
@@ -440,6 +449,34 @@ def writes_birth_date(text: str, lead: LeadView, history: list[Turn], today: dat
     return bool(written and written & birth_dates(lead, history, today))
 
 
+_ASKS_BIRTH = re.compile(r"\b(?:date of birth|birth ?date|birthday|b-?day|dob|d\.o\.b|born)\b")
+_ASKS = re.compile(r"\?|\b(?:send|type|text|share|tell|confirm|what'?s|what is|give)\b")
+
+
+def asks_birth_date(text: str) -> bool:
+    """The text asks for a date of birth ("To confirm it's you, what's your date of birth?", "And the
+    year you were born?", "send your DOB again")."""
+    flat = text.lower().replace("’", "'")
+    # In one sentence: "Your date of birth is confirmed. Which time works?" asks nothing about it.
+    return any(_ASKS_BIRTH.search(part) and _ASKS.search(part)
+               for part in re.findall(r"[^.!?\n]+[.!?]*", flat))
+
+
+_ASKS_LAST_NAME = re.compile(r"\b(?:last\s+name|surname|family\s+name)\b")
+
+
+def asks_last_name(text: str) -> bool:
+    """The text asks for a last name ("And what's your last name?", "send your first and last
+    name"), in one sentence with a question or a request."""
+    flat = text.lower().replace("’", "'")
+    return any(_ASKS_LAST_NAME.search(part) and _ASKS.search(part)
+               for part in re.findall(r"[^.!?\n]+[.!?]*", flat))
+
+
+def last_name_on_file(lead: LeadView) -> bool:
+    return not lead.is_new_person and bool((lead.last_name or "").strip())
+
+
 def claims_booking(text: str, *, other_outcome: bool = False) -> bool:
     flat = _flat(text)
     if _BOOKED_CLAIM.search(flat):
@@ -482,6 +519,21 @@ def said_yes_to_card(history: list[Turn]) -> bool:
     return bool(_YES.match(_words(replies[-1])))
 
 
+# An iPhone / Android reaction sent as a text: 'Liked "Great choice! ..."', 'Reacted 👍 to "..."'.
+_REACTION = re.compile(r"^(?:liked|loved|laughed at|emphasi[sz]ed|disliked|questioned|"
+                       r"reacted \S{1,8} to)\s*[\"“']", re.IGNORECASE)
+
+
+def reacted_to_card(history: list[Turn]) -> bool:
+    """Elliot's last text is the read-back card and the patient's latest text is a reaction to it."""
+    last = max((i for i, turn in enumerate(history) if turn.role == "elliot"), default=None)
+    latest = _latest_patient(history)
+    if last is None or latest is None or latest < last:
+        return False
+    return (texts.parse_card(history[last].text) is not None
+            and bool(_REACTION.match(history[latest].text.strip())))
+
+
 def finished_before(history: list[Turn], lead: LeadView) -> bool:
     """Elliot's texts just before the patient's latest one closed something (booked, hand-off,
     opt-out, emergency, callback), and did not end on a question."""
@@ -505,15 +557,23 @@ def finished_before(history: list[Turn], lead: LeadView) -> bool:
 
 def _check_answer(text: str, *, lead: LeadView, history: list[Turn], actions: list[AgentAction],
                   fixed: bool, today: date | None = None,
-                  after_repeat: bool = False) -> tuple[str, str | None, str] | None:
+                  after_repeat: bool = False,
+                  birthday_done: bool = False) -> tuple[str, str | None, str] | None:
     """None when the model's answer may go out; else (guard, tool to force or None, note).
 
-    `after_repeat`: the model was told it repeated itself and may now answer NO_REPLY."""
+    `after_repeat`: the model was told it repeated itself and may now answer NO_REPLY.
+    `birthday_done`: the chat already confirmed the date of birth (sms_agent_birthday)."""
     codes = {action.result_code for action in actions}
     kinds = {action.kind for action in actions}
     if text and not _is_empty_answer(text):
         if writes_birth_date(text, lead, history, today or datetime.now(UTC).date()):
             return "birth_date", None, BIRTH_DATE_NOTE
+        if birthday_done and asks_birth_date(text):
+            # Owner, 2026-11-03: once given in the chat, the date of birth is never asked again.
+            return "asked_birth_date", None, ASKED_BIRTH_DATE_NOTE
+        if last_name_on_file(lead) and asks_last_name(text):
+            # x-04 (2026-11-03): "And what's your last name?" when it is on file.
+            return "asked_last_name", None, ASKED_LAST_NAME_NOTE
         booked_here = bool(codes & {"BOOKED", "ALREADY_BOOKED"})
         other_outcome = any(code.startswith(("REPORTED", "HANDED_OFF", "ALREADY_", "EMERGENCY"))
                             for code in codes)
@@ -535,7 +595,9 @@ def _check_answer(text: str, *, lead: LeadView, history: list[Turn], actions: li
         if repeats_recent(text, history):
             return "repeat", None, REPEAT_NOTE
         return None
-    if fixed or after_repeat:
+    if fixed or after_repeat or "CARD_ALREADY_SENT" in codes or reacted_to_card(history):
+        # The card is still their latest text from Elliot and asks for a YES: a reaction to it
+        # needs no answer (2026-11-03: the same card is never sent twice in a row).
         return None
     latest = _latest_patient(history)
     if latest is not None and pure_acknowledgement(history[latest].text) and finished_before(
@@ -564,12 +626,19 @@ def run_agent(*, lead: LeadView, history: list[Turn], tools: AgentTools, now: da
     try:
         client = client or default_client(settings)
         tool_specs = load_tools()
+        # "Date of birth confirmed in this chat" (owner, 2026-11-03: never asked again once given);
+        # the tools' own reading, so the Context and the booking agree.
+        state = getattr(tools, "birthday_state", None)
+        settled = (state() if callable(state)
+                   else sms_agent_birthday.birthday_state(lead, history))
+        birthday = sms_agent_birthday.context_line(settled)
         items: list[dict[str, Any]] = [
             {"role": "developer", "content": load_prompt()},
             {"role": "developer", "content": context_block(
                 lead, now=now, front_desk_open=front_desk_open, booking_link=booking_link,
                 front_desk_phone=settings.clinic_front_desk_phone, timezone=timezone,
-                services=services, service_aliases=service_aliases)},
+                services=services, service_aliases=service_aliases,
+                birthday_confirmed=birthday)},
             *history_items(history, timezone),
         ]
     except Exception as exc:  # noqa: BLE001 - a missing prompt file must not crash the worker
@@ -630,7 +699,8 @@ def run_agent(*, lead: LeadView, history: list[Turn], tools: AgentTools, now: da
             verdict = _check_answer(answer, lead=lead, history=history, actions=actions,
                                     fixed=bool(sent_first or sent_last),
                                     today=now.astimezone(CLINIC_TZ).date(),
-                                    after_repeat="repeat" in retried)
+                                    after_repeat="repeat" in retried,
+                                    birthday_done=settled.confirmed is not None)
             if verdict is not None:
                 guard, tool, note = verdict
                 if guard in retried or last:
@@ -695,7 +765,8 @@ def reply_live(trace: WorkflowTrace, *, lead_id: str, job_id: int, settings: Set
                          up_to_inbound_id=job["last_inbound_id"] if job else None)
     desk_open = clinic_front_desk_open(live.lead.clinic, now, live.holidays)
     tools = LiveTools(trace, lead_id=lead_id, job_id=job_id, lead=live.lead, history=live.history,
-                      settings=settings, practice_id=live.practice_id, providers=providers)
+                      settings=settings, practice_id=live.practice_id, providers=providers,
+                      birthday_history=live.birthday_history)
     trace.log("sms_agent_started", history=len(live.history), front_desk_open=desk_open)
     return run_agent(lead=live.lead, history=live.history, tools=tools, now=now,
                      front_desk_open=desk_open, settings=settings, client=client,
@@ -764,6 +835,9 @@ class EarlierInChat:
     # For the repeat checks (SandboxTools.earlier): "case_change", "emergency" (within the hour),
     # "hand_off:front_desk" (booking goes on) / "hand_off:paused".
     done: set[str] = field(default_factory=set)
+    # Failed bookings by code (sms_agent_tools.REPEATED_FAILURES): the second one for the same
+    # reason hands off (SandboxTools.earlier_failures).
+    failures: dict[str, int] = field(default_factory=dict)
 
 
 def filled_from(text: str, body: str) -> bool:
@@ -810,6 +884,8 @@ def earlier_in_chat(history: list[Turn], prior_actions: list[Any] | None,
         elif code in _DONE_AFTER:
             state.done.add(_DONE_AFTER[code])
         emergency_code = emergency_code or code == "EMERGENCY_SENT"
+        if str(_get(action, "kind", "") or "") == "book" and code in REPEATED_FAILURES:
+            state.failures[code] = state.failures.get(code, 0) + 1
     emergency_times: list[datetime | None] = []
     for turn in history:
         if turn.role != "elliot":
@@ -906,7 +982,8 @@ def reply_sandbox(*, setup: SandboxSetup, history: list[Turn], settings: Setting
         desk_open = clinic_front_desk_open(lead.clinic, now, row["holidays"] or [])
     tools = SandboxTools(trace, lead=lead, history=history, practice_id=row["id"],
                          now_local=clock.astimezone(ZoneInfo(str(CLINIC_TZ))) if clock else None,
-                         settings=settings, earlier=earlier.done)
+                         settings=settings, earlier=earlier.done,
+                         earlier_failures=earlier.failures)
     return run_agent(lead=lead, history=history, tools=tools, now=now, front_desk_open=desk_open,
                      settings=settings, client=client, model=setup.model,
                      booking_link=row["booking_link_url"], timezone=str(CLINIC_TZ),

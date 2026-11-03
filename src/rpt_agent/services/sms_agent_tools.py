@@ -34,6 +34,14 @@ Round 2 of the gpt-5.5 eval (2026-11-02): "tmrw aftrnoon" searched as today is s
 wrote in this chat, never their last name (`booking_names`, MISSING_NAME), and the booked text never
 greets them by a name they did not give; a service no therapist offers at the chosen clinic names the
 clinics that do offer it (NO_CLINICIANS ... Offered at: ...).
+
+Birthday step (owner, 2026-11-03; a test chat looped "send your date of birth with the year" and the
+same card because the booking refused a birthday after the demo's pinned calendar day): the patient
+types their date of birth, `check_birthday` reads and compares it in code (sms_agent_birthday), and
+confirm_visit needs a date of birth confirmed in the chat (NEED_BIRTH_DATE otherwise); book_visit books
+with that date. The same card is never sent twice in a row (CARD_ALREADY_SENT), and a second failed
+booking for the same reason in a chat (BAD_DATE_OF_BIRTH, NOT_CONFIRMED, MISSING_NAME, ...) hands off
+to the front desk (booking_problem) instead of asking again.
 """
 
 from __future__ import annotations
@@ -50,6 +58,7 @@ from ..config import Settings, get_settings
 from ..db import transaction
 from ..observability import WorkflowTrace
 from . import slot_booking
+from . import sms_agent_birthday as birthday
 from . import sms_agent_texts as texts
 from .lead_review import SMS_FRONT_DESK_CODE, SMS_FRONT_DESK_REASONS
 from .lead_status import (
@@ -71,7 +80,15 @@ KINDS = {
     "find_times": "find_times", "list_therapists": "list_therapists",
     "confirm_visit": "confirm_visit", "book_visit": "book", "report_outcome": "report",
     "hand_off": "hand_off", "flag_emergency": "emergency", "send_intro": "fixed_text",
+    "check_birthday": "check_birthday",
 }
+# book_visit refusals that come back when the model asks again (2026-11-03 test chat: "send your date
+# of birth with the year" and the same card, over and over). The second one for the same reason in a
+# chat hands off to the front desk instead (booking_problem).
+REPEATED_FAILURES = frozenset({"BAD_DATE_OF_BIRTH", "NOT_CONFIRMED", "MISSING_NAME", "BAD_NAME",
+                               "BAD_EMAIL"})
+FAILURE_LIMIT = 2
+FAILURE_WINDOW = timedelta(hours=24)
 # Booking replies after which the patient is told the front desk will take care of it (the booking
 # engine already sent the lead to Needs Review).
 FRONT_DESK_CODES = {"FOLLOW_UP", "UNCONFIRMED", "PATIENT_EXISTS"}
@@ -110,6 +127,10 @@ def clear_no(text: str) -> bool:
     return bool(_CLEAR_NO.search(_NOT_A_NO.sub(" ", words)))
 
 
+def last_elliot_text(history: list[Turn]) -> str:
+    return next((turn.text for turn in reversed(history) if turn.role == "elliot"), "")
+
+
 def latest_patient_text(history: list[Turn]) -> str:
     return next((turn.text for turn in reversed(history) if turn.role == "patient"), "")
 
@@ -120,14 +141,26 @@ _TOMORROW = re.compile(r"\b(?:tomorrow|tmrw|tmr|tmw|tomoro|2morrow)\b", re.IGNOR
 _TODAY = re.compile(r"\btoday\b", re.IGNORECASE)
 
 
-def search_when(when: str, history: list[Turn]) -> str:
-    """`when`, except "today" becomes "tomorrow" when the patient's latest text says tomorrow (and
-    not today)."""
+def search_when(when: str, history: list[Turn], specific_date: str | None = None,
+                todays: frozenset[date] | set[date] = frozenset()) -> str:
+    """`when`, except a search for today becomes "tomorrow" when the patient's latest text says
+    tomorrow (and not today). A search for today is when="today", or (eval 2026-11-03, book-12:
+    "tmrw aftrnoon" searched as when="specific_date" with today's date) when="specific_date" with a
+    date in `todays` (the calendar's today as the model sees it, and the demo's pinned one)."""
     text = latest_patient_text(history)
-    if (str(when or "").strip().lower() == "today" and _TOMORROW.search(text)
-            and not _TODAY.search(text)):
+    wanted = str(when or "").strip().lower()
+    for_today = wanted == "today" or (
+        wanted == "specific_date" and _parse_iso(specific_date) in todays)
+    if for_today and _TOMORROW.search(text) and not _TODAY.search(text):
         return "tomorrow"
     return when
+
+
+def _parse_iso(value: str | None) -> date | None:
+    try:
+        return date.fromisoformat(str(value or "").strip())
+    except ValueError:
+        return None
 
 
 # book-12 (round 3): search_when turned "today" into "tomorrow", but the reply did not say which day
@@ -191,6 +224,51 @@ MISSING_FIRST_NAME = ("MISSING_NAME: not booked: we have no first name on file f
                       "again) and book_visit after their yes, with that first_name.")
 
 
+# Eval 2026-11-03 (x-04): MISSING_NAME came from book_visit after the yes to the card, so the model
+# asked "what's your last name?" (on file), sent the card again and passed the last name as
+# first_name. Now the first name is asked BEFORE the card: confirm_visit replies MISSING_NAME until a
+# first name was given in the chat.
+MISSING_FIRST_NAME_CARD = ("MISSING_NAME: no card was sent: we have no first name on file and they "
+                           "have not written it in this chat. Ask for their first name only (\"What's "
+                           "your first name?\"; the last name is on file: never ask for it). With "
+                           "their answer, call confirm_visit again for the same time with "
+                           "first_name.")
+# Elliot's question for the first name, and a short answer to it ("Dana", "it's Dana", "Dana Quill").
+_ASKED_FIRST_NAME = re.compile(r"\bfirst name\b", re.IGNORECASE)
+_NAME_ANSWER = re.compile(r"^(?:(?:it'?s|its|i'?m|im|this is|my (?:first )?name is|first name is|"
+                          r"name'?s)\s+)?(?P<first>[a-z][a-z'-]*)(?:\s+(?P<second>[a-z][a-z'-]*))?"
+                          r"[.!]?$", re.IGNORECASE)
+_NOT_A_NAME = re.compile(r"^(?:y|ya|ye|yes|yeah|yep|yup|no|nope|nah|ok|okay|k|sure|thanks|thank|thx|"
+                         r"hi|hey|hello|what|why|who|wait|sorry|idk|stop)$", re.IGNORECASE)
+
+
+def first_name_in_chat(lead: LeadView, history: list[Turn], given: str | None = None) -> str:
+    """A first name for a lead with none on file, from this chat: the model's `given` when the
+    patient wrote it (whole words) and it is not the last name; else the patient's short answer
+    right after Elliot asked for their first name. "" when there is none."""
+    last = (lead.last_name or "").strip().lower()
+    name = " ".join(str(given or "").split())
+    if name and said_in_chat(history, name) and name.lower() != last:
+        return name
+    found = ""
+    asked = False
+    for turn in history:
+        if turn.role != "patient":
+            asked = turn.role == "elliot" and bool(_ASKED_FIRST_NAME.search(turn.text))
+            continue
+        match = _NAME_ANSWER.match(" ".join(turn.text.replace("\u2019", "'").split())) if asked else None
+        asked = False
+        if not match:
+            continue
+        first, second = match["first"], match["second"]
+        if second and second.lower() != last:
+            continue  # two words that are not first + the last name on file: not just a name
+        if first.lower() == last or _NOT_A_NAME.match(first):
+            continue
+        found = first if any(ch.isupper() for ch in first) else first.capitalize()
+    return found
+
+
 def booking_names(lead: LeadView, history: list[Turn], first_name: str | None,
                   last_name: str | None) -> tuple[str, str]:
     """The names a booking uses (x-04, round 2: a lead with no first name on file was booked with
@@ -205,9 +283,7 @@ def booking_names(lead: LeadView, history: list[Turn], first_name: str | None,
     last = (lead.last_name or "").strip() or (last_name or "").strip()
     first = (lead.first_name or "").strip()
     if not first:
-        given = " ".join(str(first_name or "").split())
-        if given and said_in_chat(history, given) and given.lower() != last.lower():
-            first = given
+        first = first_name_in_chat(lead, history, first_name)
     if not first:
         raise ValueError(MISSING_FIRST_NAME)
     return first, last
@@ -280,7 +356,8 @@ class AgentTools(Protocol):
                    clinic: str | None = None, service: str | None = None) -> ToolResult: ...
     def list_therapists(self, *, clinic: str | None = None) -> ToolResult: ...
     def confirm_visit(self, *, date: str, time: str, therapist: str | None = None,
-                      clinic: str | None = None, service: str | None = None) -> ToolResult: ...
+                      clinic: str | None = None, service: str | None = None,
+                      first_name: str | None = None) -> ToolResult: ...
     def book_visit(self, *, date: str, time: str, therapist: str | None = None,
                    first_name: str | None = None, last_name: str | None = None,
                    date_of_birth: str | None = None, clinic: str | None = None,
@@ -291,6 +368,7 @@ class AgentTools(Protocol):
     def hand_off(self, *, reason: str, notes: str | None = None) -> ToolResult: ...
     def flag_emergency(self) -> ToolResult: ...
     def send_intro(self) -> ToolResult: ...
+    def check_birthday(self, *, date_of_birth: str) -> ToolResult: ...
 
 
 # --- dispatch --------------------------------------------------------------------------------------
@@ -441,6 +519,17 @@ def hand_off_code(reason: str) -> str:
     return "HANDED_OFF" if reason in FRONT_DESK_BOOKABLE_REASONS else "HANDED_OFF_PAUSED"
 
 
+NEED_BIRTH_DATE = ("NEED_BIRTH_DATE: no card was sent: no date of birth is confirmed in this chat yet. "
+                   "Ask once, \"To confirm it's you, what's your date of birth?\", then call "
+                   "check_birthday with their answer, then confirm_visit.")
+PENDING_BIRTH_DATE = ("NEED_BIRTH_DATE: no card was sent: the date of birth they typed is not the one "
+                      "in our records. Ask them once to double-check it (\"Could you double-check "
+                      "that date of birth for me?\"), never saying the date on file; then "
+                      "check_birthday with their answer.")
+CARD_ALREADY_SENT = ("CARD_ALREADY_SENT: this same card is already your latest text, so it was not "
+                     "sent again. A clear yes = book_visit now. For a reaction, 'maybe' or a "
+                     "question, answer in one short line (no card, no 'reply YES'), or NO_REPLY for a "
+                     "reaction alone.")
 NOT_CONFIRMED = ("NOT_CONFIRMED: not booked: {why}. Call confirm_visit for the time the patient "
                  "chose (it texts them the read-back card), and call book_visit only after they reply "
                  "yes to that card.")
@@ -456,8 +545,15 @@ class _BaseTools:
     pretend = False
 
     def __init__(self, trace: WorkflowTrace, *, lead: LeadView, history: list[Turn],
-                 settings: Settings | None = None, practice_id: int | None = None):
+                 settings: Settings | None = None, practice_id: int | None = None,
+                 today: date | None = None, birthday_history: list[Turn] | None = None):
         self.trace = trace
+        # The birthday step reads further back than the model (a date of birth given more than 20
+        # texts ago is still never asked again); None = `history`.
+        self.birthday_history = history if birthday_history is None else birthday_history
+        # The REAL clinic date for date-of-birth checks (tests pin it); never the demo's pinned
+        # booking calendar (BOOKING_TODAY_OVERRIDE).
+        self.today = today
         self.lead = lead
         self.history = history
         self.settings = settings or get_settings()
@@ -469,6 +565,8 @@ class _BaseTools:
         # What this reply already did ("hand_off:<reason>", "case_change", "emergency"): a second
         # call for the same thing sends nothing again (repeat_key).
         self.done_here: set[str] = set()
+        # Failed bookings in this reply by code (REPEATED_FAILURES).
+        self.failures_here: dict[str, int] = {}
 
     # Subclasses: a connection (read-only for the sandbox) and the booking context for a clinic.
     @contextmanager
@@ -487,7 +585,9 @@ class _BaseTools:
                    time_of_day: str | None = None, therapist: str | None = None,
                    clinic: str | None = None, service: str | None = None) -> ToolResult:
         asked = str(when or "").strip().lower()
-        when = search_when(when, self.history)
+        when = search_when(when, self.history, specific_date, self.search_todays())
+        if when == "tomorrow":
+            specific_date = None
         try:
             result = self._find_times(when=when, specific_date=specific_date, month=month,
                                       time_of_day=time_of_day, therapist=therapist, clinic=clinic,
@@ -500,6 +600,14 @@ class _BaseTools:
                 raise
             return ToolResult(self._no_clinicians(str(exc)), "find_times",
                               "No therapist for that service at that clinic")
+
+    def search_todays(self) -> set[date]:
+        """The days a find_times specific_date means "today": the clinic's real date (the Context's
+        Now) and the demo's pinned booking calendar day."""
+        days = {birthday.real_today()}
+        if self.settings.booking_today_override:
+            days.add(self.settings.booking_today_override)
+        return days
 
     def _find_times(self, **search: Any) -> ToolResult:
         raise NotImplementedError
@@ -591,8 +699,80 @@ class _BaseTools:
                 "about their visit.", "book", "Not booked: lead in Needs Review")
         return None
 
+    # --- birthday ------------------------------------------------------------------------------
+
+    def birthday_today(self) -> date:
+        return self.today or birthday.real_today()
+
+    def birthday_state(self) -> birthday.BirthdayState:
+        """What this chat settled about the date of birth (the Context line reads the same)."""
+        return birthday.birthday_state(self.lead, self.birthday_history, self.birthday_today())
+
+    def check_birthday(self, *, date_of_birth: str) -> ToolResult:
+        result = birthday.check(self.lead, self.birthday_history, date_of_birth,
+                                self.birthday_today())
+        return ToolResult(result.output, "check_birthday", result.summary)
+
+    def _birth_date_for_booking(self, given: str | None) -> tuple[str, bool]:
+        """(YYYY-MM-DD, differs from file): the date this chat confirmed; else the model's, else the
+        one on file."""
+        state = self.birthday_state()
+        if state.confirmed is not None:
+            return state.confirmed.isoformat(), state.differs
+        on_file = self.lead.date_of_birth.isoformat() if self.lead.date_of_birth else ""
+        return (given or on_file), bool(given and on_file and given != on_file)
+
+    # --- repeated failures -----------------------------------------------------------------------
+
+    def _earlier_failures(self, code: str) -> int:
+        """Failed bookings with this code earlier in the chat (live: sms_agent_actions; test chat:
+        the side panel's codes)."""
+        return 0
+
+    def _stop_repeated_failure(self, result: ToolResult) -> ToolResult:
+        code = result.code
+        if code not in REPEATED_FAILURES:
+            return result
+        self.failures_here[code] = self.failures_here.get(code, 0) + 1
+        if self.failures_here[code] + self._earlier_failures(code) < FAILURE_LIMIT:
+            return result
+        self.trace.log("sms_agent_booking_gave_up", result_code=code)
+        handed = self.hand_off(reason="booking_problem",
+                               notes=f"Booking by text failed twice ({code}); please book by hand.")
+        if handed.code == "ALREADY_HANDED_OFF":
+            return ToolResult(f"ALREADY_HANDED_OFF: booking by text failed again ({code}) and the "
+                              "front desk already has it. Ask nothing more about this booking; "
+                              "NO_REPLY or one short line.", "book",
+                              f"Booking refused again ({code}): front desk already has it",
+                              action_code="ALREADY_HANDED_OFF", reason="booking_problem")
+        return ToolResult(
+            f"HANDED_OFF: booking by text failed twice for the same reason ({code}), so the front "
+            "desk text was sent and our front desk will finish the booking. Ask nothing more about "
+            "this booking (no date of birth, name or card again); NO_REPLY or one short line.",
+            "book", f"Booking failed twice ({code}): handed to the front desk",
+            fixed_texts=handed.fixed_texts, action_code="HANDED_OFF_PAUSED",
+            reason="booking_problem")
+
+    def book_visit(self, *, date: str, time: str, therapist: str | None = None,
+                   first_name: str | None = None, last_name: str | None = None,
+                   date_of_birth: str | None = None, clinic: str | None = None,
+                   service: str | None = None) -> ToolResult:
+        try:
+            result = self._book_visit(date=date, time=time, therapist=therapist,
+                                      first_name=first_name, last_name=last_name,
+                                      date_of_birth=date_of_birth, clinic=clinic, service=service)
+        except (ValueError, slot_booking.BookingToolError) as exc:
+            result = ToolResult(str(exc), "book", f"book_visit: {str(exc).split(':', 1)[0]}")
+        return self._stop_repeated_failure(result)
+
+    def _book_visit(self, **arguments: Any) -> ToolResult:
+        raise NotImplementedError
+
+    # --- the card --------------------------------------------------------------------------------
+
     def confirm_visit(self, *, date: str, time: str, therapist: str | None = None,
-                      clinic: str | None = None, service: str | None = None) -> ToolResult:
+                      clinic: str | None = None, service: str | None = None,
+                      first_name: str | None = None) -> ToolResult:
         blocked = self._review_open_reply()
         if blocked:
             return ToolResult(blocked.output, "confirm_visit", blocked.summary)
@@ -600,6 +780,16 @@ class _BaseTools:
             return ToolResult(f"ALREADY_BOOKED: this patient already has a visit "
                               f"({self.lead.booked_visit or 'on record'}). Do not book again.",
                               "confirm_visit", "Already booked")
+        state = self.birthday_state()
+        if state.confirmed is None:
+            # The identity step comes first (owner, 2026-11-03): the date of birth typed in this
+            # chat, checked by check_birthday; never a yes to a date read to them.
+            return ToolResult(PENDING_BIRTH_DATE if state.pending else NEED_BIRTH_DATE,
+                              "confirm_visit", "No card: date of birth not confirmed yet")
+        if self.no_first_name() and not first_name_in_chat(self.lead, self.history, first_name):
+            # x-04 (2026-11-03): the first name comes before the card, never after the yes.
+            return ToolResult(MISSING_FIRST_NAME_CARD, "confirm_visit",
+                              "No card: no first name yet")
         wanted_day = _parse_day(date, "date")
         wanted_time = slot_booking.parse_clock(time)
         with self._conn() as conn:
@@ -620,8 +810,12 @@ class _BaseTools:
                 "confirm_visit", f"{_summary_when(wanted_day, wanted_time)} is not open")
         card = texts.confirm_card(slot["local_date"], slot["local_time"], slot["display_name"],
                                   context.location["name"], service=shown)
-        no_first_name = ("" if self.lead.is_new_person or (self.lead.first_name or "").strip()
-                         else " No first name is on file: book_visit needs the first name the "
+        if last_elliot_text(self.history).strip() == card.strip():
+            # Never the same card twice in a row (2026-11-03 loop): a new card needs a new step in
+            # between (a name, a date of birth, another time).
+            return ToolResult(CARD_ALREADY_SENT, "confirm_visit", "Card already sent: not sent again")
+        no_first_name = ("" if not self.no_first_name()
+                         else " No first name is on file: pass book_visit the first name the "
                               "patient wrote in this chat (never their last name).")
         return ToolResult(
             "CARD_SENT: the read-back card was texted to the patient word for word. Wait for their "
@@ -631,6 +825,10 @@ class _BaseTools:
             f"{slot['display_name']} at {context.location['name']}"
             + (f" ({shown})" if shown else ""),
             fixed_texts=[card], send_last=True)
+
+    def no_first_name(self) -> bool:
+        """A lead with a referral and no first name on file (someone new gives both names)."""
+        return not self.lead.is_new_person and not (self.lead.first_name or "").strip()
 
     def _guard(self, date: str, time: str, therapist: str | None, clinic: str | None,
                service: str | None = None) -> tuple[dict | None, ToolResult | None]:
@@ -695,9 +893,10 @@ class LiveTools(_BaseTools):
 
     def __init__(self, trace: WorkflowTrace, *, lead_id: str, job_id: int, lead: LeadView,
                  history: list[Turn], settings: Settings | None = None,
-                 practice_id: int | None = None, providers=None):
+                 practice_id: int | None = None, providers=None, today: date | None = None,
+                 birthday_history: list[Turn] | None = None):
         super().__init__(trace, lead=lead, history=history, settings=settings,
-                         practice_id=practice_id)
+                         practice_id=practice_id, today=today, birthday_history=birthday_history)
         self.lead_id = lead_id
         self.job_id = job_id
         self.providers = providers  # tests pass a fake Stride; None = the real client
@@ -717,6 +916,21 @@ class LiveTools(_BaseTools):
 
     def _offer_key(self) -> str:
         return self.conversation
+
+    def _earlier_failures(self, code: str) -> int:
+        # The worker stores every reply's actions (tool kind + result code) after the reply, so
+        # this reply's own are not counted twice.
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "select count(*) as n from sms_agent_actions where lead_id=%s and tool='book' "
+                    "and result_code=%s and created_at>now()-%s::interval",
+                    (self.lead_id, code, FAILURE_WINDOW),
+                ).fetchone()
+        except Exception as exc:  # noqa: BLE001 - the refusal itself must still reach the model
+            self.trace.log("sms_agent_failure_count_failed", error_category=type(exc).__name__)
+            return 0
+        return int(row["n"]) if row else 0
 
     def _context(self, conn, clinic: str | None,
                  service: str | None = None) -> slot_booking.BookingContext:
@@ -783,26 +997,29 @@ class LiveTools(_BaseTools):
                                              settings=self.settings)
         return ToolResult(output, "list_therapists", "Listed therapists")
 
-    def book_visit(self, *, date: str, time: str, therapist: str | None = None,
-                   first_name: str | None = None, last_name: str | None = None,
-                   date_of_birth: str | None = None, clinic: str | None = None,
-                   service: str | None = None) -> ToolResult:
+    def _book_visit(self, *, date: str, time: str, therapist: str | None = None,
+                    first_name: str | None = None, last_name: str | None = None,
+                    date_of_birth: str | None = None, clinic: str | None = None,
+                    service: str | None = None) -> ToolResult:
         card, refused = self._guard(date, time, therapist, clinic, service)
         if refused:
             return refused
         first_name, last_name = booking_names(self.lead, self.history, first_name, last_name)
+        dob, differs = self._birth_date_for_booking(date_of_birth)
         arguments = {
             "date": card["date"].isoformat(), "time": card["time"],
             "clinician_name": card["therapist"], "location": card["clinic"],
             "first_name": first_name, "last_name": last_name,
-            # The birthday the patient confirmed; the one on file when the model left it out (the
-            # prompt confirms it with the patient before booking).
-            "date_of_birth": date_of_birth or (self.lead.date_of_birth.isoformat()
-                                               if self.lead.date_of_birth else ""),
+            # The date of birth the patient typed and this chat confirmed (check_birthday), which
+            # may differ from the file (voice rule: theirs is used; appointments.patient_dob keeps
+            # it for staff); else the model's, else the one on file.
+            "date_of_birth": dob,
         }
         if card.get("service"):
             arguments["case_type"] = card["service"]  # the service on the card the patient took
         when = f"{_summary_when(card['date'], card['clock'])} with {card['therapist']}"
+        if differs:
+            when += " (date of birth differs from our records: the patient's was used)"
         try:
             output = slot_booking.book_slot(self.trace, lead_id=self.lead_id,
                                             call_id=self.conversation, arguments=arguments,
@@ -966,15 +1183,27 @@ class SandboxTools(_BaseTools):
 
     def __init__(self, trace: WorkflowTrace, *, lead: LeadView, history: list[Turn],
                  practice_id: int, now_local: datetime | None, settings: Settings | None = None,
-                 earlier: set[str] | None = None):
+                 earlier: set[str] | None = None, earlier_failures: dict[str, int] | None = None,
+                 today: date | None = None):
         super().__init__(trace, lead=lead, history=history, settings=settings,
-                         practice_id=practice_id)
+                         practice_id=practice_id, today=today)
         self.now_local = now_local
         # What Elliot did earlier in this chat (sms_agent.EarlierInChat.done): "case_change",
         # "emergency" (within the hour), "hand_off:<reason>" when the tab sent the hand-off's reason
         # back (compared like live), else "hand_off:front_desk" / "hand_off:paused": an older tab's
         # codes carry no reason, so there a reason counts by its kind (booking goes on, or stops).
         self.earlier = set(earlier or ())
+        # Failed bookings earlier in this chat by code (sms_agent.EarlierInChat.failures).
+        self.earlier_failures = dict(earlier_failures or {})
+
+    def _earlier_failures(self, code: str) -> int:
+        return self.earlier_failures.get(code, 0)
+
+    def search_todays(self) -> set[date]:
+        # The test chat's clock is the Context's Now (and the calendar searched).
+        if self.now_local is not None:
+            return {self.now_local.date()}
+        return super().search_todays()
 
     def _earlier(self, key: str) -> bool:
         if key.startswith("hand_off:"):
@@ -1014,10 +1243,10 @@ class SandboxTools(_BaseTools):
             output = slot_booking.providers_text(self._context(conn, clinic))
         return ToolResult(output, "list_therapists", "Listed therapists")
 
-    def book_visit(self, *, date: str, time: str, therapist: str | None = None,
-                   first_name: str | None = None, last_name: str | None = None,
-                   date_of_birth: str | None = None, clinic: str | None = None,
-                   service: str | None = None) -> ToolResult:
+    def _book_visit(self, *, date: str, time: str, therapist: str | None = None,
+                    first_name: str | None = None, last_name: str | None = None,
+                    date_of_birth: str | None = None, clinic: str | None = None,
+                    service: str | None = None) -> ToolResult:
         card, refused = self._guard(date, time, therapist, clinic, service)
         if refused:
             return refused
@@ -1025,17 +1254,19 @@ class SandboxTools(_BaseTools):
             return ToolResult("ALREADY_BOOKED: this patient already has a visit. Do not book again.",
                               "book", "Would not book: already booked")
         first_name, last_name = booking_names(self.lead, self.history, first_name, last_name)
+        dob, differs = self._birth_date_for_booking(date_of_birth)
         with self._conn() as conn:
             context = self._context(conn, card["clinic"], card.get("service"))
-            # The same checks the real booking makes on the name and birthday.
+            # The same checks the real booking makes on the name and birthday (the birthday against
+            # the real date, like book_slot: the test clock may be pinned earlier).
             slot_booking.validate_patient(
-                {"first_name": first_name, "last_name": last_name,
-                 "date_of_birth": date_of_birth or (self.lead.date_of_birth.isoformat()
-                                                    if self.lead.date_of_birth else "")},
-                context.now_local.date())
+                {"first_name": first_name, "last_name": last_name, "date_of_birth": dob},
+                self.birthday_today())
             slot = slot_booking.open_slot(conn, context, "sandbox", card["date"], card["clock"],
                                           card["therapist"])
             when = f"{_summary_when(card['date'], card['clock'])} with {card['therapist']}"
+            if differs:
+                when += " (date of birth differs from our records: the patient's would be used)"
             if slot is not None:
                 booked = self._booked_text(conn, card, first_name)
         if slot is None:

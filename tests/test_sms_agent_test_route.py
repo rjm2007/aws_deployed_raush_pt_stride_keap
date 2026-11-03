@@ -5,7 +5,7 @@ touches a database, OpenAI or Twilio."""
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -214,6 +214,10 @@ def test_setup_passes_clock_model_and_new_person(agent):
         # Dropped from the owner's list (2026-11-02): no longer pickable.
         _setup(model="gpt-4.1"),
         _setup(date_of_birth="2999-01-01"),
+        # Owner, 2026-11-03: at least a year back (a test lead born 2026-11-01 looped on "the year").
+        _setup(date_of_birth=datetime.now(UTC).date().isoformat()),
+        _setup(date_of_birth=(datetime.now(UTC).date() - timedelta(days=200)).isoformat()),
+        _setup(date_of_birth="1899-12-31"),
         _setup(first_name="x" * 61),
         _body(message=""),
         _body(message="   "),
@@ -523,3 +527,13 @@ def test_a_chosen_extra_the_agent_cannot_take_is_refused_not_ignored(agent, chan
     assert response.status_code == 501
     assert "yet" in response.json()["detail"]
     assert agent.calls == []
+
+
+def test_a_birthday_a_year_back_is_accepted_and_the_message_says_why_not(agent):
+    # Owner, 2026-11-03: the setup birthday is at least 1 year in the past.
+    old_enough = (datetime.now(UTC).date() - timedelta(days=400)).isoformat()
+    assert client.post(REPLY, headers=_headers(),
+                       json=_setup(date_of_birth=old_enough)).status_code == 200
+    response = client.post(REPLY, headers=_headers(),
+                           json=_setup(date_of_birth=datetime.now(UTC).date().isoformat()))
+    assert response.status_code == 422 and "at least 1 year ago" in response.text

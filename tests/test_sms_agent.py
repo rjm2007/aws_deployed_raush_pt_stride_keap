@@ -346,7 +346,11 @@ def test_context_block_has_the_lead_and_never_a_phone():
         booking_link="https://book.example/x", services="Pelvic Health, Physical Therapy")
     context = client.responses.requests[0]["input"][1]["content"]
     assert "Front desk open now: yes" in context
-    assert "Sam Test" in context and "March 14, 1990" in context
+    assert "Sam Test" in context
+    # Owner, 2026-11-03: the date on file is never shown to the model (it is never read to the
+    # patient); check_birthday compares in code.
+    assert "Birthday on file: yes" in context and "1990" not in context and "March 14" not in context
+    assert "Date of birth confirmed in this chat: no" in context
     assert "Booked visit: Tue Nov 3 at 9:00 AM with Alan Rome" in context
     assert "https://book.example/x" in context
     assert "Services we book: Pelvic Health, Physical Therapy" in context
@@ -400,7 +404,8 @@ def test_real_config_files_load_and_name_every_contract_tool():
     sms_agent._load_tools.cache_clear()
     names = {tool["name"] for tool in LOAD_TOOLS()}
     assert names == {"find_times", "list_therapists", "confirm_visit", "book_visit",
-                     "report_outcome", "hand_off", "flag_emergency", "send_intro"}
+                     "report_outcome", "hand_off", "flag_emergency", "send_intro",
+                     "check_birthday"}
 
 
 # --- sandbox entry (fake connection: proves it opens only a read-only transaction) ------------------
@@ -1158,3 +1163,45 @@ def test_a_true_front_desk_promise_passes(tool, result, lead_update, history_ext
     reply = run(FakeClient(*script, text(answer)), tools,
                 history=[*history_extra, *ASKED_NAME], lead=lead(**lead_update))
     assert answer in reply.texts and reply.error is None
+
+
+# --- eval 2026-11-03 (x-04): never ask for a last name that is on file ---------------------------------
+
+@pytest.mark.parametrize("answer,asks", [
+    ("And what's your last name?", True),
+    ("Could you send your first and last name?", True),
+    ("Please text me your surname.", True),
+    ("What's your first name?", False),
+    ("Thanks! Which time works best?", False),
+])
+def test_asks_last_name(answer, asks):
+    assert sms_agent.asks_last_name(answer) is asks
+
+
+def test_asking_for_a_last_name_on_file_is_dropped_and_rerun_once():
+    no_first = lead(first_name="", last_name="Quill")
+    trace = Trace()
+    client = FakeClient(text("And what's your last name?"), text("What's your first name?"))
+    reply = run(client, history=[Turn("patient", "yes", None)], lead=no_first, trace=trace)
+    assert reply.texts == ["What's your first name?"] and reply.error is None
+    assert notes(client.responses.requests[1]) == [sms_agent.ASKED_LAST_NAME_NOTE]
+    assert ("sms_agent_guard", {"guard": "asked_last_name", "step": "note"}) in trace.events
+    # A second miss sends nothing of the model's.
+    reply = run(FakeClient(text("What's your last name?"), text("And your last name?")),
+                history=[Turn("patient", "yes", None)], lead=no_first)
+    assert reply.texts == [] and reply.error == "guard:asked_last_name"
+    # No last name on file, or someone new: the question goes out.
+    for view in (lead(last_name=""), lead(is_new_person=True, first_name="", last_name="")):
+        reply = run(FakeClient(text("What's your last name?")),
+                    history=[Turn("patient", "hi", None)], lead=view)
+        assert reply.texts == ["What's your last name?"]
+
+
+def test_context_says_when_only_a_last_name_is_on_file():
+    client = FakeClient(text("Hi"))
+    run(client, lead=lead(first_name="", last_name="Quill"))
+    context = client.responses.requests[0]["input"][1]["content"]
+    assert "Name on file: Quill (last name only: no first name on file)" in context
+    client = FakeClient(text("Hi"))
+    run(client)
+    assert "Name on file: Sam Test\n" in client.responses.requests[0]["input"][1]["content"]

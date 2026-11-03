@@ -825,6 +825,16 @@ def clean_spelled_name(value: str) -> str:
     return value
 
 
+def birth_date_today(context: BookingContext) -> date:
+    """The real clinic date, for checking a date of birth (voice and text).
+
+    Never the demo's pinned booking calendar (BOOKING_TODAY_OVERRIDE): with it pinned to Jul 15 2026,
+    a date of birth after that day was "not possible" and every booking by text failed with
+    BAD_DATE_OF_BIRTH (test chat, 2026-11-03). Without a pinned day (production) this is the same
+    date as before."""
+    return datetime.now(context.now_local.tzinfo).date()
+
+
 def validate_patient(arguments: dict[str, Any], today: date) -> Patient:
     first = clean_spelled_name(str(arguments.get("first_name") or "").strip())
     last = clean_spelled_name(str(arguments.get("last_name") or "").strip())
@@ -1177,7 +1187,7 @@ def book_slot(
     with transaction() as conn:
         context = load_context(conn, lead_id, location_name=arguments.get("location"),
                                case_type_name=arguments.get("case_type"), settings=settings)
-        patient = validate_patient(arguments, context.now_local.date())
+        patient = validate_patient(arguments, birth_date_today(context))
         if not context.booking_enabled:
             raise BookingToolError("Booking is switched off for this practice.")
         existing = _existing_booking(conn, lead_id)

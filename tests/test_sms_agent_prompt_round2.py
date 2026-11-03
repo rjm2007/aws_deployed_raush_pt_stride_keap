@@ -59,11 +59,11 @@ def test_plain_yes_after_a_therapist_list_searches_at_once():
 
 
 def test_date_of_birth_is_never_written_with_the_year():
-    # book-11: "Got it, Aug 23, 1985." The read-back is month and day only.
-    assert "month and day only" in FLAT and "never the year" in FLAT
+    # book-11: "Got it, Aug 23, 1985." Since 2026-11-03 no date of birth is written back at all.
+    assert "Never write a date of birth in a text" in FLAT and "never the year" in FLAT
     for text in _texts():
         assert not re.search(r"\b(19|20)\d{2}\b", text), text
-    assert "month and day only, never the year" in TOOLS["confirm_visit"]["description"]
+    assert "never their date of birth" in TOOLS["confirm_visit"]["description"]
 
 
 def test_no_clinicians_offers_the_clinics_it_lists():
@@ -85,8 +85,8 @@ def test_missing_name_sends_the_card_again_and_never_asks_for_the_last_name():
     # x-04: after the first name the model asked for the last name (on file), then promised the
     # front desk. book_visit right after the name is always NOT_CONFIRMED (the card is not the
     # latest text), so the next step is confirm_visit.
-    assert ("with their answer, call confirm_visit for the same time in that turn (the card goes "
-            "out again), then book_visit after their yes") in FLAT
+    assert ("with their answer, call confirm_visit for the same time with first_name in that turn "
+            "(the card goes out again), then book_visit after their yes") in FLAT
     assert "never the last name: it is on file" in FLAT
     assert "Never hand off for a missing name." in FLAT
     description = TOOLS["book_visit"]["description"]
@@ -109,3 +109,24 @@ def test_a_moved_search_day_is_named():
     # book-12: "nothing this afternoon" for a search of tomorrow.
     assert 'A today or tomorrow search reply names the day it searched ("Searched tomorrow' in FLAT
     assert "'Searched tomorrow, Thu Nov 5'" in TOOLS["find_times"]["description"]
+
+
+# --- eval 2026-11-03 (results-gpt-5.5-dob.json) -------------------------------------------------------
+
+def test_the_first_name_is_asked_before_the_card_and_never_the_last_name_on_file():
+    # x-04: after the yes to the card Elliot asked "what's your last name?" (on file) and later
+    # passed the last name as first_name.
+    assert "Never ask for a last name that is on file." in FLAT
+    assert ("ask only \"What's your first name?\" (never the last name: it is on file), then pass it "
+            "as first_name to confirm_visit") in FLAT
+    assert "the card comes after the first name, never before" in FLAT
+    confirm = TOOLS["confirm_visit"]
+    assert "MISSING_NAME = no card was sent" in confirm["description"]
+    assert "first_name" in confirm["parameters"]["required"]
+    assert confirm["parameters"]["properties"]["first_name"]["type"] == ["string", "null"]
+
+
+def test_no_remark_on_whether_the_date_of_birth_matches_the_file():
+    # dob-01: "Thanks, we already have your identity confirmed."
+    assert "Never remark on whether their date matches our records" in FLAT
+    assert '"identity confirmed"' in FLAT
