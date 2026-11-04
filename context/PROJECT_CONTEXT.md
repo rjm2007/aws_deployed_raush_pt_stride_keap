@@ -2895,3 +2895,14 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
   `BOOKING_TODAY_OVERRIDE`; production (no pinned day) is unchanged.
 - Test chat setup birthday must be at least 1 year back (route 422 + tab). Docs: `docs/SMS_AGENT.md`
   "Birthday step". Tests: `test_sms_agent_birthday.py`, integration cases on local pgserver.
+
+### 2026-11-04 — SMS agent: booking steps run by code (owner, Yajat's test)
+
+- Bug (demo test chat): the patient said "yes" to the card and Elliot handed off to the front desk; nothing
+  was booked. The model chose the hand-off itself (1 of 8 replays).
+- Now code, not the model, books a plain yes to the card (retry once on IN_PROGRESS, hand off on failure),
+  asks the date of birth naming the picked slot, and sends the card when a valid date of birth answers
+  that question (`sms_agent.code_steps`). Card opens "Here's your visit:" (no "Great choice!").
+- Docs: `docs/SMS_AGENT.md` "Booking steps run by code". Tests: `test_sms_agent.py`,
+  `test_sms_agent_birthday.py`, integration on local pgserver; eval: 21 booking/birthday chats on gpt-5.5
+  (new scripted dob-03 = Yajat's chat).

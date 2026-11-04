@@ -143,6 +143,26 @@ the reply still says "Searched tomorrow". Other `when` values and other codes ar
 The model's final answer `NO_REPLY` (or a copy like "(empty answer)") = no text, but only when the code
 guards below allow it.
 
+### Booking steps run by code (owner, 2026-11-04)
+
+Yajat's test chat: "yes" to the card got a front-desk hand-off and no booking (gpt-5.5 chose wrong in 1 of 8
+replays). The must-not-fail steps now run in code before the model (`sms_agent.code_steps`); the model
+reads a "Code step" note with each tool's reply, those tools are taken out of its list for that reply, and
+a call to them anyway gets ALREADY_CALLED without running:
+- A plain yes to the card (`said_yes_to_card`), lead with both names on file: `book_visit` for the card
+  (date from `texts.card_date`); IN_PROGRESS = once more; still IN_PROGRESS or ERROR = `hand_off`
+  booking_problem. After BOOKED the model cannot hand off booking_problem.
+- `confirm_visit` before a confirmed date of birth texts our question naming the slot
+  (`texts.birthday_question`: "For Mon Jul 20 at 5:45 PM with Alan Rome at our Dana Point office, to confirm
+  it's you, what's your date of birth?"), never twice in a row. The patient's next text, once the chat has
+  a confirmed date of birth and the text changes nothing (no day, time, "instead", no), gets the card for
+  that slot from code (`card_after_birthday`). A date that differs from the file stays the model's
+  (double-check).
+- The model asking for the date of birth in its own words before any such question is sent back once
+  (guard `birthday_question`, forces `confirm_visit`); a second time it goes out.
+- The card's first line is "Here's your visit:" (was "Great choice! Here's your visit:"; old cards still
+  parse).
+
 ### Code guards on the model's own text (gpt-5.5 eval, 2026-11-02)
 
 The eval (`../../test/sms-agent-eval-2026-11-02/`, 25 of 63 passed) showed a model that ignores the

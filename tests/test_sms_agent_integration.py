@@ -548,7 +548,7 @@ def test_reply_live_books_from_the_database_history(env):
     roles = [item["role"] for item in request["input"]]
     assert roles == ["developer", "developer", "developer", "user", "assistant", "user",
                      "developer"]
-    assert request["input"][-1]["content"].startswith("Code step: the patient said yes")
+    assert request["input"][-1]["content"].startswith("Code step: for the patient's latest text")
     assert "book_visit" not in [spec["name"] for spec in request["tools"]]
     assert env.one("select count(*) as n from appointments where lead_id=%s", lead_id)["n"] == 1
     phone = env.one("select phone_e164 from leads where id=%s", lead_id)["phone_e164"]
@@ -1055,30 +1055,38 @@ def test_sandbox_birthday_step_end_to_end_on_the_pinned_calendar(env):
     setup = SandboxSetup(clinic="Laguna Niguel", first_name="Sam", last_name="Test",
                          date_of_birth=date(1990, 3, 14), practice_slug=env.practice_slug)
     pick = {"date": DAY1, "time": "9:00 AM", "therapist": "Thao Nguyen", "clinic": None}
-    asked = "To confirm it's you, what's your date of birth?"
-    chat = [Turn("patient", "tue 9am", None), Turn("elliot", asked, None),
-            Turn("patient", "nov 1, 2026", None)]
+    # The pick: confirm_visit texts our question naming the time (2026-11-04), no card yet.
+    chat = [Turn("patient", "tue 9am", None)]
+    client = FakeClient(tool("confirm_visit", **pick), say("NO_REPLY"))
+    reply = reply_sandbox(setup=setup, history=chat, settings=env.settings(), client=client)
+    assert [a.result_code for a in reply.actions] == ["NEED_BIRTH_DATE"]
+    [asked] = reply.texts
+    assert texts.parse_birthday_question(asked)["therapist"] == "Thao Nguyen"
+    assert "Date of birth confirmed in this chat: no" in client.responses.requests[0]["input"][1][
+        "content"]
+
+    # An impossible date: the model asks again; the question is not sent twice.
+    chat += [Turn("elliot", asked, None), Turn("patient", "nov 1, 2026", None)]
     client = FakeClient(tool("check_birthday", date_of_birth="nov 1, 2026"),
                         tool("confirm_visit", **pick), say("Could you check it and send it again?"))
     reply = reply_sandbox(setup=setup, history=chat, settings=env.settings(), client=client)
     assert [a.result_code for a in reply.actions] == ["NOT_POSSIBLE", "NEED_BIRTH_DATE"]
     assert reply.texts == ["Could you check it and send it again?"]
-    assert "Date of birth confirmed in this chat: no" in client.responses.requests[0]["input"][1][
-        "content"]
 
+    # A valid date: code sends the card for the time in our question, before the model runs.
     chat += [Turn("elliot", reply.texts[0], None), Turn("patient", "3/14/1990", None)]
-    client = FakeClient(tool("check_birthday", date_of_birth="3/14/1990"),
-                        tool("confirm_visit", **pick), say("NO_REPLY"))
+    client = FakeClient(say("NO_REPLY"))
     reply = reply_sandbox(setup=setup, history=chat, settings=env.settings(), client=client)
-    assert [a.result_code for a in reply.actions] == ["MATCH", "CARD_SENT"]
+    assert [a.result_code for a in reply.actions] == ["CARD_SENT"]
     [card] = reply.texts
+    assert texts.parse_card(card)["time"] == "9:00 AM"
     context = client.responses.requests[0]["input"][1]["content"]
     assert "Date of birth confirmed in this chat: yes" in context and "1990" not in context
 
+    # The yes: code books it with the chat's confirmed date.
     chat += [Turn("elliot", card, None), Turn("patient", "yes", None)]
-    client = FakeClient(tool("book_visit", **pick, date_of_birth="2026-11-01"), say("NO_REPLY"))
+    client = FakeClient(say("NO_REPLY"))
     reply = reply_sandbox(setup=setup, history=chat, settings=env.settings(), client=client)
-    # The chat's confirmed date is used, whatever the model passes.
     assert [a.result_code for a in reply.actions] == ["BOOKED"]
     assert reply.texts[0].startswith("You're all set, Sam!")
     assert counts(env) == before

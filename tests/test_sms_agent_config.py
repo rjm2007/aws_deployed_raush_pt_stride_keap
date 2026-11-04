@@ -139,7 +139,10 @@ def test_examples_never_read_a_birthday_to_the_patient_and_check_it_in_code():
     # Owner, 2026-11-03 (test chat looped on "is your birthday November 1?"): the patient types
     # their date of birth; check_birthday compares; confirm_visit follows in the same turn.
     assert "is your birthday" not in PROMPT
-    assert "To confirm it's you, what's your date of birth?" in PROMPT
+    # 2026-11-04: the question is ours (confirm_visit), naming the time; a valid answer to it gets
+    # the card from code.
+    assert texts.BIRTHDAY_QUESTION_END in PROMPT
+    assert "(Code step: confirm_visit" in PROMPT and "(Code step: book_visit" in PROMPT
     checked = 0
     for example in EXAMPLES:
         lines = example.splitlines()
@@ -148,7 +151,7 @@ def test_examples_never_read_a_birthday_to_the_patient_and_check_it_in_code():
                     ("-> MATCH", "-> NEW", "-> CONFIRMED_DIFFERENT")):
                 checked += 1
                 assert lines[i + 1].startswith("Tool: confirm_visit"), example
-    assert checked >= 3
+    assert checked >= 1
 
 
 def test_prompt_never_asks_for_the_date_of_birth_again_once_confirmed():

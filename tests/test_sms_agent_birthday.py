@@ -291,18 +291,64 @@ def test_check_birthday_tool_needs_no_database(monkeypatch):
     assert result.code == "MATCH" and result.kind == "check_birthday" and not result.fixed_texts
 
 
+QUESTION = texts.birthday_question(date(2026, 7, 18), time(10, 0), "Thao Nguyen", "Dana Point")
+
+
+def fake_slot(monkeypatch, tools):
+    """confirm_visit finds Thao's 10:00 AM on Sat Jul 18 at Dana Point without a database."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def conn():
+        # default_service: Physical Therapy (no service line on the card).
+        yield SimpleNamespace(execute=lambda *a, **k: SimpleNamespace(
+            fetchone=lambda: {"name": "Physical Therapy"}))
+
+    context = SimpleNamespace(case_type={"name": "Physical Therapy"},
+                              location={"name": "Dana Point"}, clinicians=[],
+                              lead={"practice_id": 1})
+    slot = {"local_date": date(2026, 7, 18), "local_time": time(10, 0),
+            "display_name": "Thao Nguyen"}
+    monkeypatch.setattr(slot_booking, "open_slot", lambda *a, **k: slot)
+    monkeypatch.setattr(tools, "_conn", conn)
+    monkeypatch.setattr(tools, "_context", lambda *a, **k: context)
+
+
+@pytest.mark.parametrize("history", [
+    chat(("patient", "10am works")), chat(("patient", "nov 1")), chat(("patient", "nov 1, 2026")),
+])
+def test_no_card_before_a_date_of_birth_code_asks_for_it_naming_the_time(monkeypatch, history):
+    # Owner, 2026-11-04: the question is ours, word for word, so the answer gets the card from code.
+    tools = sandbox(history)
+    fake_slot(monkeypatch, tools)
+    result = call_tool(tools, "confirm_visit", {"date": "2026-07-18", "time": "10:00 AM"})
+    assert result.code == "NEED_BIRTH_DATE" and result.fixed_texts == [QUESTION]
+    assert result.send_last and "NO_REPLY" in result.output
+    assert QUESTION == ("For Sat Jul 18 at 10:00 AM with Thao Nguyen at our Dana Point office, "
+                        "to confirm it's you, what's your date of birth?")
+    assert texts.parse_birthday_question(QUESTION) == {
+        "day": "Sat Jul 18", "time": "10:00 AM", "therapist": "Thao Nguyen", "service": None,
+        "clinic": "Dana Point"}
+
+
 @pytest.mark.parametrize("history,expected", [
-    (chat(("patient", "10am works")), "Ask once"),
-    (chat(("patient", "nov 1")), "Ask once"),
-    (chat(("patient", "nov 1, 2026")), "Ask once"),
+    (chat(("elliot", QUESTION), ("patient", "nov 1")), "type it again"),
     (chat(("patient", "7/2/1979")), "double-check"),
 ])
-def test_no_card_before_a_date_of_birth_is_confirmed(monkeypatch, history, expected):
+def test_the_question_is_never_sent_twice_in_a_row(monkeypatch, history, expected):
     tools = sandbox(history)
-    no_db(monkeypatch, tools)
+    fake_slot(monkeypatch, tools)
     result = call_tool(tools, "confirm_visit", {"date": "2026-07-18", "time": "10:00 AM"})
     assert result.code == "NEED_BIRTH_DATE" and expected in result.output
     assert not result.fixed_texts
+
+
+def test_birthday_question_names_a_service_other_than_the_default():
+    question = texts.birthday_question(date(2026, 11, 16), time(13, 0), "Thao Nguyen",
+                                       "Dana Point", service="Pelvic Health")
+    assert question.startswith("For Mon Nov 16 at 1:00 PM with Thao Nguyen (Pelvic Health) at our")
+    assert texts.parse_birthday_question(question)["service"] == "Pelvic Health"
+    assert texts.parse_birthday_question("To confirm it's you, what's your date of birth?") is None
 
 
 def test_the_same_card_is_never_sent_twice_in_a_row(monkeypatch):
@@ -473,10 +519,17 @@ def test_a_confirmed_date_of_birth_is_never_asked_again(small_config):
     # A second miss sends nothing of the model's.
     reply = run(history, Client("What's your birthday?", "What's your DOB?"))
     assert reply.texts == [] and reply.error == "guard:asked_birth_date"
-    # Before it is confirmed the question is the identity step and goes out.
-    reply = run(chat(("patient", "10am works")),
-                Client("To confirm it's you, what's your date of birth?"))
+    # Before it is confirmed, the first question is ours (confirm_visit names the time,
+    # 2026-11-04): the model's own is sent back once, then goes out rather than nothing.
+    client = Client("To confirm it's you, what's your date of birth?",
+                    "To confirm it's you, what's your date of birth?")
+    reply = run(chat(("patient", "10am works")), client)
     assert reply.texts == ["To confirm it's you, what's your date of birth?"]
+    assert client.requests[1]["input"][-1]["content"] == sms_agent.BIRTHDAY_QUESTION_NOTE
+    # Asking again after our question (an unreadable answer) is the model's to do.
+    reply = run(chat(("elliot", QUESTION), ("patient", "march")),
+                Client("Could you type it with the year, like 3/14/1988?"))
+    assert reply.texts == ["Could you type it with the year, like 3/14/1988?"]
 
 
 def test_live_reads_further_back_for_the_date_of_birth():

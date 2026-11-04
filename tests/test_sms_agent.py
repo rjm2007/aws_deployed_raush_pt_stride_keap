@@ -845,19 +845,103 @@ def test_a_yes_to_the_card_books_before_the_model_can_hand_off():
     assert [action.result_code for action in reply.actions] == ["BOOKED"]
     request = client.responses.requests[0]
     # The model is told what was done and cannot book a second time.
-    assert any(str(item.get("content", "")).startswith("Code step: the patient said yes")
-               and "BOOKED: sent" in item["content"] for item in request["input"])
+    assert any(str(item.get("content", "")).startswith("Code step: for the patient's latest text")
+               and "book_visit -> BOOKED: sent" in item["content"] for item in request["input"])
     assert "book_visit" not in [spec["name"] for spec in request["tools"]]
 
 
-def test_a_card_answered_in_progress_keeps_book_visit_for_the_retry():
+class SequenceTools(FakeTools):
+    """book_visit answers in turn from a list."""
+
+    def __init__(self, bookings, **replies):
+        super().__init__(**replies)
+        self.bookings = list(bookings)
+
+    def book_visit(self, *, date, time, therapist=None, first_name=None, last_name=None,
+                   date_of_birth=None, clinic=None):
+        self.calls.append(("book_visit", {"date": date, "time": time}))
+        return self.bookings.pop(0)
+
+
+def test_a_booking_still_running_is_tried_once_more_in_code():
     waiting = ToolResult("IN_PROGRESS: wait a moment", "book", "Booking still running")
-    tools = FakeTools(book_visit=waiting)
-    client = FakeClient(calls(("book_visit", {"date": "2026-11-05", "time": "10:30 AM"})),
-                        text("NO_REPLY"))
-    run(client, tools, history=YES_TO_CARD)
-    assert "book_visit" in [spec["name"] for spec in client.responses.requests[0]["tools"]]
-    assert len(tools.calls) == 2
+    booked = ToolResult("BOOKED: sent", "book", "Booked", fixed_texts=["BOOKED TEXT"])
+    tools = SequenceTools([waiting, booked])
+    reply = run(FakeClient(text("NO_REPLY")), tools, history=YES_TO_CARD)
+    assert [name for name, _ in tools.calls] == ["book_visit", "book_visit"]
+    assert reply.texts == ["BOOKED TEXT"]
+
+
+@pytest.mark.parametrize("bookings", [
+    ["IN_PROGRESS: wait a moment", "IN_PROGRESS: wait a moment"],
+    ["ERROR: book_visit did not work on our side"],
+])
+def test_a_booking_that_did_not_go_through_hands_off_in_code(bookings):
+    # The prompt's rule (IN_PROGRESS twice or ERROR = hand_off booking_problem), now in code.
+    handed = ToolResult("HANDED_OFF: front desk text sent", "hand_off", "Handed off",
+                        fixed_texts=["FRONT DESK TEXT"], action_code="HANDED_OFF_PAUSED",
+                        reason="booking_problem")
+    tools = SequenceTools([ToolResult(output, "book", "Booking") for output in bookings],
+                          hand_off=handed)
+    client = FakeClient(calls(("hand_off", {"reason": "booking_problem"})),
+                        text("I couldn't finish booking that by text, so our front desk will "
+                             "finish setting up your visit."))
+    reply = run(client, tools, history=YES_TO_CARD)
+    assert [name for name, _ in tools.calls] == ["book_visit"] * len(bookings) + ["hand_off"]
+    assert tools.calls[-1][1] == {"reason": "booking_problem"}
+    assert reply.texts[0] == "FRONT DESK TEXT" and len(reply.texts) == 2
+    # The model's own second hand-off is answered without running it.
+    names = [spec["name"] for spec in client.responses.requests[0]["tools"]]
+    assert "book_visit" not in names and "hand_off" not in names
+    assert len([name for name, _ in tools.calls if name == "hand_off"]) == 1
+
+
+QUESTION = texts.birthday_question(date(2026, 11, 5), dtime(10, 30), "Thao Nguyen", "Mission Viejo")
+
+
+@pytest.mark.parametrize("answer", ["3/14/1990", "march 14 1990", "it's 3-14-90 thanks"])
+def test_a_date_of_birth_after_our_question_gets_the_card_from_code(answer):
+    card = ToolResult("CARD_SENT: sent", "confirm_visit", "Read back", fixed_texts=[CARD],
+                      send_last=True)
+    tools = FakeTools(confirm_visit=card)
+    client = FakeClient(text("NO_REPLY"))
+    reply = run(client, tools, history=[Turn("patient", "10:30 works", None),
+                                        Turn("elliot", QUESTION, None),
+                                        Turn("patient", answer, None)])
+    assert tools.calls == [("confirm_visit", {"date": "2026-11-05", "time": "10:30 AM",
+                                              "therapist": "Thao Nguyen"})]
+    assert reply.texts == [CARD]
+    assert "confirm_visit" not in [spec["name"] for spec in client.responses.requests[0]["tools"]]
+
+
+@pytest.mark.parametrize("history", [
+    # A date that is not theirs (pending double-check), or none yet.
+    [Turn("elliot", QUESTION, None), Turn("patient", "3/15/1991", None)],
+    [Turn("elliot", QUESTION, None), Turn("patient", "march", None)],
+    # Their text changes the pick.
+    [Turn("elliot", QUESTION, None), Turn("patient", "3/14/1990 but can we do Friday?", None)],
+    [Turn("elliot", QUESTION, None), Turn("patient", "3/14/1990, 9am instead", None)],
+    # The card already went after the question.
+    [Turn("elliot", QUESTION, None), Turn("patient", "3/14/1990", None),
+     Turn("elliot", CARD, None), Turn("patient", "what's the address?", None)],
+    # The model's own question names no time: the model sends the card.
+    [Turn("elliot", "To confirm it's you, what's your date of birth?", None),
+     Turn("patient", "3/14/1990", None)],
+])
+def test_code_sends_the_card_only_for_a_plain_answer_to_our_question(history):
+    tools = FakeTools()
+    run(FakeClient(text("Sure.")), tools, history=history)
+    assert [name for name, _ in tools.calls if name == "confirm_visit"] == []
+
+
+def test_our_birthday_question_is_not_asked_twice_by_the_model():
+    question = ToolResult("NEED_BIRTH_DATE: asked", "confirm_visit", "Asked",
+                          fixed_texts=[QUESTION], send_last=True)
+    client = FakeClient(calls(("confirm_visit", {"date": "2026-11-05", "time": "10:30 AM"})),
+                        text("Great, to confirm it's you, what's your date of birth?"))
+    reply = run(client, FakeTools(confirm_visit=question),
+                history=[Turn("patient", "10:30 works", None)])
+    assert reply.texts == [QUESTION]
 
 
 @pytest.mark.parametrize("history,who", [
@@ -1073,9 +1157,9 @@ def test_the_full_birthday_on_file_is_never_texted():
     # The dropped text is not fed back, and the log has no date.
     assert "03/14/1990" not in json.dumps(client.responses.requests[1]["input"])
     assert "1990" not in json.dumps(trace.events)
-    # Month and day only is fine.
-    assert run(FakeClient(text("Just to confirm, is your birthday March 14?"))).texts == [
-        "Just to confirm, is your birthday March 14?"]
+    # Month and day only is no birth date written out (asking it is another guard's business).
+    assert not sms_agent.writes_birth_date("Just to confirm, is your birthday March 14?", lead(),
+                                           [], NOW.date())
 
 
 def test_a_birthday_the_patient_corrected_in_chat_is_never_texted_back():

@@ -194,6 +194,33 @@ def parse_card(text: str | None) -> dict[str, str | None] | None:
     return match.groupdict() if match else None
 
 
+# The date of birth question, sent by code with the picked time (owner, 2026-11-04: the booking steps
+# are code, not the model's choice), so the next turn can send the card for that time itself.
+BIRTHDAY_QUESTION_END = "to confirm it's you, what's your date of birth?"
+
+
+def birthday_question(day: date, time: clock_time, therapist: str, clinic: str,
+                      service: str | None = None) -> str:
+    """"For Mon Jul 20 at 5:45 PM with Alan Rome at our Dana Point office, to confirm it's you,
+    what's your date of birth?" (`service`: named when it is not the default, like the card)."""
+    service_part = f" ({service.strip()})" if service and service.strip() else ""
+    return (f"For {card_day(day)} at {card_time(time)} with {therapist}{service_part} at our "
+            f"{clinic} office, {BIRTHDAY_QUESTION_END}")
+
+
+_BIRTHDAY_QUESTION = re.compile(
+    r"^For (?P<day>\w{3} \w{3} \d{1,2}) at (?P<time>\d{1,2}:\d{2} [AP]M) with "
+    r"(?P<therapist>[^\n(]+?)(?: \((?P<service>[^)\n]+)\))? at our (?P<clinic>[^\n]+?) office, "
+    + re.escape(BIRTHDAY_QUESTION_END) + r"$"
+)
+
+
+def parse_birthday_question(text: str | None) -> dict[str, str | None] | None:
+    """day / time / therapist / service / clinic of our date of birth question, or None."""
+    match = _BIRTHDAY_QUESTION.match((text or "").strip())
+    return match.groupdict() if match else None
+
+
 def long_day(value: date | datetime) -> str:
     """"Tuesday, November 3" for the booked text."""
     return f"{value:%A}, {value:%B} {value.day}"

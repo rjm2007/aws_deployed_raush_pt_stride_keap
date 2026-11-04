@@ -519,9 +519,14 @@ def hand_off_code(reason: str) -> str:
     return "HANDED_OFF" if reason in FRONT_DESK_BOOKABLE_REASONS else "HANDED_OFF_PAUSED"
 
 
-NEED_BIRTH_DATE = ("NEED_BIRTH_DATE: no card was sent: no date of birth is confirmed in this chat yet. "
-                   "Ask once, \"To confirm it's you, what's your date of birth?\", then call "
-                   "check_birthday with their answer, then confirm_visit.")
+# confirm_visit before a date of birth is confirmed: code texts the question naming the time
+# (2026-11-04); the model adds nothing.
+BIRTH_DATE_ASKED = ("NEED_BIRTH_DATE: no card yet: our date of birth question for this time was texted "
+                    "to the patient word for word. Add nothing (NO_REPLY): never ask for the date of "
+                    "birth in your own words.")
+BIRTH_DATE_ASKED_AGAIN = ("NEED_BIRTH_DATE: no card yet: our date of birth question for this time is "
+                          "already your latest text and their answer is not a full date of birth. "
+                          "Ask once to type it again with the year, like 3/14/1988.")
 PENDING_BIRTH_DATE = ("NEED_BIRTH_DATE: no card was sent: the date of birth they typed is not the one "
                       "in our records. Ask them once to double-check it (\"Could you double-check "
                       "that date of birth for me?\"), never saying the date on file; then "
@@ -780,16 +785,6 @@ class _BaseTools:
             return ToolResult(f"ALREADY_BOOKED: this patient already has a visit "
                               f"({self.lead.booked_visit or 'on record'}). Do not book again.",
                               "confirm_visit", "Already booked")
-        state = self.birthday_state()
-        if state.confirmed is None:
-            # The identity step comes first (owner, 2026-11-03): the date of birth typed in this
-            # chat, checked by check_birthday; never a yes to a date read to them.
-            return ToolResult(PENDING_BIRTH_DATE if state.pending else NEED_BIRTH_DATE,
-                              "confirm_visit", "No card: date of birth not confirmed yet")
-        if self.no_first_name() and not first_name_in_chat(self.lead, self.history, first_name):
-            # x-04 (2026-11-03): the first name comes before the card, never after the yes.
-            return ToolResult(MISSING_FIRST_NAME_CARD, "confirm_visit",
-                              "No card: no first name yet")
         wanted_day = _parse_day(date, "date")
         wanted_time = slot_booking.parse_clock(time)
         with self._conn() as conn:
@@ -808,6 +803,28 @@ class _BaseTools:
                 f"NOT_AVAILABLE: {texts.card_time(wanted_time)} on {texts.long_day(wanted_day)} "
                 f"is not an open time{f' with {therapist}' if therapist else ''}. {others}",
                 "confirm_visit", f"{_summary_when(wanted_day, wanted_time)} is not open")
+        state = self.birthday_state()
+        if state.confirmed is None:
+            # The identity step comes first (owner, 2026-11-03): the date of birth typed in this
+            # chat; never a yes to a date read to them. Our question names the time (2026-11-04),
+            # so their answer gets this card from code, not from the model's choice.
+            if state.pending:
+                return ToolResult(PENDING_BIRTH_DATE, "confirm_visit",
+                                  "No card: date of birth not confirmed yet")
+            question = texts.birthday_question(slot["local_date"], slot["local_time"],
+                                               slot["display_name"], context.location["name"],
+                                               service=shown)
+            if last_elliot_text(self.history).strip() == question:
+                return ToolResult(BIRTH_DATE_ASKED_AGAIN, "confirm_visit",
+                                  "No card: date of birth not readable yet")
+            return ToolResult(BIRTH_DATE_ASKED, "confirm_visit",
+                              f"Asked for the date of birth for "
+                              f"{_summary_when(slot['local_date'], slot['local_time'])}",
+                              fixed_texts=[question], send_last=True)
+        if self.no_first_name() and not first_name_in_chat(self.lead, self.history, first_name):
+            # x-04 (2026-11-03): the first name comes before the card, never after the yes.
+            return ToolResult(MISSING_FIRST_NAME_CARD, "confirm_visit",
+                              "No card: no first name yet")
         card = texts.confirm_card(slot["local_date"], slot["local_time"], slot["display_name"],
                                   context.location["name"], service=shown)
         if last_elliot_text(self.history).strip() == card.strip():

@@ -291,10 +291,14 @@ _DONE_STATUSES = {"booked", "callback_scheduled", "booking_link_sent", "declined
 BOOK_NOTE = ("Code check: your last answer said the visit is booked, but nothing was booked in this "
              "reply (no book_visit returned BOOKED), so it was not sent. The patient said yes to the "
              "read-back card: call book_visit now for the date, time and therapist on that card.")
-BOOKED_ON_YES_NOTE = ("Code step: the patient said yes to the read-back card, so our system already "
-                      "called book_visit with the card's date, time, therapist and clinic. Its "
-                      "reply: {output}\nFollow that reply as if you had called book_visit "
-                      "yourself; never hand off instead of a booking that went through.")
+BIRTHDAY_QUESTION_NOTE = ("Code check: your last answer asked for the date of birth in your own "
+                          "words, so it was not sent. Call confirm_visit for the time they picked: "
+                          "our system asks for the date of birth naming that time. If they have not "
+                          "picked a time yet, do not ask for the date of birth yet.")
+CODE_STEP_NOTE = ("Code step: for the patient's latest text our system already made these tool calls "
+                  "(the same ones you would make), and any fixed text in them is on its way:\n{steps}\n"
+                  "Follow those replies as if you had made the calls yourself and do not make them "
+                  "again; never hand off instead of a booking that went through.")
 CLAIM_NOTE = ("Code check: your last answer said the visit is booked, but nothing was booked (no "
               "book_visit returned BOOKED), so it was not sent. Never say a visit is booked unless "
               "book_visit returned BOOKED. Continue the step you were on: the read-back card comes "
@@ -523,24 +527,74 @@ def said_yes_to_card(history: list[Turn]) -> bool:
     return bool(_YES.match(_words(replies[-1])))
 
 
+# ToolResult.kind -> the tool's name (book_visit's results are kind "book").
+_TOOL_OF_KIND = {"book": "book_visit"}
+# Words that change the pick ("actually Tuesday", "can we do 10?"): the model reads those texts.
+_OTHER_PICK = re.compile(r"\b(?:mon|tues?|wed|thu|thur|thurs|fri|sat|sun)(?:day)?\b|\b(?:today|"
+                         r"tomorrow|tmrw|next|week|morning|afternoon|evening)\b")
+
+
+def code_steps(lead: LeadView, history: list[Turn], tools: AgentTools, *, settled, now: datetime,
+               trace: WorkflowTrace | None = None) -> list[ToolResult]:
+    """The booking steps code takes before the model runs (owner, 2026-11-04: the model chose a
+    front-desk hand-off over book_visit for a plain yes in Yajat's test): a yes to the card books
+    it, a failed booking hands off; a date of birth typed after our question gets the card."""
+    return (book_on_yes(lead, history, tools, now=now, trace=trace)
+            or card_after_birthday(lead, history, tools, settled=settled, now=now, trace=trace))
+
+
 def book_on_yes(lead: LeadView, history: list[Turn], tools: AgentTools, *, now: datetime,
-                trace: WorkflowTrace | None = None) -> ToolResult | None:
-    """A plain yes to the card books it in code, before the model runs (Yajat's test, 2026-11-04:
-    gpt-5.5 answered "yes" with a front-desk hand-off in 1 of 8 replays and nothing was booked).
-    Only for a lead with both names on file: otherwise the model passes the names from the chat."""
+                trace: WorkflowTrace | None = None) -> list[ToolResult]:
+    """A plain yes to the card: book_visit for the card (once more after IN_PROGRESS, like the
+    prompt's rule), then a booking_problem hand-off if it did not go through. Only for a lead with
+    both names on file: otherwise the model passes the names from the chat."""
     if lead.is_new_person or not (lead.first_name or "").strip() or not (
             lead.last_name or "").strip():
-        return None
+        return []
     if not said_yes_to_card(history):
-        return None
+        return []
     elliot = [turn for turn in history if turn.role == "elliot"]
     card = texts.parse_card(elliot[-1].text)
     day = texts.card_date(card["day"], now.astimezone(CLINIC_TZ).date()) if card else None
     if day is None:
-        return None
-    return call_tool(tools, "book_visit", {
-        "date": day.isoformat(), "time": card["time"], "therapist": card["therapist"],
-        "clinic": card["clinic"], "service": card["service"]}, trace)
+        return []
+    arguments = {"date": day.isoformat(), "time": card["time"], "therapist": card["therapist"],
+                 "clinic": card["clinic"], "service": card["service"]}
+    results = [call_tool(tools, "book_visit", arguments, trace)]
+    if results[-1].code == "IN_PROGRESS":
+        results.append(call_tool(tools, "book_visit", arguments, trace))
+    if results[-1].code in ("IN_PROGRESS", "ERROR"):
+        results.append(call_tool(tools, "hand_off", {
+            "reason": "booking_problem",
+            "notes": "Booking by text did not go through; please book by hand."}, trace))
+    return results
+
+
+def card_after_birthday(lead: LeadView, history: list[Turn], tools: AgentTools, *, settled,
+                        now: datetime, trace: WorkflowTrace | None = None) -> list[ToolResult]:
+    """The patient answered our date of birth question (it names the time) and the chat now has a
+    confirmed date of birth: confirm_visit for that time. Not when their text also changes the
+    pick, says no, or a card already went after the question."""
+    if settled.confirmed is None:
+        return []
+    asked = max((index for index, turn in enumerate(history) if turn.role == "elliot"
+                 and texts.parse_birthday_question(turn.text)), default=None)
+    latest = _latest_patient(history)
+    if asked is None or latest is None or latest < asked:
+        return []
+    if any(turn.role == "elliot" and texts.parse_card(turn.text) for turn in history[asked:]):
+        return []
+    words = _flat(history[latest].text)
+    if clear_no(history[latest].text) or _YES_BUT.search(words) or _OTHER_PICK.search(words) or (
+            _CLOCK_TIME.search(history[latest].text)):
+        return []
+    pick = texts.parse_birthday_question(history[asked].text)
+    day = texts.card_date(pick["day"], now.astimezone(CLINIC_TZ).date())
+    if day is None:
+        return []
+    return [call_tool(tools, "confirm_visit", {
+        "date": day.isoformat(), "time": pick["time"], "therapist": pick["therapist"],
+        "clinic": pick["clinic"], "service": pick["service"]}, trace)]
 
 
 # An iPhone / Android reaction sent as a text: 'Liked "Here's your visit: ..."', 'Reacted 👍 to "..."'.
@@ -582,7 +636,8 @@ def finished_before(history: list[Turn], lead: LeadView) -> bool:
 def _check_answer(text: str, *, lead: LeadView, history: list[Turn], actions: list[AgentAction],
                   fixed: bool, today: date | None = None,
                   after_repeat: bool = False,
-                  birthday_done: bool = False) -> tuple[str, str | None, str] | None:
+                  birthday_done: bool = False,
+                  birthday_pending: bool = False) -> tuple[str, str | None, str] | None:
     """None when the model's answer may go out; else (guard, tool to force or None, note).
 
     `after_repeat`: the model was told it repeated itself and may now answer NO_REPLY.
@@ -595,6 +650,13 @@ def _check_answer(text: str, *, lead: LeadView, history: list[Turn], actions: li
         if birthday_done and asks_birth_date(text):
             # Owner, 2026-11-03: once given in the chat, the date of birth is never asked again.
             return "asked_birth_date", None, ASKED_BIRTH_DATE_NOTE
+        if (not birthday_done and not birthday_pending and not lead.is_new_person
+                and "confirm_visit" not in kinds and asks_birth_date(text)
+                and not any(turn.role == "elliot" and asks_birth_date(turn.text)
+                            for turn in history)):
+            # 2026-11-04: the first date of birth question is ours (confirm_visit), naming the time,
+            # so the patient's answer gets the card from code.
+            return "birthday_question", "confirm_visit", BIRTHDAY_QUESTION_NOTE
         if last_name_on_file(lead) and asks_last_name(text):
             # x-04 (2026-11-03): "And what's your last name?" when it is on file.
             return "asked_last_name", None, ASKED_LAST_NAME_NOTE
@@ -676,20 +738,23 @@ def run_agent(*, lead: LeadView, history: list[Turn], tools: AgentTools, now: da
         return AgentReply([], actions, error=error, opted_out=opted_out)
 
     model = model or settings.sms_agent_model
-    code_booked = False             # book_visit already ran in code for this yes
-    booking = book_on_yes(lead, history, tools, now=now, trace=trace)
-    if booking is not None:
-        actions.append(AgentAction(kind=booking.kind, summary=booking.summary,
-                                   result_code=booking.action_code or booking.code,
-                                   reason=booking.reason))
-        bucket = sent_last if booking.send_last else sent_first
-        bucket.extend(text for text in booking.fixed_texts if text not in bucket)
-        items.append({"role": "developer", "content": BOOKED_ON_YES_NOTE.format(
-            output=booking.output)})
-        if booking.code != "IN_PROGRESS":
-            # Booked or refused: a second book_visit in this reply could only book twice.
-            code_booked = True
-            tool_specs = [spec for spec in tool_specs if spec.get("name") != "book_visit"]
+    # Tools code already ran for this text (2026-11-04): a second call could book twice or send a
+    # second card.
+    done_in_code: set[str] = set()
+    steps = code_steps(lead, history, tools, settled=settled, now=now, trace=trace)
+    for step in steps:
+        actions.append(AgentAction(kind=step.kind, summary=step.summary,
+                                   result_code=step.action_code or step.code, reason=step.reason))
+        bucket = sent_last if step.send_last else sent_first
+        bucket.extend(text for text in step.fixed_texts if text not in bucket)
+    if steps:
+        items.append({"role": "developer", "content": CODE_STEP_NOTE.format(
+            steps="\n".join(f"- {_TOOL_OF_KIND.get(step.kind, step.kind)} -> {step.output}"
+                            for step in steps))})
+        done_in_code = {_TOOL_OF_KIND.get(step.kind, step.kind) for step in steps}
+        if any(step.code == "BOOKED" for step in steps):
+            done_in_code.add("hand_off:booking_problem")
+        tool_specs = [spec for spec in tool_specs if spec.get("name") not in done_in_code]
     max_rounds = settings.sms_agent_max_rounds
     retried: set[str] = set()       # guards already re-run once in this reply
     forced: str | None = None       # tool the next round must call (a guard's re-run)
@@ -734,11 +799,20 @@ def run_agent(*, lead: LeadView, history: list[Turn], tools: AgentTools, now: da
         calls = [item for item in output if _get(item, "type") == "function_call"]
         if not calls:
             answer = _clean(_output_text(response))
+            if any(texts.parse_birthday_question(text) for text in sent_last) and asks_birth_date(
+                    answer):
+                # Our question names the time and goes last; the model's own copy would ask twice.
+                answer = ""
             verdict = _check_answer(answer, lead=lead, history=history, actions=actions,
                                     fixed=bool(sent_first or sent_last),
                                     today=now.astimezone(CLINIC_TZ).date(),
                                     after_repeat="repeat" in retried,
-                                    birthday_done=settled.confirmed is not None)
+                                    birthday_done=settled.confirmed is not None,
+                                    birthday_pending=settled.pending is not None)
+            if verdict is not None and verdict[0] == "birthday_question" and (
+                    "birthday_question" in retried or last):
+                # Better the model's own question than no answer (it has no time to name).
+                verdict = None
             if verdict is not None:
                 guard, tool, note = verdict
                 if guard in retried or last:
@@ -773,11 +847,12 @@ def run_agent(*, lead: LeadView, history: list[Turn], tools: AgentTools, now: da
                 result = ToolResult("BAD_ARGUMENTS: send the tool's arguments as a JSON object.",
                                     "unknown", f"{name}: unreadable arguments")
             else:
-                if name == "book_visit" and code_booked:
-                    # Never a second booking (or a second refusal card) for the same yes.
+                if (name in done_in_code
+                        or f"{name}:{arguments.get('reason')}" in done_in_code):
+                    # Never a second booking, card or hand-off for the same text.
                     items.append({"type": "function_call_output", "call_id": _get(call, "call_id"),
-                                  "output": "ALREADY_CALLED: our system already called book_visit "
-                                            "for this yes; follow its reply above."})
+                                  "output": f"ALREADY_CALLED: our system already called {name} "
+                                            "for this text; follow its reply above."})
                     continue
                 result = call_tool(tools, name, arguments, trace)
             actions.append(AgentAction(kind=result.kind, summary=result.summary,
