@@ -139,13 +139,31 @@ def render(conn_or_none, key: str, *, practice_id: int | None = None,
 
 # --- the read-back card ---------------------------------------------------------------------------
 
-CARD_FIRST_LINE = "Great choice! Here's your visit:"
+# Owner, 2026-11-04: no "Great choice!" (Yajat's test). Cards sent before still read as cards.
+CARD_FIRST_LINE = "Here's your visit:"
 CARD_LAST_LINE = "Reply YES and I'll book it."
+_OLD_CARD_OPENER = "Great choice! "
 
 
 def card_day(value: date) -> str:
     """"Tue Nov 3": short, and the same in the card and in the guard."""
     return f"{value:%a} {value:%b} {value.day}"
+
+
+def card_date(day: str, today: date) -> date | None:
+    """The date a card's "Mon Jul 20" means: weekday, month and day fit, the year nearest `today`
+    (the demo calendar is pinned to July while the real date is later)."""
+    fits = []
+    for year in (today.year - 1, today.year, today.year + 1):
+        for month in range(1, 13):
+            for number in range(1, 32):
+                try:
+                    value = date(year, month, number)
+                except ValueError:
+                    break
+                if card_day(value) == day:
+                    fits.append(value)
+    return min(fits, key=lambda value: abs((value - today).days), default=None)
 
 
 def card_time(value: clock_time) -> str:
@@ -163,7 +181,7 @@ def confirm_card(day: date, time: clock_time, therapist: str, clinic: str,
 
 
 _CARD = re.compile(
-    r"^" + re.escape(CARD_FIRST_LINE) + r"\n(?P<day>\w{3} \w{3} \d{1,2}) at "
+    r"^(?:" + re.escape(_OLD_CARD_OPENER) + r")?" + re.escape(CARD_FIRST_LINE) + r"\n(?P<day>\w{3} \w{3} \d{1,2}) at "
     r"(?P<time>\d{1,2}:\d{2} [AP]M) with (?P<therapist>[^\n]+)\n(?:(?P<service>[^\n]+)\n)?"
     r"(?P<clinic>[^\n]+) office\n" + re.escape(CARD_LAST_LINE) + r"$"
 )

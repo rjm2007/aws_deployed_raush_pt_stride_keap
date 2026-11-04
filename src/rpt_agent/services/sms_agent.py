@@ -291,6 +291,10 @@ _DONE_STATUSES = {"booked", "callback_scheduled", "booking_link_sent", "declined
 BOOK_NOTE = ("Code check: your last answer said the visit is booked, but nothing was booked in this "
              "reply (no book_visit returned BOOKED), so it was not sent. The patient said yes to the "
              "read-back card: call book_visit now for the date, time and therapist on that card.")
+BOOKED_ON_YES_NOTE = ("Code step: the patient said yes to the read-back card, so our system already "
+                      "called book_visit with the card's date, time, therapist and clinic. Its "
+                      "reply: {output}\nFollow that reply as if you had called book_visit "
+                      "yourself; never hand off instead of a booking that went through.")
 CLAIM_NOTE = ("Code check: your last answer said the visit is booked, but nothing was booked (no "
               "book_visit returned BOOKED), so it was not sent. Never say a visit is booked unless "
               "book_visit returned BOOKED. Continue the step you were on: the read-back card comes "
@@ -519,7 +523,27 @@ def said_yes_to_card(history: list[Turn]) -> bool:
     return bool(_YES.match(_words(replies[-1])))
 
 
-# An iPhone / Android reaction sent as a text: 'Liked "Great choice! ..."', 'Reacted 👍 to "..."'.
+def book_on_yes(lead: LeadView, history: list[Turn], tools: AgentTools, *, now: datetime,
+                trace: WorkflowTrace | None = None) -> ToolResult | None:
+    """A plain yes to the card books it in code, before the model runs (Yajat's test, 2026-11-04:
+    gpt-5.5 answered "yes" with a front-desk hand-off in 1 of 8 replays and nothing was booked).
+    Only for a lead with both names on file: otherwise the model passes the names from the chat."""
+    if lead.is_new_person or not (lead.first_name or "").strip() or not (
+            lead.last_name or "").strip():
+        return None
+    if not said_yes_to_card(history):
+        return None
+    elliot = [turn for turn in history if turn.role == "elliot"]
+    card = texts.parse_card(elliot[-1].text)
+    day = texts.card_date(card["day"], now.astimezone(CLINIC_TZ).date()) if card else None
+    if day is None:
+        return None
+    return call_tool(tools, "book_visit", {
+        "date": day.isoformat(), "time": card["time"], "therapist": card["therapist"],
+        "clinic": card["clinic"], "service": card["service"]}, trace)
+
+
+# An iPhone / Android reaction sent as a text: 'Liked "Here's your visit: ..."', 'Reacted 👍 to "..."'.
 _REACTION = re.compile(r"^(?:liked|loved|laughed at|emphasi[sz]ed|disliked|questioned|"
                        r"reacted \S{1,8} to)\s*[\"“']", re.IGNORECASE)
 
@@ -652,6 +676,20 @@ def run_agent(*, lead: LeadView, history: list[Turn], tools: AgentTools, now: da
         return AgentReply([], actions, error=error, opted_out=opted_out)
 
     model = model or settings.sms_agent_model
+    code_booked = False             # book_visit already ran in code for this yes
+    booking = book_on_yes(lead, history, tools, now=now, trace=trace)
+    if booking is not None:
+        actions.append(AgentAction(kind=booking.kind, summary=booking.summary,
+                                   result_code=booking.action_code or booking.code,
+                                   reason=booking.reason))
+        bucket = sent_last if booking.send_last else sent_first
+        bucket.extend(text for text in booking.fixed_texts if text not in bucket)
+        items.append({"role": "developer", "content": BOOKED_ON_YES_NOTE.format(
+            output=booking.output)})
+        if booking.code != "IN_PROGRESS":
+            # Booked or refused: a second book_visit in this reply could only book twice.
+            code_booked = True
+            tool_specs = [spec for spec in tool_specs if spec.get("name") != "book_visit"]
     max_rounds = settings.sms_agent_max_rounds
     retried: set[str] = set()       # guards already re-run once in this reply
     forced: str | None = None       # tool the next round must call (a guard's re-run)
@@ -735,6 +773,12 @@ def run_agent(*, lead: LeadView, history: list[Turn], tools: AgentTools, now: da
                 result = ToolResult("BAD_ARGUMENTS: send the tool's arguments as a JSON object.",
                                     "unknown", f"{name}: unreadable arguments")
             else:
+                if name == "book_visit" and code_booked:
+                    # Never a second booking (or a second refusal card) for the same yes.
+                    items.append({"type": "function_call_output", "call_id": _get(call, "call_id"),
+                                  "output": "ALREADY_CALLED: our system already called book_visit "
+                                            "for this yes; follow its reply above."})
+                    continue
                 result = call_tool(tools, name, arguments, trace)
             actions.append(AgentAction(kind=result.kind, summary=result.summary,
                                        result_code=result.action_code or result.code,

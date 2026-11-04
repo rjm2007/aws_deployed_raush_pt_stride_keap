@@ -440,7 +440,7 @@ def test_context_says_the_date_of_birth_is_confirmed_and_never_shows_it(small_co
 
 def test_a_reaction_to_the_card_needs_no_reply(small_config):
     history = chat(("patient", "3/14/1990"), ("elliot", CARD),
-                   ("patient", "Liked “Great choice! Here's your visit:”"))
+                   ("patient", "Liked “Here's your visit:”"))
     reply = run(history, Client("NO_REPLY"))
     assert reply.no_reply and reply.error is None
     # "maybe" is not a reaction: it gets an answer.

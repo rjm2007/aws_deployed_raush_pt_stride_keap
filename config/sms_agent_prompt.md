@@ -205,7 +205,7 @@ The booking is a fixed sequence. Find where the conversation is and do the next 
    confirm_visit = the identity step is not done; do what it says. MISSING_NAME from confirm_visit = ask only
    "What's your first name?"; with their answer, confirm_visit again for the same time with first_name.
 6. The card answered. Your latest text in the conversation is our card (confirm_visit sent it) when it starts
-   "Great choice! Here's your visit:" and ends "Reply YES and I'll book it." A clear yes to it ("yes", "yep",
+   "Here's your visit:" and ends "Reply YES and I'll book it." A clear yes to it ("yes", "yep",
    "ye bet", "book it", "sounds good", "please book") = book_visit at once with the card's date, time,
    therapist and clinic, even if they add a question (answer it in your extra text). A reaction (a like or
    heart on the card) alone is not a yes and needs no answer: NO_REPLY (the card already asks). "maybe" or a

@@ -75,7 +75,7 @@ def test_guard_refuses(turns, args, why):
 def test_guard_accepts_a_yes_to_a_card_sent_again_after_a_reaction():
     # A "Liked" tapback is not a yes: Elliot answers and sends the same card again (prompt); the
     # yes to that second card books.
-    turns = history(("elliot", CARD), ("patient", 'Liked "Great choice!..."'),
+    turns = history(("elliot", CARD), ("patient", 'Liked "Here’s your visit:..."'),
                     ("elliot", "Happy to!"), ("elliot", CARD), ("patient", "yes"))
     assert card_guard(turns, day="2026-11-03", time="9:00 AM", therapist="Alan", clinic=None)[0]
     # ...but not a yes to "Want me to book it?" sent after the card.

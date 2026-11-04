@@ -531,6 +531,8 @@ def test_reply_live_books_from_the_database_history(env):
             "insert into sms_messages(lead_id,direction,sender,body,occurred_at,delivery_status) "
             "values(%s,%s,%s,%s,now(),%s)",
             (lead_id, direction, sender, body, "received" if direction == "inbound" else "sent"))
+    # The yes to the card books in code before the model runs (2026-11-04); the model only adds
+    # its words, and a book_visit of its own changes nothing.
     client = FakeClient(
         {"output": [{"type": "function_call", "name": "book_visit", "call_id": "c1",
                      "arguments": json.dumps({**BOOK, "first_name": None, "last_name": None,
@@ -544,7 +546,11 @@ def test_reply_live_books_from_the_database_history(env):
     assert [a.result_code for a in reply.actions] == ["BOOKED"]
     request = client.responses.requests[0]
     roles = [item["role"] for item in request["input"]]
-    assert roles == ["developer", "developer", "developer", "user", "assistant", "user"]
+    assert roles == ["developer", "developer", "developer", "user", "assistant", "user",
+                     "developer"]
+    assert request["input"][-1]["content"].startswith("Code step: the patient said yes")
+    assert "book_visit" not in [spec["name"] for spec in request["tools"]]
+    assert env.one("select count(*) as n from appointments where lead_id=%s", lead_id)["n"] == 1
     phone = env.one("select phone_e164 from leads where id=%s", lead_id)["phone_e164"]
     assert phone not in json.dumps(request["input"], default=str)
     # The date on file is never shown to the model; the one typed in the chat is confirmed.

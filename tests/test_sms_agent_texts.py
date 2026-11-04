@@ -109,12 +109,14 @@ def test_address_for(clinic, expected):
 
 def test_card_round_trip_and_shape():
     card = texts.confirm_card(date(2026, 11, 3), time(9, 0), "Alan Rome", "Laguna Niguel")
-    assert card == ("Great choice! Here's your visit:\nTue Nov 3 at 9:00 AM with Alan Rome\n"
+    assert card == ("Here's your visit:\nTue Nov 3 at 9:00 AM with Alan Rome\n"
                     "Laguna Niguel office\nReply YES and I'll book it.")
     assert texts.parse_card(card) == {"day": "Tue Nov 3", "time": "9:00 AM",
                                       "therapist": "Alan Rome", "service": None,
                                       "clinic": "Laguna Niguel"}
     assert texts.parse_card("  " + card + "\n") is not None
+    # Cards sent before 2026-11-04 opened with "Great choice! " and still count as cards.
+    assert texts.parse_card("Great choice! " + card) == texts.parse_card(card)
 
 
 def test_card_names_a_service_other_than_the_default():
@@ -122,7 +124,7 @@ def test_card_names_a_service_other_than_the_default():
     # card names the service when it is not the default, and the guard reads it back.
     card = texts.confirm_card(date(2026, 11, 16), time(13, 0), "Thao Nguyen", "Dana Point",
                               service="Pelvic Health")
-    assert card == ("Great choice! Here's your visit:\nMon Nov 16 at 1:00 PM with Thao Nguyen\n"
+    assert card == ("Here's your visit:\nMon Nov 16 at 1:00 PM with Thao Nguyen\n"
                     "Pelvic Health\nDana Point office\nReply YES and I'll book it.")
     assert texts.parse_card(card) == {"day": "Mon Nov 16", "time": "1:00 PM",
                                       "therapist": "Thao Nguyen", "service": "Pelvic Health",
@@ -133,7 +135,7 @@ def test_card_names_a_service_other_than_the_default():
 
 
 @pytest.mark.parametrize("text", [
-    "", None, "Great choice! Here's your visit:\nTue Nov 3 at 9:00 AM with Alan Rome",
+    "", None, "Here's your visit:\nTue Nov 3 at 9:00 AM with Alan Rome",
     "Here's your visit: Tue Nov 3 at 9:00 AM with Alan Rome. Reply YES and I'll book it.",
     texts.confirm_card(date(2026, 11, 3), time(9, 0), "Alan", "Dana Point") + " Also, hi!",
 ])

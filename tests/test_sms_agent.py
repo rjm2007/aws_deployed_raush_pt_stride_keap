@@ -642,14 +642,15 @@ def notes(request):
 
 def test_false_booking_claim_after_a_yes_to_the_card_forces_book_visit():
     # book-03: the patient said YES to the card; the model texted "All set! You're booked" with no
-    # book_visit. The claim is never sent; the model must call book_visit.
+    # book_visit. The claim is never sent; the model must call book_visit. (A lead with both names
+    # on file is booked by code before the model runs; this lead has no last name on file.)
     booked = ToolResult("BOOKED: sent", "book", "Booked", fixed_texts=["BOOKED TEXT"])
     tools = FakeTools(book_visit=booked)
     trace = Trace()
     client = FakeClient(text(FALSE_CLAIM),
                         calls(("book_visit", {"date": "2026-11-05", "time": "10:30 AM"})),
                         text(""))
-    reply = run(client, tools, history=YES_TO_CARD, trace=trace)
+    reply = run(client, tools, history=YES_TO_CARD, trace=trace, lead=lead(last_name=""))
     assert reply.texts == ["BOOKED TEXT"] and reply.error is None
     assert client.responses.requests[1]["tool_choice"] == {"type": "function", "name": "book_visit"}
     assert "tool_choice" not in client.responses.requests[2]
@@ -829,6 +830,57 @@ def test_guard_reruns_count_toward_the_round_cap():
     assert reply.texts == [] and reply.error == "guard:booking_claim"
     assert len(client.responses.requests) == 2
     assert client.responses.requests[1]["tool_choice"] == "none"
+
+
+# --- a yes to the card books in code (Yajat's test, 2026-11-04) -------------------------------------
+
+def test_a_yes_to_the_card_books_before_the_model_can_hand_off():
+    # gpt-5.5 answered "yes" to the card with a front-desk hand-off and never called book_visit.
+    booked = ToolResult("BOOKED: sent", "book", "Booked", fixed_texts=["BOOKED TEXT"])
+    tools = FakeTools(book_visit=booked)
+    client = FakeClient(text("NO_REPLY"))
+    reply = run(client, tools, history=YES_TO_CARD)
+    assert tools.calls == [("book_visit", {"date": "2026-11-05", "time": "10:30 AM"})]
+    assert reply.texts == ["BOOKED TEXT"] and reply.error is None
+    assert [action.result_code for action in reply.actions] == ["BOOKED"]
+    request = client.responses.requests[0]
+    # The model is told what was done and cannot book a second time.
+    assert any(str(item.get("content", "")).startswith("Code step: the patient said yes")
+               and "BOOKED: sent" in item["content"] for item in request["input"])
+    assert "book_visit" not in [spec["name"] for spec in request["tools"]]
+
+
+def test_a_card_answered_in_progress_keeps_book_visit_for_the_retry():
+    waiting = ToolResult("IN_PROGRESS: wait a moment", "book", "Booking still running")
+    tools = FakeTools(book_visit=waiting)
+    client = FakeClient(calls(("book_visit", {"date": "2026-11-05", "time": "10:30 AM"})),
+                        text("NO_REPLY"))
+    run(client, tools, history=YES_TO_CARD)
+    assert "book_visit" in [spec["name"] for spec in client.responses.requests[0]["tools"]]
+    assert len(tools.calls) == 2
+
+
+@pytest.mark.parametrize("history,who", [
+    ([Turn("elliot", CARD, None), Turn("patient", "yes but can we do 10 instead?", None)], {}),
+    ([Turn("elliot", CARD, None), Turn("patient", "no", None)], {}),
+    ([Turn("elliot", "What time works?", None), Turn("patient", "yes", None)], {}),
+    (YES_TO_CARD, {"is_new_person": True}),
+    (YES_TO_CARD, {"first_name": ""}),
+])
+def test_code_books_only_a_plain_yes_to_the_card_for_names_on_file(history, who):
+    tools = FakeTools()
+    run(FakeClient(text("Sure.")), tools, history=history, lead=lead(**who))
+    assert tools.calls == []
+
+
+@pytest.mark.parametrize("day,today,expected", [
+    ("Mon Jul 20", date(2026, 11, 4), date(2026, 7, 20)),   # demo calendar pinned to July
+    ("Thu Nov 5", date(2026, 11, 2), date(2026, 11, 5)),
+    ("Tue Jan 5", date(2026, 12, 20), date(2027, 1, 5)),
+    ("Fri Jul 20", date(2026, 11, 4), None),                 # no such weekday near today
+])
+def test_card_date(day, today, expected):
+    assert texts.card_date(day, today) == expected
 
 
 # --- review fixes (2026-11-02) --------------------------------------------------------------------
