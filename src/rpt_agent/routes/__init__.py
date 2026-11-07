@@ -2,6 +2,7 @@ from .appointments import router as appointments_router
 from .availability import router as availability_router
 from .booking_tools import router as booking_tools_router
 from .dashboard import router as dashboard_router
+from .demo_form import router as demo_form_router
 from .health import router as health_router
 from .keap import router as keap_router
 from .leads import router as leads_router
@@ -15,6 +16,7 @@ __all__ = [
     "availability_router",
     "booking_tools_router",
     "dashboard_router",
+    "demo_form_router",
     "health_router",
     "keap_router",
     "leads_router",

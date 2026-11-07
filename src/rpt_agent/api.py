@@ -10,6 +10,7 @@ from .routes import (
     availability_router,
     booking_tools_router,
     dashboard_router,
+    demo_form_router,
     health_router,
     keap_router,
     leads_router,
@@ -66,6 +67,7 @@ app.include_router(health_router)
 app.include_router(availability_router)
 app.include_router(booking_tools_router)
 app.include_router(dashboard_router)
+app.include_router(demo_form_router)
 app.include_router(dashboard_calendar_router)
 app.include_router(agent_router)
 # SMS agent test chat (sandbox; off unless SMS_AGENT_TEST_ENABLED).

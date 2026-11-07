@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     # The Google Sheet is the only way leads come in (client, 2026-10-15): the dashboard's "Add
     # lead" is switched off unless this is turned on (local tests, emergencies).
     dashboard_lead_create_enabled: bool = False
+    # Public demo form (demo.aibolt.ai/try, conference demo 2026-11-07): a visitor's details start a
+    # lead like a Sheet row. Demo only; never on in production. The cap counts form leads per hour.
+    demo_form_enabled: bool = False
+    demo_form_max_per_hour: int = Field(default=40, ge=1, le=500)
+    demo_form_lead_type: str = "Physical Therapy"
     n8n_intake_key_id: str = ""
     n8n_intake_secret: str = ""
     n8n_intake_auth_disabled: bool = False

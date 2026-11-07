@@ -2917,3 +2917,21 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
 - Docs: `docs/SMS_AGENT.md` "Booking steps run by code". Tests: `test_sms_agent.py`,
   `test_sms_agent_birthday.py`, integration on local pgserver; eval: 21 booking/birthday chats on gpt-5.5
   (new scripted dob-03 = Yajat's chat).
+
+### 2026-11-07 — Public demo form at /try (conference demo; built, not deployed, off by default)
+
+- Why: Kevin (PerformPS) demos Stride at the PPS conference from his phone; visitors need a way to become a
+  lead without the Sheet or a staff login.
+- Backend: `POST /api/v1/demo-form/leads` (`routes/demo_form.py`, `services/demo_form.py`). Off unless
+  `DEMO_FORM_ENABLED` (404); dashboard service token only. Name, +1 / +91 mobile (10 digits, repeated
+  code or Indian trunk 0 dropped), date of birth at least a year back, consent. Inserts a
+  `source_system='demo_form'` lead (consent `web_form`, case `DEMO_FORM_LEAD_TYPE` = Physical Therapy so
+  the booking engine matches it, location `BOOKING_DEFAULT_CITY`, owner "Demo form", `is_test` by the
+  TEST_MODE rule), plans the active cadence, `hand_over_number`. Idempotent on the form key;
+  `DEMO_FORM_MAX_PER_HOUR` (40) cap → 429. Not written to the Sheet. No migration.
+- Frontend: `/try` page (design A, Text / Call / Booked after submit) + `app/api/try/route.ts` (public,
+  forwards only the form fields). Always light.
+- Tests: `tests/test_demo_form.py` (route), `tests/test_demo_form_integration.py` (real schema). Full suite on
+  a local pgserver: only the 9 old unrelated failures.
+- To go live on demo: deploy both, set `DEMO_FORM_ENABLED=true` in the demo server `.env`, restart api.
+  Never enable in production.
