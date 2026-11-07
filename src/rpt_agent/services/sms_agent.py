@@ -390,7 +390,7 @@ def front_desk_has_it(lead: LeadView, history: list[Turn], actions: list[AgentAc
     if lead.needs_review or lead.status == "callback_scheduled":
         return True
     return any(turn.role == "elliot" and any(
-        filled_from(turn.text, texts.DRAFTS[key]) for key in ("front_desk", "english_only"))
+        filled_from(turn.text, texts.DRAFTS[key]) for key in _HAND_OFF_KEYS)
         for turn in history)
 
 
@@ -624,10 +624,10 @@ def finished_before(history: list[Turn], lead: LeadView) -> bool:
     if not block or block[-1].endswith("?"):
         return False
     for text in block:
-        if text == texts.EMERGENCY_TEXT or _OPT_OUT_LINE.search(_flat(text)):
+        if texts.is_emergency_text(text) or _OPT_OUT_LINE.search(_flat(text)):
             return True
         if any(filled_from(text, texts.DRAFTS[key])
-               for key in ("booked", "front_desk", "english_only")):
+               for key in ("booked", *_HAND_OFF_KEYS)):
             return True
     # A Studio-edited fixed text is not recognised above: the lead's state says it.
     return lead.status in _DONE_STATUSES or lead.booking_paused
@@ -977,6 +977,8 @@ def filled_from(text: str, body: str) -> bool:
 _DONE_AFTER = {"HANDED_OFF": "hand_off:front_desk", "HANDED_OFF_PAUSED": "hand_off:paused",
                "REPORTED_CASE_CHANGE": "case_change"}
 _HAND_OFF_CODES = {"HANDED_OFF", "HANDED_OFF_PAUSED", "ALREADY_HANDED_OFF"}
+# The fixed texts hand_off sends (sms_agent_tools._hand_off_text).
+_HAND_OFF_KEYS = ("front_desk", "english_only", "cancel_visit")
 
 
 def earlier_in_chat(history: list[Turn], prior_actions: list[Any] | None,
@@ -984,6 +986,7 @@ def earlier_in_chat(history: list[Turn], prior_actions: list[Any] | None,
                     now: datetime | None = None) -> EarlierInChat:
     state = EarlierInChat()
     emergency_code = False
+    hand_off_code_seen = False
     for action in prior_actions or []:
         code = str(_get(action, "result_code", "") or "").strip().upper()
         if code == "BOOKED":
@@ -997,6 +1000,7 @@ def earlier_in_chat(history: list[Turn], prior_actions: list[Any] | None,
         if code in _STATUS_AFTER:
             state.status = _STATUS_AFTER[code]
         reason = str(_get(action, "reason", "") or "").strip().lower()
+        hand_off_code_seen = hand_off_code_seen or code in _HAND_OFF_CODES
         if code in _HAND_OFF_CODES and reason in SMS_FRONT_DESK_REASONS:
             # The tab sent the reason back (x-02): only the same reason is a repeat, like live.
             state.done.add(f"hand_off:{reason}")
@@ -1009,12 +1013,16 @@ def earlier_in_chat(history: list[Turn], prior_actions: list[Any] | None,
     for turn in history:
         if turn.role != "elliot":
             continue
-        if turn.text.strip() == texts.EMERGENCY_TEXT:
+        if texts.is_emergency_text(turn.text):
             state.paused = True
             emergency_times.append(turn.at)
         elif booked_body and filled_from(turn.text, booked_body):
             state.booked = True
-        elif any(filled_from(turn.text, body) for body in hand_off_bodies if body):
+        elif (not hand_off_code_seen
+              and any(filled_from(turn.text, body) for body in hand_off_bodies if body)):
+            # Only for a chat without the side panel's codes: "hand_off:front_desk" counts every
+            # bookable reason as done (Yajat's test, 2026-11-05: an earlier front desk text made a
+            # later cancel "already handed off"). With codes, the reasons decide, like live.
             state.done.add("hand_off:front_desk")
     # The emergency text counts as a repeat for an hour (live: the card's time); a chat that only
     # has the side panel's code has no time: it counts.
@@ -1083,7 +1091,7 @@ def reply_sandbox(*, setup: SandboxSetup, history: list[Turn], settings: Setting
         ).fetchone()
         booked_body = texts.template_body(conn, "booked", row["id"]) if row else None
         hand_off_bodies = tuple(texts.template_body(conn, key, row["id"])
-                                for key in ("front_desk", "english_only")) if row else ()
+                                for key in _HAND_OFF_KEYS) if row else ()
     if not row:
         return AgentReply([], [], error="practice_not_found")
     clock = setup.clock

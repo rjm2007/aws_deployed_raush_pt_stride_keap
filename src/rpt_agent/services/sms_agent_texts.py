@@ -6,7 +6,7 @@ with no cadence step and key `sms_agent.<name>` (seeded by migration 054). The a
 them itself. A deleted or inactive row falls back to the same draft here, so a Studio mistake can
 never leave a patient without an answer.
 
-Two texts stay in code: the emergency line (never editable: it must always say 911 and 988) and the
+Two texts stay in code: the emergency lines (never editable: they must always say 911) and the
 read-back card, whose exact shape the booking guard recognises in the history (`confirm_card` /
 `parse_card`).
 """
@@ -22,7 +22,7 @@ from ..config import Settings, get_settings
 
 PREFIX = "sms_agent."
 KEYS = ("intro", "new_person_intro", "booked", "front_desk", "english_only", "text_only",
-        "unknown_number")
+        "unknown_number", "cancel_visit")
 
 # The same drafts as migration 054 (kept equal by tests/test_sms_agent_texts.py).
 DRAFTS = {
@@ -55,6 +55,12 @@ DRAFTS = {
         "{front_desk_phone}, or they'll reach out to you."
     ),
     "text_only": "Sorry, I can only read text messages. Could you type that out for me?",
+    # Migration 055 (Yajat's test, 2026-11-05: "no cancel it" got the general front desk text, which
+    # never said the visit is still booked).
+    "cancel_visit": (
+        "Got it, I've passed that to our front desk. Your visit stays booked until they confirm the "
+        "change with you. You can also call them at {front_desk_phone}."
+    ),
     "unknown_number": (
         "Hi, this is Rausch Physical Therapy! You can book your first visit online here: "
         "{booking_link}\n"
@@ -62,13 +68,30 @@ DRAFTS = {
     ),
 }
 
-# In code on purpose: an emergency answer must never be edited away (plan section 6). The 988 line
-# (Suicide and Crisis Lifeline; owner, 2026-11-02): flag_emergency also covers thoughts of suicide
-# or self-harm, which 911 alone does not answer well.
-EMERGENCY_TEXT = (
+# In code on purpose: an emergency answer must never be edited away (plan section 6). Two texts
+# (Yajat's test, 2026-11-05: chest pain got the 988 line too): a medical emergency gets only 911;
+# thoughts of suicide or self-harm also get 988, the Suicide and Crisis Lifeline (owner, 2026-11-02).
+EMERGENCY_TEXT = "Please call 911 right now if this is an emergency. Our team has been alerted too."
+SELF_HARM_TEXT = (
+    "If you're in danger, please call 911 right now. You can also call or text 988 (Suicide and "
+    "Crisis Lifeline) any time. Our team has been alerted too."
+)
+EMERGENCY_KINDS = {"medical": EMERGENCY_TEXT, "self_harm": SELF_HARM_TEXT}
+# The one text sent before 2026-11-07: still an emergency text in a chat's history.
+_OLD_EMERGENCY_TEXT = (
     "If this is a medical emergency, please call 911 right away. If you're thinking about harming "
     "yourself, call or text 988 any time. Our front desk team will also reach out to you."
 )
+
+
+def emergency_text(kind: str | None) -> str:
+    """The text for flag_emergency's kind; anything unknown gets the self-harm text (it says 911
+    first, and 988 does no harm)."""
+    return EMERGENCY_KINDS.get(str(kind or "").strip().lower(), SELF_HARM_TEXT)
+
+
+def is_emergency_text(text: str | None) -> bool:
+    return (text or "").strip() in (EMERGENCY_TEXT, SELF_HARM_TEXT, _OLD_EMERGENCY_TEXT)
 
 # The three approved office addresses (voice prompt, "Clinic facts"), written for text.
 CLINIC_ADDRESSES = {

@@ -61,6 +61,9 @@ SMS_FRONT_DESK_REASONS = {
     "booking_problem": "a booking problem",
     "emergency": "possible emergency (Elliot texted the 911 line)",
     "other": "something Elliot does not handle",
+    # Yajat's test, 2026-11-05: its own reason and text, so it is never a "repeat" of another
+    # "other" hand-off and the text says the visit stays booked.
+    "cancel_visit": "wants to cancel or change their visit",
 }
 # Written by services/sms_inbound.py: the daily AI reply cap was reached, or the agent failed
 # (model timeout, ...) and nothing was sent.

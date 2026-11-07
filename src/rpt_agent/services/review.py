@@ -36,7 +36,7 @@ def restore_pause_skipped(conn, lead_id: str) -> int:
 # different case, a booking problem and an emergency still stop booking until staff look at it.
 SMS_FRONT_DESK_CODE = "sms_front_desk"
 FRONT_DESK_BOOKABLE_REASONS = ("insurance", "wants_person", "other_language", "unknown_question",
-                               "other")
+                               "other", "cancel_visit")
 # SQL on an open lead_reviews row `r`: it does not stop booking by text.
 BOOKABLE_REVIEW_SQL = (
     f"(r.code='{SMS_FRONT_DESK_CODE}' and coalesce(r.details->>'reason','') in "

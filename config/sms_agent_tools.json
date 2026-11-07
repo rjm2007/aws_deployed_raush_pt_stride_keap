@@ -367,7 +367,7 @@
   {
     "type": "function",
     "name": "hand_off",
-    "description": "Passes the patient to our front desk: sends our front desk text (their phone number, and that they will reach out) and asks the front desk to contact the patient. Use it for anything you do not handle: insurance, cost, billing or coverage (insurance); a different service, body part or problem than the referral, together with report_outcome case_change (different_case); asking for a person or a call from the office (wants_person); writing in another language (other_language, which sends our English-only text instead); a question whose answer is not in your clinic facts, such as parking, directions or which office is closest (unknown_question); a booking that did not go through, or a booking matter while the lead is in review (booking_problem); rescheduling or cancelling a visit, asking us to stop calling while texting is fine, or anything else (other). For insurance, wants_person, other_language, unknown_question and other, booking by text goes on (the front desk still reaches out). For different_case and booking_problem it puts the lead in review, which pauses booking by text from the next text on, so never offer times after those. If the same text is a clear yes to the card, call book_visit first. Use it once per topic in a conversation: if our front desk text already followed the patient's question on this topic, do not call it again (answer anything else, or NO_REPLY to 'thanks, I'll wait'). For a case change call report_outcome case_change first. Reply HANDED_OFF or HANDED_OFF_PAUSED = the text is on its way, sent before anything you write, so never repeat the phone number or 'they'll reach out'. ALREADY_HANDED_OFF = the front desk already has this and nothing was sent; say nothing more about it (answer anything else they asked, else NO_REPLY).",
+    "description": "Passes the patient to our front desk: sends our front desk text (their phone number, and that they will reach out) and asks the front desk to contact the patient. Use it for anything you do not handle: insurance, cost, billing or coverage (insurance); a different service, body part or problem than the referral, together with report_outcome case_change (different_case); asking for a person or a call from the office (wants_person); writing in another language (other_language, which sends our English-only text instead); a question whose answer is not in your clinic facts, such as parking, directions or which office is closest (unknown_question); a booking that did not go through, or a booking matter while the lead is in review (booking_problem); cancelling or changing a booked visit (cancel_visit, which sends our text that the visit stays booked until the front desk confirms the change); asking us to stop calling while texting is fine, or anything else (other). For insurance, wants_person, other_language, unknown_question, other and cancel_visit, booking by text goes on (the front desk still reaches out). For different_case and booking_problem it puts the lead in review, which pauses booking by text from the next text on, so never offer times after those. If the same text is a clear yes to the card, call book_visit first. Use it once per topic in a conversation: if our front desk text already followed the patient's question on this topic, do not call it again (answer anything else, or NO_REPLY to 'thanks, I'll wait'). For a case change call report_outcome case_change first. Reply HANDED_OFF or HANDED_OFF_PAUSED = the text is on its way, sent before anything you write, so never repeat the phone number or 'they'll reach out'. ALREADY_HANDED_OFF = the front desk already has this and nothing was sent; do not repeat the hand-off (answer anything else they asked, else NO_REPLY), but if they ask how to reach the front desk or to talk to someone, give the phone number the reply gives.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -380,7 +380,8 @@
             "other_language",
             "unknown_question",
             "booking_problem",
-            "other"
+            "other",
+            "cancel_visit"
           ],
           "description": "Why the front desk is needed; see the tool description for which reason fits."
         },
@@ -400,11 +401,22 @@
   {
     "type": "function",
     "name": "flag_emergency",
-    "description": "Sends our fixed 'please call 911' text (it also gives 988, the Suicide and Crisis Lifeline) and alerts our staff. Use it at once when a text suggests a medical emergency or danger right now (chest pain, can't breathe, fainted, fell and can't get up, severe bleeding, thoughts of suicide or self-harm). Not for an injury in the past, like the one that led to the referral. Once per conversation: if the emergency text is already in the conversation, do not call it again; write one short caring line instead (our team will reach out; 911, or call or text 988). Reply EMERGENCY_SENT = sent; your final answer in that turn is NO_REPLY. ALREADY_SENT = it was already sent within the hour (nothing sent again); write that one short line.",
+    "description": "Sends our fixed 'please call 911' text and alerts our staff. Use it at once when a text suggests a medical emergency or danger right now (chest pain, can't breathe, fainted, fell and can't get up, severe bleeding, thoughts of suicide or self-harm). Not for an injury in the past, like the one that led to the referral. kind: medical for a physical emergency (911 only); self_harm for thoughts of suicide or self-harm (911 and 988, the Suicide and Crisis Lifeline). Once per conversation: if the emergency text is already in the conversation, do not call it again; write one short caring line instead (our team will reach out; please call 911; add 'call or text 988 any time' only for self-harm). Reply EMERGENCY_SENT = sent; your final answer in that turn is NO_REPLY. ALREADY_SENT = it was already sent within the hour (nothing sent again); write that one short line.",
     "parameters": {
       "type": "object",
-      "properties": {},
-      "required": [],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "medical",
+            "self_harm"
+          ],
+          "description": "medical = a physical emergency; self_harm = thoughts of suicide or self-harm."
+        }
+      },
+      "required": [
+        "kind"
+      ],
       "additionalProperties": false
     },
     "strict": true

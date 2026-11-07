@@ -2896,6 +2896,17 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
 - Test chat setup birthday must be at least 1 year back (route 422 + tab). Docs: `docs/SMS_AGENT.md`
   "Birthday step". Tests: `test_sms_agent_birthday.py`, integration cases on local pgserver.
 
+### 2026-11-07 — SMS agent: cancel text, emergency split, test chat repeats (Yajat's test of 2026-11-05)
+
+- Cancel or change a booked visit by text: new hand_off reason `cancel_visit` with its own Studio text
+  (`sms_agent.cancel_visit`, migration 055): the visit stays booked until the front desk confirms. Booking by
+  text goes on (front-desk-only card).
+- A repeat hand-off (ALREADY_HANDED_OFF) tells the model the front desk number for a patient who asks for it.
+- Emergency: `flag_emergency(kind)`: medical = 911 only, self_harm = 911 + 988 (chest pain got 988 before).
+- Test chat: an earlier front desk text no longer counts every reason as handed off when the side panel's
+  codes are there (a cancel after an earlier hand-off got "already has your request").
+- Tests: `test_sms_agent.py`, `test_sms_agent_tools.py`, `test_sms_agent_texts.py`; DB tests on local pgserver.
+
 ### 2026-11-04 — SMS agent: booking steps run by code (owner, Yajat's test)
 
 - Bug (demo test chat): the patient said "yes" to the card and Elliot handed off to the front desk; nothing

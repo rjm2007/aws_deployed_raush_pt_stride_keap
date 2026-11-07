@@ -393,7 +393,7 @@ def test_hand_off_on_a_declined_lead_keeps_its_status(env):
 
 def test_emergency_sends_911_and_opens_a_card(env):
     lead_id = env.lead()
-    result = call_tool(env.live(lead_id, []), "flag_emergency", {})
+    result = call_tool(env.live(lead_id, []), "flag_emergency", {"kind": "medical"})
     assert result.fixed_texts == [texts.EMERGENCY_TEXT]
     review = env.one("select code,details from lead_reviews where lead_id=%s", lead_id)
     assert review["code"] == "sms_front_desk" and review["details"]["reason"] == "emergency"
@@ -808,8 +808,8 @@ def test_live_hand_off_case_change_and_emergency_are_not_repeated_on_a_later_rep
                     lead_id, "case_change_asked")["n"]
     assert cards == 1
     # The emergency text goes once an hour.
-    assert call_tool(env.live(lead_id, [], job_id=5), "flag_emergency", {}).fixed_texts == [
-        texts.EMERGENCY_TEXT]
+    assert call_tool(env.live(lead_id, [], job_id=5), "flag_emergency",
+                     {"kind": "medical"}).fixed_texts == [texts.EMERGENCY_TEXT]
     repeat = call_tool(env.live(lead_id, [], job_id=6), "flag_emergency", {})
     assert repeat.code == "ALREADY_SENT" and repeat.fixed_texts == []
     env.db.execute("update lead_reviews set flagged_at=now()-interval '2 hours' where lead_id=%s "

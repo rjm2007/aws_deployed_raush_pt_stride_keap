@@ -15,6 +15,7 @@ from datetime import time as dtime
 import pytest
 
 from rpt_agent.config import get_settings
+from rpt_agent.observability import WorkflowTrace
 from rpt_agent.services import sms_agent
 from rpt_agent.services import sms_agent_texts as texts
 from rpt_agent.services.sms_agent import (
@@ -25,7 +26,7 @@ from rpt_agent.services.sms_agent import (
     reply_sandbox,
     run_agent,
 )
-from rpt_agent.services.sms_agent_tools import ToolResult
+from rpt_agent.services.sms_agent_tools import SandboxTools, ToolResult
 
 NOW = datetime(2026, 11, 2, 18, 0, tzinfo=UTC)
 TOOL_SPECS = [{"type": "function", "name": name, "description": "", "parameters": {}}
@@ -1064,6 +1065,27 @@ def test_earlier_in_chat_knows_what_was_already_handed_off():
     assert "emergency" not in sms_agent.earlier_in_chat(old, None, now=NOW).done
     assert "emergency" in sms_agent.earlier_in_chat(
         old, None, now=datetime(2026, 11, 2, 15, 30, tzinfo=UTC)).done
+
+
+def test_earlier_front_desk_text_with_codes_counts_only_its_own_reason():
+    """Yajat's test, 2026-11-05: after a front desk text, "no cancel it" got "our front desk already
+    has your cancellation request": the text counted every reason as done. With the side panel's
+    codes the reason decides, like live."""
+    history = [Turn("elliot", texts.render(None, "front_desk"), None)]
+    bodies = (texts.DRAFTS["front_desk"], texts.DRAFTS["cancel_visit"])
+    state = sms_agent.earlier_in_chat(
+        history, [{"kind": "hand_off", "result_code": "HANDED_OFF", "reason": "insurance"}],
+        hand_off_bodies=bodies)
+    assert state.done == {"hand_off:insurance"}
+    tools = SandboxTools(WorkflowTrace("t", "t"), lead=sms_agent.sandbox_lead(SandboxSetup()),
+                         history=history, practice_id=1, now_local=None, earlier=state.done)
+    assert not tools._hand_off_repeat("cancel_visit")
+    assert not tools._hand_off_repeat("wants_person")
+    assert tools._hand_off_repeat("insurance")
+    # The cancel text is a hand-off text too (a chat without codes).
+    cancel = [Turn("elliot", texts.render(None, "cancel_visit"), None)]
+    assert sms_agent.earlier_in_chat(cancel, None, hand_off_bodies=bodies).done == {
+        "hand_off:front_desk"}
 
 
 # --- round 2 (gpt-5.5 eval, 2026-11-02) -------------------------------------------------------------

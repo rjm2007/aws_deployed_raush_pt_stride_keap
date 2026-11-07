@@ -4,10 +4,12 @@ and the new review code's card (services/lead_review.py, sms_front_desk)."""
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from datetime import date, datetime, time
 
 import pytest
 
+from rpt_agent.config import get_settings
 from rpt_agent.observability import WorkflowTrace
 from rpt_agent.services import lead_review
 from rpt_agent.services import sms_agent_texts as texts
@@ -175,7 +177,7 @@ def test_sandbox_pretend_outcomes_need_no_database():
     assert handed.summary == "Would open a Needs Review card: insurance or costs"
     other = call_tool(tools, "hand_off", {"reason": "other_language"})
     assert other.fixed_texts == ["TEXT:other_language"]
-    emergency = call_tool(tools, "flag_emergency", {})
+    emergency = call_tool(tools, "flag_emergency", {"kind": "medical"})
     assert emergency.fixed_texts == [texts.EMERGENCY_TEXT] and emergency.code == "EMERGENCY_SENT"
     declined = call_tool(tools, "report_outcome", {"status": "declined"})
     assert declined.code == "REPORTED" and declined.summary == "Would report: declined"
@@ -1112,3 +1114,41 @@ def test_booking_names_use_the_first_name_answer_when_the_model_passes_the_last_
     turns = history(("elliot", ASK_FIRST), ("patient", "Dana"), ("elliot", CARD), ("patient", "yes"))
     assert booking_names(lead(first_name="", last_name="Quill"), turns, "Quill", "Quill") == (
         "Dana", "Quill")
+
+
+def test_cancel_visit_sends_its_own_text_and_keeps_booking_open():
+    """Yajat's test, 2026-11-05: a cancel got the general front desk text, which never said the
+    visit is still booked."""
+    tools = SandboxTools(WorkflowTrace("test", "test"), lead=lead(), history=ANSWERED,
+                         practice_id=1, now_local=None)
+    tools._conn = lambda: nullcontext(None)
+    tools._render = lambda conn, key, **values: f"TEXT:{key}"
+    handed = call_tool(tools, "hand_off", {"reason": "cancel_visit", "notes": "Cancel Sat visit"})
+    assert handed.code == "HANDED_OFF" and handed.fixed_texts == ["TEXT:cancel_visit"]
+    assert handed.summary == "Would open a Needs Review card: wants to cancel or change their visit"
+    assert not tools.paused_by_hand_off
+    assert call_tool(tools, "hand_off", {"reason": "other"}).fixed_texts == ["TEXT:front_desk"]
+    text = texts.render(None, "cancel_visit", settings=get_settings().model_copy(
+        update={"clinic_front_desk_phone": "(949) 276-5401"}))
+    assert "stays booked" in text and "(949) 276-5401" in text
+
+
+def test_already_handed_off_gives_the_number_when_asked():
+    """Yajat's test, 2026-11-05: "I want to talk to the front desk" after a hand-off got "Our front
+    desk already has your request" without the number."""
+    settings = get_settings().model_copy(update={"clinic_front_desk_phone": "(949) 276-5401"})
+    tools = SandboxTools(WorkflowTrace("test", "test"), lead=lead(), history=ANSWERED,
+                         practice_id=1, now_local=None, settings=settings,
+                         earlier={"hand_off:wants_person"})
+    again = call_tool(tools, "hand_off", {"reason": "wants_person"})
+    assert again.code == "ALREADY_HANDED_OFF" and again.fixed_texts == []
+    assert "(949) 276-5401" in again.output
+
+
+@pytest.mark.parametrize(("kind", "text"), [("medical", texts.EMERGENCY_TEXT),
+                                            ("self_harm", texts.SELF_HARM_TEXT)])
+def test_emergency_text_by_kind(kind, text):
+    """Yajat's test, 2026-11-05: chest pain got the 988 line too."""
+    tools = SandboxTools(WorkflowTrace("test", "test"), lead=lead(), history=ANSWERED,
+                         practice_id=1, now_local=None)
+    assert call_tool(tools, "flag_emergency", {"kind": kind}).fixed_texts == [text]

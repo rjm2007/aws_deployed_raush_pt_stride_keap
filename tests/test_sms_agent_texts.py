@@ -11,7 +11,9 @@ import pytest
 from rpt_agent.config import get_settings
 from rpt_agent.services import sms_agent_texts as texts
 
-MIGRATION = Path(__file__).resolve().parents[1] / "supabase" / "migrations" / "054_sms_agent.sql"
+MIGRATIONS = Path(__file__).resolve().parents[1] / "supabase" / "migrations"
+# The Studio texts' seeds: 054, and 055 (sms_agent.cancel_visit, 2026-11-07).
+MIGRATION_FILES = ("054_sms_agent.sql", "055_sms_agent_cancel_text.sql")
 
 
 class Conn:
@@ -42,9 +44,9 @@ def settings():
     return get_settings().model_copy(update={"clinic_front_desk_phone": "(949) 276-5401"})
 
 
-def test_drafts_match_migration_054():
+def test_drafts_match_the_migrations():
     """The code fallback is the same text staff start from in the Studio."""
-    sql = MIGRATION.read_text()
+    sql = "\n".join((MIGRATIONS / name).read_text() for name in MIGRATION_FILES)
     for key, draft in texts.DRAFTS.items():
         match = re.search(r"\('sms_agent\." + key + r"',\s*\n(.*?)\)(?:,|\n\) as t)", sql, re.DOTALL)
         assert match, key
@@ -144,6 +146,25 @@ def test_not_a_card(text):
 
 
 def test_emergency_line_is_in_code():
-    assert "911" in texts.EMERGENCY_TEXT and "emergency" not in texts.DRAFTS
-    # Owner, 2026-11-02: the Suicide and Crisis Lifeline too, in one short line.
-    assert "call or text 988" in texts.EMERGENCY_TEXT and len(texts.EMERGENCY_TEXT) <= 200
+    assert "emergency" not in texts.DRAFTS
+    for text in (texts.EMERGENCY_TEXT, texts.SELF_HARM_TEXT):
+        assert "911" in text and len(text) <= 200
+    # Yajat's test, 2026-11-05: chest pain got the 988 line. 988 (owner, 2026-11-02) is only for
+    # thoughts of suicide or self-harm.
+    assert "988" not in texts.EMERGENCY_TEXT and "call or text 988" in texts.SELF_HARM_TEXT
+
+
+def test_emergency_text_by_kind():
+    assert texts.emergency_text("medical") == texts.EMERGENCY_TEXT
+    assert texts.emergency_text("self_harm") == texts.SELF_HARM_TEXT
+    # Unknown: the text with both 911 and 988.
+    assert texts.emergency_text(None) == texts.SELF_HARM_TEXT
+
+
+def test_the_old_emergency_text_is_still_an_emergency_text():
+    old = ("If this is a medical emergency, please call 911 right away. If you're thinking about "
+           "harming yourself, call or text 988 any time. Our front desk team will also reach out to "
+           "you.")
+    for text in (old, texts.EMERGENCY_TEXT, " " + texts.SELF_HARM_TEXT + "\n"):
+        assert texts.is_emergency_text(text)
+    assert not texts.is_emergency_text("Please call 911.")

@@ -84,6 +84,7 @@ def db(monkeypatch):
     fake_texts.render = lambda conn, key, **values: f"<{key}> {values.get('booking_link')}"
     fake_texts.template_body = real_texts.template_body
     fake_texts.EMERGENCY_TEXT = real_texts.EMERGENCY_TEXT
+    fake_texts.is_emergency_text = real_texts.is_emergency_text
     fake_texts.parse_card = real_texts.parse_card
     monkeypatch.setitem(sys.modules, "rpt_agent.services.sms_agent_texts", fake_texts)
     # `from .services import sms_agent_texts` reads the package attribute first: once any earlier

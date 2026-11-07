@@ -74,7 +74,7 @@ from .sms_agent_context import MEDIA_ONLY, LeadView, Turn
 REPORT_STATUSES = ("callback_scheduled", "booking_link", "declined", "do_not_contact",
                    "wrong_person", "case_change")
 HAND_OFF_REASONS = ("insurance", "different_case", "wants_person", "other_language",
-                    "unknown_question", "booking_problem", "other")
+                    "unknown_question", "booking_problem", "other", "cancel_visit")
 # Tool name -> AgentAction kind (shown in the test chat's side panel).
 KINDS = {
     "find_times": "find_times", "list_therapists": "list_therapists",
@@ -102,9 +102,15 @@ HAND_OFF_REPEAT_WINDOW = timedelta(hours=24)
 EMERGENCY_REPEAT_WINDOW = timedelta(hours=1)
 ALREADY_HANDED_OFF = ("ALREADY_HANDED_OFF: the front desk already has this; no new card was opened and "
                       "no text was sent. Answer the new text briefly, or NO_REPLY for thanks.")
+# Yajat's test, 2026-11-05: "can I talk to the front desk" after a hand-off got "Our front desk
+# already has your request" without the number (1 in 3 replays). Asking how to reach them gets it.
+ALREADY_HANDED_OFF_PHONE = (" If they ask to reach or talk to the front desk, say they will reach out "
+                            "and give the number: {phone}.")
 ALREADY_REPORTED = ("ALREADY_REPORTED: the front desk already has this case change; nothing was "
                     "changed and no text was sent. Answer the new text briefly, or NO_REPLY for "
                     "thanks.")
+# flag_emergency's kind, as the card's note for staff.
+EMERGENCY_NOTES = {"medical": "Medical emergency", "self_harm": "Thoughts of suicide or self-harm"}
 ALREADY_SENT = ("ALREADY_SENT: the emergency text was sent within the last hour and staff were "
                 "flagged; it was not sent again. Write one short, kind line (no 911 text again).")
 
@@ -366,7 +372,7 @@ class AgentTools(Protocol):
                        callback_type: str | None = None, delay_minutes: Any = None,
                        callback_datetime_iso: str | None = None) -> ToolResult: ...
     def hand_off(self, *, reason: str, notes: str | None = None) -> ToolResult: ...
-    def flag_emergency(self) -> ToolResult: ...
+    def flag_emergency(self, *, kind: str | None = None) -> ToolResult: ...
     def send_intro(self) -> ToolResult: ...
     def check_birthday(self, *, date_of_birth: str) -> ToolResult: ...
 
@@ -665,7 +671,9 @@ class _BaseTools:
     def _already_handed_off(self, reason: str) -> ToolResult:
         self._note_hand_off(reason)
         self.done_here.add(f"hand_off:{reason}")
-        return ToolResult(ALREADY_HANDED_OFF, "hand_off",
+        phone = self.settings.clinic_front_desk_phone
+        output = ALREADY_HANDED_OFF + (ALREADY_HANDED_OFF_PHONE.format(phone=phone) if phone else "")
+        return ToolResult(output, "hand_off",
                           f"Front desk already has this ({reason}): nothing sent again",
                           action_code="ALREADY_HANDED_OFF", reason=reason)
 
@@ -886,7 +894,8 @@ class _BaseTools:
 
     def _hand_off_text(self, reason: str) -> str:
         with self._conn() as conn:
-            return self._render(conn, "english_only" if reason == "other_language" else "front_desk")
+            key = {"other_language": "english_only", "cancel_visit": "cancel_visit"}
+            return self._render(conn, key.get(reason, "front_desk"))
 
     @staticmethod
     def _check_reason(reason: str) -> str:
@@ -1138,16 +1147,17 @@ class LiveTools(_BaseTools):
                           fixed_texts=[self._hand_off_text(reason)],
                           action_code=hand_off_code(reason), reason=reason)
 
-    def flag_emergency(self) -> ToolResult:
+    def flag_emergency(self, *, kind: str | None = None) -> ToolResult:
         if self._repeat("emergency"):
             return self._already_emergency()
         self.paused_by_hand_off = True
         self.done_here.add("emergency")
         with transaction() as conn:
-            open_front_desk_card(conn, self.lead_id, "emergency", None,
+            open_front_desk_card(conn, self.lead_id, "emergency", EMERGENCY_NOTES.get(kind or ""),
                                  conversation=self.report_key)
         return ToolResult("EMERGENCY_SENT: the 911 text was sent and staff were flagged.",
-                          "emergency", "Flagged an emergency", fixed_texts=[texts.EMERGENCY_TEXT])
+                          "emergency", "Flagged an emergency",
+                          fixed_texts=[texts.emergency_text(kind)])
 
 
 def open_front_desk_card(conn, lead_id: str, reason: str, notes: str | None, *,
@@ -1337,11 +1347,12 @@ class SandboxTools(_BaseTools):
                           fixed_texts=[self._hand_off_text(reason)],
                           action_code=hand_off_code(reason), reason=reason)
 
-    def flag_emergency(self) -> ToolResult:
+    def flag_emergency(self, *, kind: str | None = None) -> ToolResult:
         if self._repeat("emergency"):
             return self._already_emergency()
         self.paused_by_hand_off = True
         self.done_here.add("emergency")
         return ToolResult("EMERGENCY_SENT (pretend): the 911 text was sent.", "emergency",
-                          "Would flag an emergency for staff", fixed_texts=[texts.EMERGENCY_TEXT])
+                          "Would flag an emergency for staff",
+                          fixed_texts=[texts.emergency_text(kind)])
 
