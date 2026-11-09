@@ -2935,3 +2935,14 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
   a local pgserver: only the 9 old unrelated failures.
 - To go live on demo: deploy both, set `DEMO_FORM_ENABLED=true` in the demo server `.env`, restart api.
   Never enable in production.
+
+### 2026-11-09 — Returning patient with a new case is booked (branch `feature/own-postgres`, live on demo)
+- Owner: a patient treated before (same name + birthday in Stride) who comes back with a different problem is booked by
+  Elliot on a new case of the existing Stride patient; the same case again still goes to the front desk (`PATIENT_EXISTS`).
+  Stride has no patient search and its error has no id, so `slot_booking._returning_patient` finds the patient in our
+  leads (`stride_patient_id`, same birthday, name match first, phone only when no name matches) and `stride_patients` /
+  `stride_cases`; more than one candidate = front desk. Tests in `tests/test_slot_booking_integration.py` (9 cases).
+- Demo Elliot (7e4d63e1): prompt fixes from demo call 01a1b5ae (cut-off lines, "the second one", named dates, "didn't
+  catch that" only for unclear words) and `stopSpeakingPlan.acknowledgementPhrases` (okay, great, thanks, sure, yeah, ...):
+  short words while Elliot talks no longer stop him, so he never restarts a line.
+

@@ -66,7 +66,7 @@ otherwise the default case type is used.
 - Server fills phone, case title (the lead's case), default address, appointment type, clinician,
   location, start/end.
 - Replies: `BOOKED`, `ALREADY_BOOKED`, `TAKEN` / `NOT_AVAILABLE` (with 3 new openings),
-  `PATIENT_EXISTS` (lead flagged), `UNCONFIRMED` (unclear Stride result; lead flagged, never retried),
+  `PATIENT_EXISTS` (lead flagged; owner 2026-11-09: when Stride refuses a second patient with the same name + birthday, `_returning_patient` looks for that patient in our leads (same birthday, same name, else same phone) and Stride's files; exactly one patient whose cases do not include this case (by meaning, `_case_key`) gets a new case and is booked, the same case or an unclear match stays `PATIENT_EXISTS`), `UNCONFIRMED` (unclear Stride result; lead flagged, never retried),
   `FOLLOW_UP` (could not finish in time, or Stride refused for another reason; lead flagged),
   `IN_PROGRESS` (an earlier request for this patient
   is still finishing; the agent says nothing (the tool's own waiting message plays) and books again with the same details, at most
