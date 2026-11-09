@@ -383,6 +383,102 @@ def test_patient_already_exists_flags_for_staff(env):
     assert env.stride.count("appointments") == 0
 
 
+def earlier_patient(env, stride_patient_id, lead_type, *, phone=None, first="Rpt", last="Tester"):
+    """A lead Elliot booked before: same birthday, a Stride patient on file."""
+    env.db.execute(
+        "insert into leads(practice_id,source_system,full_name,first_name,last_name,phone_e164,"
+        "date_of_birth,status,cadence_state,is_test,location,lead_type,stride_patient_id) "
+        "values(%s,'demo_form',%s,%s,%s,%s,'1990-04-26','booked','completed',true,'Laguna Niguel',"
+        "%s,%s)",
+        (env.practice_id, f"{first} {last}", first, last,
+         phone or f"+1555{uuid4().int % 10**7:07d}", lead_type, stride_patient_id),
+    )
+
+
+def test_returning_patient_with_a_new_case_is_booked_on_that_patient(env):
+    # Owner, 2026-11-09: treated before for one problem, back with another -> Elliot books it.
+    lead = booked_setup(env)
+    earlier_patient(env, 777001, "Physical Therapy")
+    env.stride.script["patients"] = [stride_error("400", "Patient already exists")]
+    message = env.book(lead, date=DAY1, time="9:00 AM")
+    assert message.startswith("BOOKED")
+    case = next(p for name, p in env.stride.calls if name == "cases")
+    assert case["patient_id"] == 777001 and case["title"] == "Knee"
+    row = env.one("select stride_patient_id,needs_review from leads where id=%s", lead)
+    assert row == {"stride_patient_id": 777001, "needs_review": False}
+
+
+def test_returning_patient_found_by_phone_when_booked_under_another_name(env):
+    # Elliot books under the name spoken on the call, so the earlier lead's name may differ.
+    lead = booked_setup(env)
+    phone = env.one("select phone_e164 from leads where id=%s", lead)["phone_e164"]
+    earlier_patient(env, 777002, "Physical Therapy", phone=phone, last="TestN1b")
+    env.stride.script["patients"] = [stride_error("400", "Patient already exists")]
+    assert env.book(lead, date=DAY1, time="9:00 AM").startswith("BOOKED")
+    assert next(p for name, p in env.stride.calls if name == "cases")["patient_id"] == 777002
+
+
+def test_returning_patient_with_the_same_case_goes_to_the_front_desk(env):
+    lead = booked_setup(env)  # lead_type "knee"
+    earlier_patient(env, 777003, " KNEE ")
+    env.stride.script["patients"] = [stride_error("400", "Patient already exists")]
+    message = env.book(lead, date=DAY1, time="9:00 AM")
+    assert message.startswith("PATIENT_EXISTS")
+    assert env.stride.count("cases") == 0 and env.stride.count("appointments") == 0
+    assert env.one("select needs_review from leads where id=%s", lead)["needs_review"]
+
+
+def test_same_case_by_meaning_goes_to_the_front_desk(env):
+    # "Physical Therapy" on file, the new referral says "physical therapy": the same case.
+    lead = booked_setup(env)
+    env.db.execute("update leads set lead_type='physical therapy' where id=%s", (lead,))
+    earlier_patient(env, 777004, "Physical Therapy")
+    env.stride.script["patients"] = [stride_error("400", "Patient already exists")]
+    assert env.book(lead, date=DAY1, time="9:00 AM").startswith("PATIENT_EXISTS")
+    assert env.stride.count("cases") == 0
+
+
+def test_returning_patient_from_the_stride_files(env):
+    lead = booked_setup(env)
+    env.db.execute("insert into stride_patients(practice_id,stride_id,first_name,last_name,"
+                   "date_of_birth) values(%s,777005,'Rpt','Tester','1990-04-26')", (env.practice_id,))
+    env.db.execute("insert into stride_cases(practice_id,stride_id,patient_stride_id,title) "
+                   "values(%s,888005,777005,'Pelvic Floor')", (env.practice_id,))
+    env.stride.script["patients"] = [stride_error("400", "Patient already exists")]
+    assert env.book(lead, date=DAY1, time="9:00 AM").startswith("BOOKED")
+    assert next(p for name, p in env.stride.calls if name == "cases")["patient_id"] == 777005
+
+
+def test_stride_files_with_the_same_case_go_to_the_front_desk(env):
+    lead = booked_setup(env)
+    env.db.execute("insert into stride_patients(practice_id,stride_id,first_name,last_name,"
+                   "date_of_birth) values(%s,777006,'Rpt','Tester','1990-04-26')", (env.practice_id,))
+    env.db.execute("insert into stride_cases(practice_id,stride_id,patient_stride_id,title) "
+                   "values(%s,888006,777006,'Knee')", (env.practice_id,))
+    env.stride.script["patients"] = [stride_error("400", "Patient already exists")]
+    assert env.book(lead, date=DAY1, time="9:00 AM").startswith("PATIENT_EXISTS")
+
+
+def test_two_possible_patients_go_to_the_front_desk(env):
+    lead = booked_setup(env)
+    earlier_patient(env, 777007, "Physical Therapy")
+    earlier_patient(env, 777008, "Physical Therapy")
+    env.stride.script["patients"] = [stride_error("400", "Patient already exists")]
+    assert env.book(lead, date=DAY1, time="9:00 AM").startswith("PATIENT_EXISTS")
+    assert env.stride.count("cases") == 0
+
+
+def test_other_birthday_is_not_the_same_patient(env):
+    lead = booked_setup(env)
+    env.db.execute(
+        "insert into leads(practice_id,source_system,full_name,first_name,last_name,phone_e164,"
+        "date_of_birth,status,cadence_state,is_test,lead_type,stride_patient_id) "
+        "values(%s,'demo_form','Rpt Tester','Rpt','Tester','+15550000000','1991-04-26','booked',"
+        "'completed',true,'Physical Therapy',777009)", (env.practice_id,))
+    env.stride.script["patients"] = [stride_error("400", "Patient already exists")]
+    assert env.book(lead, date=DAY1, time="9:00 AM").startswith("PATIENT_EXISTS")
+
+
 def test_unclear_result_is_never_retried(env):
     lead = booked_setup(env)
     env.stride.script["appointments"] = [

@@ -948,6 +948,43 @@ def _alternatives(trace: WorkflowTrace, context: BookingContext, call_key: str |
     return f"{too_far}Other openings: {_offer_text(slots)}. {BOOK_HINT}"
 
 
+def _returning_patient(conn, lead: dict[str, Any], patient: Any, case_text: str) -> int | None:
+    """The Stride patient this booking is a repeat of, when the new case is a different one.
+
+    Stride refuses a second patient with the same name and birthday and has no search, so the
+    patient comes from our own data: an earlier lead with a Stride patient, the same birthday and
+    the same phone or name (Elliot may have booked under the name spoken on the call), or Stride's
+    imported files (same name and birthday). Returns None (front desk) when no single patient is
+    found, or when that patient already has this case (by meaning: "Ortho" = "Physical Therapy").
+    """
+    from .lead_actions import _case_key  # local: lead_actions imports the worker
+
+    first = " ".join(patient.first_name.lower().split())
+    last = " ".join(patient.last_name.lower().split())
+    found = conn.execute(
+        "select l.stride_patient_id as patient_id,l.lead_type as case_text from leads l "
+        "where l.practice_id=%(p)s and l.id<>%(lead)s and l.stride_patient_id is not null "
+        "and l.date_of_birth=%(dob)s and (l.phone_e164=%(phone)s or "
+        " (lower(trim(l.first_name))=%(first)s and lower(trim(l.last_name))=%(last)s)) "
+        "union all "
+        "select p.stride_id,c.title from stride_patients p "
+        "left join stride_cases c on c.patient_stride_id=p.stride_id and c.practice_id=p.practice_id "
+        " and c.deleted_at is null "
+        "where p.practice_id=%(p)s and p.deleted_at is null and p.date_of_birth=%(dob)s "
+        "and lower(trim(p.first_name))=%(first)s and lower(trim(p.last_name))=%(last)s",
+        {"p": lead["practice_id"], "lead": lead["id"], "dob": patient.date_of_birth,
+         "phone": lead["phone_e164"], "first": first, "last": last},
+    ).fetchall()
+    patients = {row["patient_id"] for row in found}
+    if len(patients) != 1:
+        return None
+    wanted = _case_key(conn, lead["practice_id"], case_text)
+    if any(_case_key(conn, lead["practice_id"], row["case_text"]) == wanted
+           for row in found if row["case_text"]):
+        return None
+    return patients.pop()
+
+
 def _existing_booking(conn, lead_id: str) -> dict[str, Any] | None:
     return conn.execute(
         "select a.id,a.state,a.start_utc,a.stride_appointment_id,bl.name as location_name,"
@@ -1347,24 +1384,38 @@ def book_slot(
                 return follow_up("tool deadline reached before patient creation",
                                  "ran out of time before the patient step")
             stage = "patient"
-            patient_id = providers.stride_create(trace, "patients", {
-                "first_name": patient.first_name,
-                "last_name": patient.last_name,
-                "date_of_birth": patient.date_of_birth.isoformat(),
-                "contact_info": {
-                    "mobile_phone_number": _stride_phone(lead["phone_e164"]),
-                    "personal_email": patient.email or lead["email"] or "",
-                    "preferred_contact_method": "P",
-                    "appointment_reminder_text": True,
-                },
-                "primary_address": {
-                    "address_1": settings.booking_default_address_1,
-                    "city": settings.booking_default_city,
-                    "state": settings.booking_default_state,
-                    "zip_code": settings.booking_default_zip,
-                    "address_type": "H",
-                },
-            })
+            try:
+                patient_id = providers.stride_create(trace, "patients", {
+                    "first_name": patient.first_name,
+                    "last_name": patient.last_name,
+                    "date_of_birth": patient.date_of_birth.isoformat(),
+                    "contact_info": {
+                        "mobile_phone_number": _stride_phone(lead["phone_e164"]),
+                        "personal_email": patient.email or lead["email"] or "",
+                        "preferred_contact_method": "P",
+                        "appointment_reminder_text": True,
+                    },
+                    "primary_address": {
+                        "address_1": settings.booking_default_address_1,
+                        "city": settings.booking_default_city,
+                        "state": settings.booking_default_state,
+                        "zip_code": settings.booking_default_zip,
+                        "address_type": "H",
+                    },
+                })
+            except ProviderError as exc:
+                # A returning patient with a new problem is booked on a new case (owner, 2026-11-09:
+                # a patient treated for pelvic who comes back with a knee must not wait for the front
+                # desk). The same case again stays with the front desk (PATIENT_EXISTS below).
+                if exc.ambiguous or "already exists" not in str(exc).lower():
+                    raise
+                with transaction() as conn:
+                    returning = _returning_patient(conn, lead, patient,
+                                                   lead["lead_type"] or context.case_type["name"])
+                if not returning:
+                    raise
+                patient_id = returning
+                trace.log("booking_returning_patient", stride_patient_id=patient_id)
             with transaction() as conn:
                 conn.execute("update leads set stride_patient_id=%s where id=%s",
                              (patient_id, lead_id))
