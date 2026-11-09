@@ -962,12 +962,14 @@ def _returning_patient(conn, lead: dict[str, Any], patient: Any, case_text: str)
     first = " ".join(patient.first_name.lower().split())
     last = " ".join(patient.last_name.lower().split())
     found = conn.execute(
-        "select l.stride_patient_id as patient_id,l.lead_type as case_text from leads l "
+        "select l.stride_patient_id as patient_id,l.lead_type as case_text,"
+        "(lower(trim(l.first_name))=%(first)s and lower(trim(l.last_name))=%(last)s) as by_name "
+        "from leads l "
         "where l.practice_id=%(p)s and l.id<>%(lead)s and l.stride_patient_id is not null "
         "and l.date_of_birth=%(dob)s and (l.phone_e164=%(phone)s or "
         " (lower(trim(l.first_name))=%(first)s and lower(trim(l.last_name))=%(last)s)) "
         "union all "
-        "select p.stride_id,c.title from stride_patients p "
+        "select p.stride_id,c.title,true from stride_patients p "
         "left join stride_cases c on c.patient_stride_id=p.stride_id and c.practice_id=p.practice_id "
         " and c.deleted_at is null "
         "where p.practice_id=%(p)s and p.deleted_at is null and p.date_of_birth=%(dob)s "
@@ -975,6 +977,9 @@ def _returning_patient(conn, lead: dict[str, Any], patient: Any, case_text: str)
         {"p": lead["practice_id"], "lead": lead["id"], "dob": patient.date_of_birth,
          "phone": lead["phone_e164"], "first": first, "last": last},
     ).fetchall()
+    # Stride matches on name + birthday, so a name match wins; the phone alone (another family
+    # member, or an earlier test under another name) is used only when no name matches.
+    found = [row for row in found if row["by_name"]] or found
     patients = {row["patient_id"] for row in found}
     if len(patients) != 1:
         return None

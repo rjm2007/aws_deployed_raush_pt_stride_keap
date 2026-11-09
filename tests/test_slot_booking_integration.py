@@ -418,6 +418,17 @@ def test_returning_patient_found_by_phone_when_booked_under_another_name(env):
     assert next(p for name, p in env.stride.calls if name == "cases")["patient_id"] == 777002
 
 
+def test_name_match_wins_over_another_patient_on_the_same_phone(env):
+    # Same phone + birthday under another name (an earlier test, a family member) is not Stride's match.
+    lead = booked_setup(env)
+    phone = env.one("select phone_e164 from leads where id=%s", lead)["phone_e164"]
+    earlier_patient(env, 777010, "Physical Therapy", phone=phone, last="TestN1")
+    earlier_patient(env, 777011, "Physical Therapy")
+    env.stride.script["patients"] = [stride_error("400", "Patient already exists")]
+    assert env.book(lead, date=DAY1, time="9:00 AM").startswith("BOOKED")
+    assert next(p for name, p in env.stride.calls if name == "cases")["patient_id"] == 777011
+
+
 def test_returning_patient_with_the_same_case_goes_to_the_front_desk(env):
     lead = booked_setup(env)  # lead_type "knee"
     earlier_patient(env, 777003, " KNEE ")
