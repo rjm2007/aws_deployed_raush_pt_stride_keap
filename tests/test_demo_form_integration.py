@@ -7,7 +7,7 @@ database with the migrations applied).
 
 import pytest
 from fastapi.testclient import TestClient
-from test_sheet_direct_integration import STEPS, _phone, env  # noqa: F401 - the shared fixture
+from test_sheet_direct_integration import STEPS, _phone, cases, env  # noqa: F401 - shared fixtures
 
 from rpt_agent.api import app
 from rpt_agent.config import get_settings
@@ -26,12 +26,12 @@ def form(env, monkeypatch):  # noqa: F811 - pytest fixture injection
     return env
 
 
-def _submit(phone, key=None, first="Jane"):
+def _submit(phone, key=None, first="Jane", **extra):
     return TestClient(app).post(
         "/api/v1/demo-form/leads",
         json={"idempotency_key": key or f"demo-{phone}", "first_name": first, "last_name": "Smith",
               "country_code": "+1", "phone": phone, "date_of_birth": "1990-01-16",
-              "contact_consent": True},
+              "contact_consent": True, **extra},
         headers={"X-Dashboard-Token": TOKEN})
 
 
@@ -54,6 +54,16 @@ def test_a_form_lead_starts_the_cadence_like_a_sheet_lead(form):
     assert form.db.execute(
         "select count(*) as n from integration_outbox where aggregate_id=%s",
         (str(lead["id"]),)).fetchone()["n"] == 0
+
+
+def test_the_chosen_case_is_stored_under_its_booking_name(form, cases):  # noqa: F811
+    pelvic = _submit(_phone(), case_type="physical therapy - pelvic")
+    assert pelvic.status_code == 201
+    assert form.lead(pelvic.json()["lead_id"])["lead_type"] == "Physical Therapy - Pelvic"
+    # Only a case the booking engine can book; nothing is created for an unknown one.
+    before = len(form.leads())
+    assert _submit(_phone(), case_type="Massage").status_code == 422
+    assert len(form.leads()) == before
 
 
 def test_a_double_tap_makes_one_lead(form):

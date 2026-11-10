@@ -2946,3 +2946,13 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
   catch that" only for unclear words) and `stopSpeakingPlan.acknowledgementPhrases` (okay, great, thanks, sure, yeah, ...):
   short words while Elliot talks no longer stop him, so he never restarts a line.
 
+
+### 2026-11-10 — Demo form: visit type (case) and pasted full numbers
+
+- `POST /api/v1/demo-form/leads` takes an optional `case_type`. It must name an active `case_types` row (any case,
+  stored under its exact name so the call says it and find-slots picks it), else 422 and no lead; none =
+  `DEMO_FORM_LEAD_TYPE`. The `/try` page asks "What's the visit for?" (Physical therapy / Pelvic health).
+- Dashboard `/try`: a pasted full number ("+91 96545 40686", "+1 949 555 0123", "0965…") switches the country and
+  drops the code (`readPhone`); before, the first 10 digits were kept (91 kept, last two digits lost).
+- Copy: the call comes first and the Day 0 text only after it (the worker holds a text while a call is in flight),
+  so the page says "We'll call you within a minute … and text you if we miss you".

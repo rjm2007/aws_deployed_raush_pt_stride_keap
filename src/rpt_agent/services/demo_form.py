@@ -32,6 +32,7 @@ def start_demo_lead(
     phone: str,
     phone_original: str,
     date_of_birth: date,
+    case_type: str | None = None,
 ) -> str:
     """Create the lead and plan its cadence; the same key twice returns the first lead."""
     settings = get_settings()
@@ -62,6 +63,18 @@ def start_demo_lead(
         ).fetchone()
         if recent and recent["count"] >= settings.demo_form_max_per_hour:
             raise DemoFormError(429, "too many demo requests, try again soon")
+        lead_type = settings.demo_form_lead_type
+        if case_type:
+            # Only a case the booking engine can book; stored under its exact name so the call
+            # names it and find-slots picks it without guessing.
+            case = conn.execute(
+                "select name from case_types where practice_id=%s and is_active=true "
+                "and lower(name)=lower(%s)",
+                (practice["id"], case_type),
+            ).fetchone()
+            if not case:
+                raise DemoFormError(422, "case_type is not a bookable case")
+            lead_type = case["name"]
         inserted = conn.execute(
             "insert into leads(practice_id,source_system,external_referral_id,first_name,"
             "last_name,full_name,phone_e164,phone_original,date_of_birth,timezone,line_type,"
@@ -82,7 +95,7 @@ def start_demo_lead(
                 practice["timezone"],
                 f"demo-form:{idempotency_key}",
                 CONSENT_TEXT_VERSION,
-                settings.demo_form_lead_type,
+                lead_type,
                 settings.booking_default_city,
                 synthetic,
             ),

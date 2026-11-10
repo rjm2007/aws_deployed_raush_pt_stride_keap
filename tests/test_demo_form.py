@@ -65,6 +65,13 @@ def test_a_valid_form_starts_a_lead_with_the_full_number(started):
     assert str(call["date_of_birth"]) == "1990-01-16"
 
 
+def test_the_case_is_passed_on_and_blank_means_the_default(started):
+    assert _post({**BODY, "case_type": " Physical Therapy  - Pelvic "}).status_code == 201
+    assert _post({**BODY, "idempotency_key": "demo-key-0002", "case_type": " "}).status_code == 201
+    assert _post({**BODY, "idempotency_key": "demo-key-0003"}).status_code == 201
+    assert [call["case_type"] for call in started] == ["Physical Therapy - Pelvic", None, None]
+
+
 def test_an_indian_number_is_kept_with_its_code(started):
     assert _post({**BODY, "country_code": "+91", "phone": "098765 43210"}).status_code == 201
     assert started[0]["phone"] == "+919876543210"

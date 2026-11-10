@@ -61,6 +61,8 @@ class DemoLead(BaseModel):
     country_code: Literal["+1", "+91"]
     phone: str = Field(min_length=7, max_length=32)
     date_of_birth: date
+    # A case type name (Physical Therapy, Physical Therapy - Pelvic, ...); none = DEMO_FORM_LEAD_TYPE.
+    case_type: str | None = Field(default=None, max_length=80)
     contact_consent: Literal[True]
 
     @field_validator("first_name", "last_name")
@@ -70,6 +72,12 @@ class DemoLead(BaseModel):
         if not value:
             raise ValueError("must not be blank")
         return value
+
+    @field_validator("case_type")
+    @classmethod
+    def optional_text(cls, value: str | None) -> str | None:
+        value = " ".join((value or "").split())
+        return value or None
 
     @field_validator("date_of_birth", mode="before")
     @classmethod
@@ -103,6 +111,7 @@ async def create_demo_lead(payload: DemoLead):
             phone=f"{payload.country_code}{national}",
             phone_original=f"{payload.country_code} {payload.phone.strip()}",
             date_of_birth=payload.date_of_birth,
+            case_type=payload.case_type,
         )
     except DemoFormError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
