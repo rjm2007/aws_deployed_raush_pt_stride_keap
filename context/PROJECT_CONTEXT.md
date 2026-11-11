@@ -2981,4 +2981,8 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
 - After an independent review: a cancel counts against a restart by the visit's first-seen time (Stride re-sends a
   cancelled visit on later edits); tags go on in `tag_order` (Pending, status, Booked, Completed last); a new
   contact id clears `synced`; tags applied by a failed or re-planned attempt are noted as sent (`_note_sent`); Bad
-  Phone never sends the lead's number. Open: E-69 (switching a tag on later re-tags old history), E-70.
+  Phone never sends the lead's number. E-69 decided: at go-live every tag is switched on before the first sync.
+- E-70 (owner, 2026-11-11): a visit carried from an older lead counts while it started after the new referral
+  was created (was: only while still in the future), so a returning patient stays Booked / gets Completed after
+  the visit; carried cancels and no-shows are skipped; `_SELECT_ROWS` re-plans the new lead when an older
+  same-number lead's visit changes.

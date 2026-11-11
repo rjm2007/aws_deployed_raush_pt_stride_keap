@@ -1040,3 +1040,68 @@ def test_bad_phone_never_sends_the_wrong_number_to_keap(env):
     env.db.execute("update leads set status='invalid_phone' where id=%s", (known,))
     env.sync(known)  # phone-only person already in Keap: still found and tagged
     assert env.contact(known)["tag_ids"] == ["194"]
+
+
+# --- a repeat referral whose carried visit has passed (owner, 2026-11-11, E-70) -------------------
+
+
+def _go_live_a_week_ago(env):
+    env.db.execute("update practice_settings set keap_sync_start_at=now()-interval '7 days' "
+                   "where practice_id=%s", (env.practice_id,))
+
+
+def _referred_again(env, visit_days_ago=1):
+    """Old lead booked a visit; a new referral came in BEFORE that visit; the visit has now passed."""
+    _go_live_a_week_ago(env)
+    old = env.lead()
+    pid = env.book(old, days=3)
+    env.sync(old)
+    new = env.lead()
+    env.db.execute("update leads set created_at=now()-interval '5 days' where id=%s", (old,))
+    env.db.execute("update leads set created_at=now()-interval '2 days' where id=%s", (new,))
+    env.sync(new)
+    env.db.execute("update stride_appointments set start_utc=now()-make_interval(days=>%s),"
+                   "updated_at=now() where practice_id=%s and patient_stride_id=%s",
+                   (visit_days_ago, env.practice_id, pid))
+    return old, new, pid
+
+
+def test_a_carried_visit_that_has_passed_keeps_the_new_referral_booked(env):
+    env.status_tags()
+    _old, new, _pid = _referred_again(env)
+    env.keap.requests.clear()
+    env.sync(new)
+    assert env.row(new)["desired"]["tags"] == ["180"]
+    assert _tag_calls(env) == []  # no "New Evaluation Booked" for someone who was just seen
+
+
+def test_a_carried_visit_checked_in_shows_completed_without_waiting_for_the_hourly_plan(env):
+    env.status_tags()
+    env.keap.automations["172"] = {"180"}
+    _old, new, pid = _referred_again(env)
+    env.sync(new)
+    env.db.execute("update stride_appointments set status='Checked In',updated_at=now() "
+                   "where practice_id=%s and patient_stride_id=%s", (env.practice_id, pid))
+    env.db.execute("update keap_sync set desired_at=now()-interval '10 minutes' where lead_id=%s",
+                   (new,))
+    counts = env.plan()  # the change-only plan, not the hourly full one
+    assert counts["queued"] >= 1
+    env.sync(new, plan=False)
+    assert env.contact(new)["tag_ids"] == ["172"]
+
+
+def test_a_carried_visit_missed_or_cancelled_leaves_the_new_referral_pending(env):
+    _go_live_a_week_ago(env)
+    for status in ("No Show", "Cancel"):
+        old = env.lead(name=f"Asha {status[:2]}", email=f"{status[:2]}@example.test",
+                       phone=f"+1555555{'0111' if status == 'Cancel' else '0112'}")
+        pid = env.book(old, days=3)
+        new = env.lead(name=f"Asha {status[:2]}", email=f"{status[:2]}@example.test",
+                       phone=f"+1555555{'0111' if status == 'Cancel' else '0112'}")
+        env.db.execute("update leads set created_at=now()-interval '5 days' where id=%s", (old,))
+        env.db.execute("update leads set created_at=now()-interval '2 days' where id=%s", (new,))
+        env.db.execute("update stride_appointments set start_utc=now()-interval '1 day',status=%s,"
+                       "updated_at=now() where practice_id=%s and patient_stride_id=%s",
+                       (status, env.practice_id, pid))
+        env.plan()
+        assert env.row(new)["desired"]["tags"] == [PENDING], status

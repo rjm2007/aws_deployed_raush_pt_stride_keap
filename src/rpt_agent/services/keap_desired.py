@@ -556,6 +556,9 @@ def _load_context(conn, practice_id, rows, settings, mapping):
     # An upcoming booking the same person still has through an OLDER lead (a repeat referral
     # came in before the visit) counts for the newest lead, so Keap never flips a booked patient
     # back to Pending (decision 2026-10-14: an upcoming booking wins). Keyed ("carried", lead id).
+    # "Upcoming" = after the new referral arrived, not after now: once the visit passes it still
+    # counts (Booked, then Completed when checked in), or the new lead fell back to Pending the
+    # day after the visit (owner, 2026-11-11, E-70). Visits before the new referral never count.
     if lead_ids and type_ids:
         carried_sql = (
             "select n.id as for_lead,{cols} from leads n "
@@ -566,12 +569,13 @@ def _load_context(conn, practice_id, rows, settings, mapping):
         ours = carried_sql.format(
             cols="a.stride_appointment_id as stride_id,ct.stride_appointment_type_id as "
                  "appointment_type_id,a.start_utc,a.created_at as booked_at,a.clinician_id,"
-                 "c.display_name as clinician_name,'Unmarked' as status",
+                 "c.display_name as clinician_name,"
+                 "case a.state when 'completed' then 'Checked In' else 'Unmarked' end as status",
             join="join appointments a on a.lead_id=l.id join case_types ct on ct.id=a.case_type_id "
                  "left join clinicians c on c.practice_id=a.practice_id "
                  "and c.stride_user_id=a.clinician_id",
             # Once Stride has its own copy, that copy decides (cancelled, moved): ours is stale.
-            where="a.state in ('scheduled','unknown') and a.start_utc>now() "
+            where="a.state in ('scheduled','unknown','completed') and a.start_utc>n.created_at "
                   "and ct.stride_appointment_type_id=any(%s) and not exists(select 1 from "
                   "stride_appointments sa where sa.practice_id=a.practice_id "
                   "and sa.stride_id=a.stride_appointment_id)",
@@ -582,7 +586,7 @@ def _load_context(conn, practice_id, rows, settings, mapping):
             join="join stride_patients sp on sp.practice_id=l.practice_id and sp.lead_id=l.id "
                  "and sp.deleted_at is null join stride_appointments sa on "
                  "sa.practice_id=sp.practice_id and sa.patient_stride_id=sp.stride_id",
-            where="sa.deleted_at is null and sa.start_utc>now() and sa.start_utc>=%s "
+            where="sa.deleted_at is null and sa.start_utc>n.created_at and sa.start_utc>=%s "
                   "and sa.appointment_type_id=any(%s)",
         )
         for sql, params in (
@@ -591,7 +595,9 @@ def _load_context(conn, practice_id, rows, settings, mapping):
         ):
             for r in conn.execute(sql, params):
                 row = dict(r)
-                if (row["status"] or "").strip().lower() in CANCELLED_STATUSES:
+                # A visit that fell through on the old lead is no booking for the new referral,
+                # which is being worked on (Pending).
+                if (row["status"] or "").strip().lower() in CANCELLED_STATUSES | NO_SHOW_STATUSES:
                     continue
                 row.update(starts_at_local=None, deleted_at=None)
                 appointments.setdefault(("carried", row.pop("for_lead")), []).append(row)
@@ -657,7 +663,17 @@ _SELECT_ROWS = (
     "   and (a.updated_at>k.desired_at-" + REPLAN_GRACE + " "
     "        or (a.start_utc>k.desired_at and a.start_utc<=now()))) "
     " or exists(select 1 from appointments ap where ap.lead_id=k.lead_id "
-    "   and ap.updated_at>k.desired_at-" + REPLAN_GRACE + ")) "
+    "   and ap.updated_at>k.desired_at-" + REPLAN_GRACE + ") "
+    # A visit carried from an older lead on the same number (checked in, cancelled) changes this
+    # person too; without this it waited for the hourly full plan.
+    " or exists(select 1 from leads o where o.practice_id=l.practice_id "
+    "   and o.phone_e164=l.phone_e164 and o.id<>l.id and o.created_at<l.created_at and ("
+    "   exists(select 1 from stride_patients op join stride_appointments oa "
+    "     on oa.practice_id=op.practice_id and oa.patient_stride_id=op.stride_id "
+    "     where op.practice_id=o.practice_id and op.lead_id=o.id "
+    "     and oa.updated_at>k.desired_at-" + REPLAN_GRACE + ") "
+    "   or exists(select 1 from appointments oap where oap.lead_id=o.id "
+    "     and oap.updated_at>k.desired_at-" + REPLAN_GRACE + ")))) "
     "and (%s::timestamptz is null or k.desired_at is null or k.desired_at<%s) "
     "order by k.desired_at nulls first,k.id limit %s"
 )
