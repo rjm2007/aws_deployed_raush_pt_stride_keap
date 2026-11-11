@@ -343,3 +343,176 @@ def test_pelvic_tag_uses_the_sheet_gender_first_then_stride(sheet, stride, tag):
 def test_a_stride_only_patient_uses_the_stride_gender():
     only_stride = patient(gender="M", preferred_email="a@example.test")
     assert run(None, only_stride, appts=[appt(6)], mapping=SANDBOX).desired["tags"] == ["160"]
+
+
+# --- the Keap admin's STATUS tags (Michelle, 2026-11-10) ------------------------------------------
+
+HANDED_OFF, ABANDONED, BAD_PHONE, CANCELLED, NO_SHOW = "901", "902", "903", "904", "905"
+STATUS_TAGS = {"keap_handed_off_tag_id": HANDED_OFF, "keap_abandoned_tag_id": ABANDONED,
+               "keap_bad_phone_tag_id": BAD_PHONE, "keap_cancelled_tag_id": CANCELLED,
+               "keap_no_show_tag_id": NO_SHOW}
+
+
+def tags_of(lead_=None, appts=(), patient_=None, **settings):
+    built = run(lead_, patient_, appts=appts, settings={**STATUS_TAGS, **settings})
+    return built.desired["tags"]
+
+
+def test_status_tags_are_owned_and_apply_only_is_the_default():
+    d = run(lead(), settings=STATUS_TAGS).desired
+    assert {HANDED_OFF, ABANDONED, BAD_PHONE, CANCELLED, NO_SHOW} <= set(d["owned_tags"])
+    assert d["remove_old_tags"] is False
+    assert run(lead(), settings={"keap_remove_old_tags": True}).desired["remove_old_tags"] is True
+
+
+def test_do_not_contact_goes_to_keap_with_abandoned_lead_only():
+    built = run(lead(status="do_not_contact"), settings=STATUS_TAGS)
+    assert built.desired["tags"] == [ABANDONED] and built.desired["contact"]["email"]
+    # Already in Keap (frozen under the old rule): now it is planned, not frozen.
+    assert not run(lead(status="do_not_contact"), settings=STATUS_TAGS, synced_before=True).freeze
+
+
+def test_do_not_contact_wins_over_a_booked_visit():
+    # They asked us to stop: only the tag whose automation stops all marketing.
+    assert tags_of(lead(status="do_not_contact"),
+                   appts=[appt(2), appt(1, days=-2, status="Checked In")]) == [ABANDONED]
+
+
+def test_wrong_number_gets_bad_phone_but_a_booked_visit_wins():
+    assert tags_of(lead(status="invalid_phone")) == [BAD_PHONE]
+    assert tags_of(lead(status="invalid_phone"), appts=[appt(2)]) == ["180"]
+
+
+def test_each_keep_out_status_stays_out_until_its_own_tag_is_set():
+    only_bad_phone = {"keap_bad_phone_tag_id": BAD_PHONE}
+    assert run(lead(status="do_not_contact"), settings=only_bad_phone).desired is None
+    assert run(lead(status="invalid_phone"), settings=only_bad_phone).desired["tags"] == [BAD_PHONE]
+
+
+def test_sent_to_the_front_desk_gets_handed_off():
+    assert tags_of(lead(status="transferred_human")) == [HANDED_OFF]
+    assert tags_of(lead(status="transferred_human"), appts=[appt(2)]) == ["180"]
+    # Without the tag: Pending, as before.
+    assert run(lead(status="transferred_human")).desired["tags"] == [PENDING]
+
+
+def test_needs_review_is_not_handed_off():
+    # Owner, 2026-11-11: only the lead status counts, not open front-desk review cards.
+    assert tags_of(lead(status="needs_attention")) == [PENDING]
+
+
+@pytest.mark.parametrize("status", ["Cancel", "Late Cancel", "A", "L"])
+def test_a_cancel_gets_cancelled_instead_of_pending(status):
+    d = run(lead(status="needs_attention"), appts=[appt(2, status=status)],
+            settings=STATUS_TAGS).desired
+    assert d["tags"] == [CANCELLED]
+    assert all(f["value"] is None for f in d["fields"].values())
+
+
+def test_a_deleted_visit_is_a_cancel():
+    assert tags_of(lead(status="needs_attention"), appts=[appt(2, deleted=True)]) == [CANCELLED]
+
+
+@pytest.mark.parametrize("status", ["No Show", "N"])
+def test_a_no_show_gets_noshow_and_loses_booked(status):
+    # E-12: Keap said Booked while the dashboard said needs attention.
+    d = run(lead(status="needs_attention"), appts=[appt(2, days=-1, status=status)],
+            settings=STATUS_TAGS).desired
+    assert d["tags"] == [NO_SHOW]
+    assert d["fields"]["6"]["value"] is None
+
+
+def test_without_the_no_show_tag_a_no_show_stays_booked():
+    settings = {**STATUS_TAGS, "keap_no_show_tag_id": None}
+    assert run(lead(), appts=[appt(2, days=-1, status="No Show")],
+               settings=settings).desired["tags"] == ["180"]
+
+
+def test_without_the_cancelled_tag_a_cancel_returns_to_pending():
+    settings = {**STATUS_TAGS, "keap_cancelled_tag_id": None}
+    assert run(lead(status="needs_attention"), appts=[appt(2, status="Cancel")],
+               settings=settings).desired["tags"] == [PENDING]
+
+
+def test_rebooking_after_a_cancel_or_no_show_is_booked_again():
+    gone = [appt(2, days=1, status="Cancel"), appt(1, days=-1, status="No Show")]
+    assert tags_of(lead(), appts=[*gone, appt(1, days=5)]) == ["184"]
+
+
+def test_the_latest_fall_through_decides_cancelled_or_noshow():
+    early, late = NOW - timedelta(days=2), NOW - timedelta(hours=1)
+    no_show = appt(2, days=-0.5, status="No Show", updated_at=early)
+    cancel = appt(1, days=4, status="Cancel", updated_at=late)
+    assert tags_of(lead(status="needs_attention"), appts=[no_show, cancel]) == [CANCELLED]
+    no_show["updated_at"], cancel["updated_at"] = late, early
+    assert tags_of(lead(status="needs_attention"), appts=[no_show, cancel]) == [NO_SHOW]
+
+
+def test_outreach_started_again_after_a_cancel_is_pending_then_can_give_up():
+    cancel = appt(2, days=3, status="Cancel", updated_at=NOW - timedelta(days=1),
+                  first_seen_at=NOW - timedelta(days=3))
+    restarted = NOW - timedelta(hours=2)
+    assert tags_of(lead(status="new", outreach_planned_at=restarted), appts=[cancel]) == [PENDING]
+    assert tags_of(lead(status="closed_no_response", outreach_planned_at=restarted),
+                   appts=[cancel]) == [GAVE_UP]
+
+
+def test_outreach_planned_before_the_cancel_does_not_undo_it():
+    cancel = appt(2, days=3, status="Cancel", updated_at=NOW - timedelta(hours=1),
+                  first_seen_at=NOW - timedelta(days=3))
+    planned = NOW - timedelta(days=5)
+    assert tags_of(lead(status="needs_attention", outreach_planned_at=planned),
+                   appts=[cancel]) == [CANCELLED]
+    # Staff closed it for the front desk (closed_no_response) without a restart: still Cancelled.
+    assert tags_of(lead(status="closed_no_response", outreach_planned_at=planned),
+                   appts=[cancel]) == [CANCELLED]
+
+
+def test_a_lead_staff_marked_booked_again_is_not_cancelled():
+    assert tags_of(lead(status="booked"), appts=[appt(2, status="Cancel")]) == []
+
+
+def test_a_stride_only_patient_gets_cancelled_or_noshow_but_never_pending():
+    assert tags_of(None, appts=[appt(2, status="Cancel")], patient_=patient(
+        preferred_phone="5555550199")) == [CANCELLED]
+    assert tags_of(None, appts=[appt(2, days=-1, status="No Show")], patient_=patient(
+        preferred_phone="5555550199")) == [NO_SHOW]
+    assert tags_of(None, appts=[], patient_=patient(preferred_phone="5555550199")) == []
+
+
+def test_a_cancel_after_a_completed_visit_keeps_booked_and_completed():
+    # The same scope as before: a fall-through counts only when nothing else is on the books.
+    assert tags_of(lead(), appts=[appt(2, days=-0.5, status="Checked In"),
+                                  appt(1, days=3, status="Cancel")]) == ["172", "180"]
+
+
+def test_a_replaced_lead_after_a_restart_keeps_pending():
+    from rpt_agent.services.review import REPLACED_REASON
+    assert tags_of(lead(status="closed_no_response", status_reason=REPLACED_REASON)) == [PENDING]
+
+
+def test_a_cancelled_visit_stride_sends_again_after_a_restart_does_not_undo_the_restart():
+    # Stride re-sends a cancelled visit on any later edit (updated_at moves); the restart stands.
+    restarted = NOW - timedelta(hours=2)
+    cancel = appt(2, days=3, status="Cancel", updated_at=NOW - timedelta(minutes=5),
+                  first_seen_at=NOW - timedelta(days=2))
+    assert tags_of(lead(status="in_progress", outreach_planned_at=restarted),
+                   appts=[cancel]) == [PENDING]
+
+
+def test_tag_order_puts_pending_first_and_completed_after_booked():
+    d = run(lead(), appts=[appt(2, days=-0.5, status="Checked In")],
+            settings={**STATUS_TAGS, "keap_remove_pending_when_booked": False}).desired
+    assert d["tag_order"] == [PENDING, "180", "172"]
+
+
+def test_bad_phone_leaves_the_leads_number_out_of_keap():
+    d = run(lead(status="invalid_phone"), settings=STATUS_TAGS).desired
+    assert d["contact"]["phone"] is None and d["match"]["phone"] == "+15555550101"
+    stride = run(lead(status="invalid_phone"), patient(mobile_phone="5555550188"),
+                 settings=STATUS_TAGS).desired
+    assert stride["contact"]["phone"] == "5555550188"  # Stride's own number may be right
+    phone_only = lead(status="invalid_phone", email=None)
+    assert run(phone_only, settings=STATUS_TAGS).skip_reason == "no contact details"
+    built = run(phone_only, settings=STATUS_TAGS, synced_before=True)
+    assert built.desired["tags"] == [BAD_PHONE] and built.desired["contact"]["phone"] is None

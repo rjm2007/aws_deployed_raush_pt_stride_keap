@@ -5,9 +5,18 @@
 -- Rausch's real appointment types are known. Needs migration 046 (male_booked_tag_id).
 -- Initial Evaluation, Re-Evaluation and Plan of Care (POC) are deliberately NOT mapped for now
 -- (client, 2026-10-20): they get no Keap tag, and any earlier rows for them are switched off below.
+-- Status tags from the Keap admin's reply of 2026-11-10 (needs migration 056). 192-198 were created
+-- in the sandbox on 2026-11-11 under the Funnels category. Apply only: Keap's automations remove the
+-- old status tag (the sandbox has none, so there old tags stay on test contacts).
 update public.practice_settings set
-  keap_pending_tag_id = '144',          -- Pending
+  keap_pending_tag_id = '180',          -- STATUS: New Evaluation Booked (= outreach started, not booked)
   keap_gave_up_tag_id = '186',          -- STATUS: AI Gave Up
+  keap_handed_off_tag_id = '168',       -- STATUS: Handed off to Human
+  keap_abandoned_tag_id = '192',        -- STATUS: Abandoned Lead (Do Not Contact)
+  keap_bad_phone_tag_id = '194',        -- STATUS: Bad Phone (wrong number / wrong person)
+  keap_cancelled_tag_id = '196',        -- STATUS: Cancelled
+  keap_no_show_tag_id = '198',          -- STATUS: NoShow
+  keap_remove_old_tags = false,
   keap_sync_start_at = coalesce(keap_sync_start_at, now() - interval '1 day'),
   keap_include_existing_patients = true -- sandbox: we want to test the full first load
 where practice_id = (select id from public.practices where slug = 'rausch-pt');
@@ -30,7 +39,7 @@ on conflict (practice_id, stride_appointment_type_id) do update set
   is_active = true;
 
 -- New Evaluation Booked (180), Re-Eval Booked (178), POC Appt Booked (174): off, whatever Stride
--- type id they had.
+-- type id they had (180 is the Pending tag since 2026-11-11, never a booked tag).
 update public.keap_appointment_types set is_active = false, updated_at = now()
 where booked_tag_id in ('180', '178', '174')
   and practice_id = (select id from public.practices where slug = 'rausch-pt');

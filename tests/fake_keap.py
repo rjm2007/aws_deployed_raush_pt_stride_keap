@@ -27,7 +27,11 @@ class FakeKeap:
                      "178": "Re-Eval Booked", "166": "PT Premium Appt Booked",
                      "164": "PT Premium Appt Completed", "162": "Pelvic Appt Booked - Female",
                      "160": "Pelvic Appt Booked - Male", "158": "Pelvic Appt Completed",
-                     "999": "Clinic's own tag"}
+                     "168": "Handed off to Human", "192": "Abandoned Lead", "194": "Bad Phone",
+                     "196": "Cancelled", "198": "NoShow", "999": "Clinic's own tag"}
+        # The clinic's Keap automations: applying a tag removes these tags (Keap admin,
+        # 2026-11-10: "Keap is already set up to remove tags when the following tag is applied").
+        self.automations: dict[str, set[str]] = {}
         self.custom_fields = {"6": "DATE", "8": "TEXT", "10": "TEXT", "4": "TEXT_AREA"}
         self.requests: list[tuple[str, str]] = []
         self.counts: Counter[str] = Counter()
@@ -130,6 +134,7 @@ class FakeKeap:
                 tags = self.contacts[cid]["tag_ids"]
                 if route.endswith(":applyTags") and tag not in tags:
                     tags.append(tag)
+                    tags[:] = [t for t in tags if t not in self.automations.get(tag, ())]
                 if route.endswith(":removeTags") and tag in tags:
                     tags.remove(tag)
             if route.endswith(":removeTags"):

@@ -2,8 +2,9 @@
 
 Every Keap write below is safe to repeat, and the steps run in a fixed order:
 find (or create) the contact, patch only the fields we own, apply wanted tags first,
-then remove owned tags that are no longer wanted (so a person is never left without a
-status tag). What Keap holds that we do not own - other emails and phones, other
+then (only with `remove_old_tags`) remove owned tags that are no longer wanted (so a person
+is never left without a status tag). Without it a tag is applied once, when it is new for the
+person, and Keap's own automations remove the old one. What Keap holds that we do not own - other emails and phones, other
 custom fields, other tags, the contact type of an existing contact - is left alone.
 Never log names, emails, phones or birthdays; `last_error` holds short PHI-free reasons.
 """
@@ -151,8 +152,25 @@ def update_body(
 
 
 def _save_contact_id(row_id: int, contact_id: str | None) -> None:
+    # What we last sent belongs to the old contact: a new one starts with nothing sent, even if
+    # this attempt fails before it ends (review, 2026-11-11).
     with transaction() as conn:
-        conn.execute("update keap_sync set keap_contact_id=%s where id=%s", (contact_id, row_id))
+        conn.execute(
+            "update keap_sync set synced=case when keap_contact_id is distinct from %s then null "
+            "else synced end,keap_contact_id=%s where id=%s", (contact_id, contact_id, row_id))
+
+
+_NOTE_SENT = ("update keap_sync set synced=coalesce(synced,'{}'::jsonb)||"
+              "jsonb_build_object('tags',%s::jsonb) where id=%s")
+
+
+def _note_sent(row_id: int, tags: set[str], conn=None) -> None:
+    """Tags applied by an attempt that did not end 'synced' count as sent: never re-applied."""
+    if conn is not None:
+        conn.execute(_NOTE_SENT, (Jsonb(sorted(tags)), row_id))
+        return
+    with transaction() as own:
+        own.execute(_NOTE_SENT, (Jsonb(sorted(tags)), row_id))
 
 
 def claim_contact(conn, row: dict[str, Any], contact_id: str) -> bool:
@@ -257,11 +275,31 @@ def sync_one(client: KeapClient, row: dict[str, Any], trace: WorkflowTrace) -> s
 
     have = {str(t) for t in (contact.get("tag_ids") or [])}
     want = {str(t) for t in desired["tags"]}
+    applied: list[str] = []
+    sent: set[str] = set()
     owned = {str(t) for t in desired["owned_tags"]}
-    for tag_id in sorted(want - have):  # apply first: never leave a person without a status tag
-        client.apply_tag(trace, tag_id, contact_id)
-    for tag_id in sorted((owned & have) - want):
-        client.remove_tag(trace, tag_id, contact_id)
+    if desired.get("remove_old_tags", True):
+        for tag_id in sorted(want - have):  # apply first: never leave a person without a status tag
+            client.apply_tag(trace, tag_id, contact_id)
+        for tag_id in sorted((owned & have) - want):
+            client.remove_tag(trace, tag_id, contact_id)
+    else:
+        # Keap admin, 2026-11-10: Keap's automations remove the old status tag when the next one
+        # is applied, so we never remove one. We apply only tags that are new since our last sync
+        # of this contact: a tag Keap took off (e.g. Booked once Completed is on) must not be put
+        # back by an unrelated change (a new visit time), or its automation fires again.
+        if row.get("keap_contact_id") and contact_id == row["keap_contact_id"]:
+            sent = {str(t) for t in ((row.get("synced") or {}).get("tags") or [])}
+        new = want - sent - have
+        try:
+            # Keap's automations act on the tag applied last: tag_order puts Completed after Booked.
+            for tag_id in [t for t in (desired.get("tag_order") or sorted(want)) if t in new]:
+                client.apply_tag(trace, tag_id, contact_id)
+                applied.append(tag_id)
+        except Exception:
+            if applied:
+                _note_sent(row["id"], sent | set(applied))
+            raise
 
     with transaction() as conn:
         done = conn.execute(
@@ -274,6 +312,8 @@ def sync_one(client: KeapClient, row: dict[str, Any], trace: WorkflowTrace) -> s
                 "update keap_sync set status='pending',next_attempt_at=now() where id=%s",
                 (row["id"],),
             )
+            if applied:
+                _note_sent(row["id"], sent | set(applied), conn)
             return "requeued"
     return "synced"
 

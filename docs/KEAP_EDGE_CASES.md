@@ -25,19 +25,35 @@ client / Michelle), **GAP** (known weakness, not built), **RISK** (cannot be tes
 | E-02 | Lead is still being called | Nothing changes; an idle system makes zero Keap writes | tested - chain `test_an_idle_system...` |
 | E-03 | Lead books in Stride | Type's Booked tag applied **before** Pending is removed; date, time, clinician filled; dashboard says booked | tested - chain `test_stride_booking...`, sync (order of calls) |
 | E-04 | Booking rescheduled | Date/time/clinician follow; tags unchanged | tested - chain `test_reschedule...` |
-| E-05 | Booking cancelled / late-cancelled / deleted in Stride | Dashboard -> needs attention; Keap: Booked removed, Pending back, fields cleared | tested - chain (3 variants) |
-| E-06 | Re-books after a cancel (even a different type) | Booked again, Pending off | tested - chain `test_rebooking...` |
-| E-07 | Checked in | Completed added, Booked kept | tested - chain, plan |
+| E-05 | Booking cancelled / late-cancelled / deleted in Stride | Dashboard -> needs attention; Keap: **STATUS: Cancelled** applied, fields cleared (Keap's automation takes Booked off). Without the Cancelled tag set: Booked removed, Pending back | tested - chain (3 variants, both modes), unit |
+| E-06 | Re-books after a cancel (even a different type) | Booked again (applied again: it is new since the last sync) | tested - chain `test_rebooking...`, `test_a_stride_cancel_shows_cancelled...`, sync |
+| E-07 | Checked in | Completed added; Booked stays in our plan. If Keap's automation takes Booked off, we **never put it back** (it is not new for the person) | tested - chain, plan, sync `test_a_tag_keap_removed_is_never_put_back...` |
 | E-08 | Second appointment of another type | Both Booked tags; the single date/time/clinician set shows the **next upcoming** one (else the latest past) | tested - chain, unit |
 | E-09 | Stride type we do not map (e.g. id 77) | Dashboard says booked, but Keap gets **no** Booked tag and Pending is removed -> the contact has no status tag | **by design / GAP** - pinned by chain `test_an_appointment_type_we_do_not_map...`. Fix = map every type Rausch uses (waiting for the real type list) |
 | E-10 | Booked by voice agent or by staff in the Sheet, no Stride visit yet | Pending removed, no Booked tag | by design - chain `test_staff_marking_booked...`, unit |
 | E-11 | Visit before the go-live cutoff (`keap_sync_start_at`) | Ignored; never tags anyone | tested - chain, unit, plan |
-| E-12 | **No-show** | Dashboard flags the lead needs attention (the booking "fell through"); Keap **keeps Booked** (the rule we agreed: no-show = no tag change) -> **they disagree** | **DECISION** - pinned by chain `test_no_show_keeps_booked...`. Options: (a) keep, (b) remove Booked on no-show like a cancel, (c) add a No-show tag. Recommend (b) |
-| E-13 | Follow-up ends with no booking (closed_no_response, declined) | AI Gave Up (186) applied first, then Pending removed | tested - chain, unit |
-| E-14 | Do Not Contact / invalid phone / transferred to a human | Left on Pending, **no tag change** until Michelle names the tags. NB: a DNC tag alone does not stop email; Keap's email-opt-out call is a separate, unbuilt step | **DECISION** - chain `test_do_not_contact_is_left_alone...` |
-| E-15 | Lead closed by staff | Same as E-14 unless status is closed_no_response/declined | DECISION |
+| E-12 | **No-show** | Dashboard flags the lead needs attention; Keap gets **STATUS: NoShow** (Keap admin, 2026-11-10), so they agree. Without the NoShow tag set: Booked kept (old rule) | tested - chain `test_a_no_show_shows_noshow...` (and the old rule `test_no_show_keeps_booked...`), unit |
+| E-13 | Follow-up ends with no booking (closed_no_response, declined) | AI Gave Up (186) applied | tested - chain, unit |
+| E-14 | Do Not Contact / wrong number (incl. "wrong person") / sent to the front desk | Lead status `do_not_contact` -> **STATUS: Abandoned Lead** (wins even over a booked visit), `invalid_phone` -> **STATUS: Bad Phone** (a booked visit wins), `transferred_human` -> **STATUS: Handed off to Human** (a booked visit wins). DNC and wrong-number people now go to Keap (created if new). Needs Review cards do not count as handed off (owner, 2026-11-11). Email opt-out: the clinic's Abandoned Lead automation stops marketing (owner, 2026-11-11); we send the tag only. An SMS STOP alone is not Do Not Contact (calls go on); it is when calls are stopped too. Each tag unset -> old rule (kept out / Pending) | tested - unit, sync, chain `test_do_not_contact_from_the_sheet...` |
+| E-15 | Lead closed by staff | Front desk will handle = `closed_no_response` -> AI Gave Up, except after a cancel / no-show (no restart since): Cancelled / NoShow stays | tested - chain `test_front_desk_closing_a_cancel...`, unit |
 | E-16 | Walk-in patient who was never a lead | Contact + Booked/Completed tags, never Pending | tested - chain, plan |
 | E-17 | Existing patients on the first full load | Included when `keap_include_existing_patients`; a load of more than 200 is spread over minutes so new leads never wait | tested - plan `test_bulk_first_load...` |
+
+| E-62 | Cancel / no-show, then staff restart the outreach | Back to Pending (New Evaluation Booked); if that cadence ends with no booking, AI Gave Up. "After" = the visit was first seen before the restart planned new steps (`outreach_events.created_at` vs the visit's `created_at` / our booking time; not `updated_at`, which moves when Stride re-sends the cancelled visit) | tested - chain `test_a_restart_after_a_cancel...` (incl. a re-sent cancel), unit |
+| E-63 | Walk-in (Stride-only) patient cancels or no-shows | Cancelled / NoShow, never Pending | tested - unit |
+| E-64 | Cancel of a later visit when an earlier one is checked in (or another visit is still booked) | Booked / Completed stay; Cancelled only when nothing is on the books | by design - unit |
+| E-65 | Contact deleted in Keap and recreated | All its tags are sent again (what we last sent was for the old contact; cleared the moment the new id is saved, so a failed attempt does not lose it) | tested - sync `test_a_contact_recreated...`, `test_a_recreated_contact_gets_its_tag_even_after...` |
+| E-66 | Several tags new in one sync (e.g. booked and checked in between two ticks) | Applied in status order: Pending, other status tags, Booked, Completed last (Keap's automation acts on the last one) | tested - sync `test_booked_and_completed_new_in_one_sync...` |
+| E-67 | An attempt that applied some tags and then failed or was re-planned | Those tags count as sent (`_note_sent`): never applied again | tested - sync `test_tags_applied_by_a_requeued...`, `test_a_failure_partway...` |
+| E-68 | Bad Phone | The lead's number is never sent to Keap (it reaches a stranger); Stride's own numbers still are; it still finds the existing contact. A number already on an existing contact is not cleared | tested - unit, sync `test_bad_phone_never_sends...` |
+| E-69 | A new tag switched on in a Keap that already holds synced people | Everyone is re-planned at once: old cancels / no-shows, old Do Not Contact and wrong-number leads get the new tag right away (fires automations) | **RISK / DECISION** before go-live: switch tags on before the first sync, or add a cut-over date |
+| E-70 | Repeat referral: the carried upcoming visit of the older lead passes | The carried booking drops out after its time, so the new lead shows Pending again (older behaviour, not from this change) | **GAP** |
+
+Tag rules (apply-only, Keap admin 2026-11-10): one status per person in this order: Do Not Contact ->
+Abandoned Lead; a booked visit -> Booked (+ Completed); wrong number -> Bad Phone; last visit fell through
+(no restart since) -> Cancelled / NoShow; follow-up ended -> AI Gave Up; sent to the front desk -> Handed off
+to Human; else New Evaluation Booked (Pending). Tags are applied only when new since the last sync of that
+contact and never removed (`keap_sync.sync_one`).
 
 ## B. Who is who (identity)
 
@@ -107,7 +123,7 @@ client / Michelle), **GAP** (known weakness, not built), **RISK** (cannot be tes
 | ID | Situation | What happens | Status / tests |
 | --- | --- | --- | --- |
 | E-56 | Sandbox ids used against production (or the reverse) | Tag/field ids differ per Keap account. The connection stores the account name, but **nothing checks the mapping belongs to the connected account** | **GAP** - a wrong id either fails ("not found") or silently tags something else |
-| E-57 | Staff change tags/fields by hand in Keap | Our owned tags are re-written only when our plan for that person changes; a manual removal of Pending is **not repaired** until then | **GAP**, pinned by chain `test_drift_made_by_hand...` - proposal: a slow nightly check that re-reads each contact (costs requests) |
+| E-57 | Staff (or Keap automations) change tags by hand in Keap | Apply-only mode (default): a tag is sent once, when it is new for the person; a tag taken off in Keap is **never** put back (that would fire its automation again). Remove mode (`keap_remove_old_tags`): re-written only when our plan changes | by design - sync `test_a_tag_staff_remove_by_hand...`; remove mode pinned by chain `test_drift_made_by_hand...` |
 | E-58 | Staff edit the Appointment Date field in Keap | Overwritten at the next change (we own it) | by design |
 | E-59 | Test leads | Excluded unless `KEAP_INCLUDE_TEST_LEADS=true` (sandbox only) | tested - plan |
 | E-60 | Personal data in logs | httpx request URLs carry the email/phone (URL-encoded, invisible to redaction); httpx logging is turned to WARNING | tested - sync `test_logs_never_contain...` |

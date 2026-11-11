@@ -50,9 +50,11 @@ def env(monkeypatch):
         "insert into practices(name,slug,timezone) values('Synthetic',%s,'America/New_York') "
         "returning id", (slug,)).fetchone()["id"]
     conn.execute(
+        # The tests below this fixture were written for the remove mode; the Keap admin's mode
+        # (apply only, 2026-11-10) is switched on per test with env.status_tags().
         "insert into practice_settings(practice_id,stride_location_timezone,keap_pending_tag_id,"
-        "keap_gave_up_tag_id,keap_sync_start_at,keap_include_existing_patients) "
-        "values(%s,'America/New_York',%s,'186',now()-interval '1 day',true)", (practice, PENDING))
+        "keap_gave_up_tag_id,keap_sync_start_at,keap_include_existing_patients,keap_remove_old_tags) "
+        "values(%s,'America/New_York',%s,'186',now()-interval '1 day',true,true)", (practice, PENDING))
     for type_id, booked, done in ((2, "180", "172"), (1, "184", "176")):
         conn.execute(
             "insert into keap_appointment_types(practice_id,stride_appointment_type_id,label,"
@@ -123,6 +125,16 @@ def env(monkeypatch):
 
         def contact(self, lead_id):
             return fake.contacts[self.row(lead_id)["keap_contact_id"]]
+
+        def status_tags(self):
+            """The Keap admin's setup (2026-11-10): her STATUS tags, we never remove a tag, and
+            applying a status tag makes Keap remove the person's other status tags."""
+            conn.execute(
+                "update practice_settings set keap_handed_off_tag_id='168',keap_abandoned_tag_id='192',"
+                "keap_bad_phone_tag_id='194',keap_cancelled_tag_id='196',keap_no_show_tag_id='198',"
+                "keap_remove_old_tags=false where practice_id=%s", (practice,))
+            status = {PENDING, "186", "168", "192", "194", "196", "198", "180", "184"}
+            fake.automations = {tag: status - {tag} for tag in status}
 
     yield Env()
 
@@ -784,3 +796,247 @@ def test_a_family_member_on_the_same_phone_keeps_a_separate_contact(env):
     env.plan()
     assert env.row(parent)["status"] != "skipped"
     assert env.row(child)["keap_contact_id"] != env.row(parent)["keap_contact_id"]
+
+
+# --- the Keap admin's mode: apply new tags only, never remove (Michelle, 2026-11-10) -------------
+
+
+def _tag_calls(env):
+    return [path for _, path in env.keap.requests if "contacts:" in path]
+
+
+def _move_visit(env, pid):
+    env.db.execute("update stride_appointments set start_utc=start_utc+interval '1 day',"
+                   "starts_at_local=starts_at_local+interval '1 day',updated_at=now() "
+                   "where practice_id=%s and patient_stride_id=%s", (env.practice_id, pid))
+
+
+def test_apply_only_mode_never_removes_a_tag(env):
+    env.status_tags()
+    lead = env.lead()
+    env.sync(lead)
+    assert env.contact(lead)["tag_ids"] == [PENDING]
+    env.contact(lead)["tag_ids"].append("999")
+    env.keap.requests.clear()
+    env.book(lead)
+    env.sync(lead)
+    assert _tag_calls(env) == ["/tags/180/contacts:applyTags"]
+    # Keap's automation took Pending off; the clinic's own tag is untouched.
+    assert set(env.contact(lead)["tag_ids"]) == {"180", "999"}
+
+
+def test_a_tag_keap_removed_is_never_put_back_by_an_unrelated_change(env):
+    # The reason for apply-only: if Keap removes Booked when Completed goes on, re-sending Booked
+    # on the next visit-time change would fire the clinic's "booked" automation again.
+    env.status_tags()
+    env.keap.automations["172"] = {"180"}
+    lead = env.lead()
+    pid = env.book(lead)
+    env.sync(lead)
+    env.db.execute("update stride_appointments set status='Checked In',updated_at=now() "
+                   "where practice_id=%s and patient_stride_id=%s", (env.practice_id, pid))
+    env.sync(lead)
+    assert env.contact(lead)["tag_ids"] == ["172"]
+    env.keap.requests.clear()
+    _move_visit(env, pid)
+    env.sync(lead)
+    assert any("PATCH" == m for m, _ in env.keap.requests)  # the new date did go out
+    assert _tag_calls(env) == [] and env.contact(lead)["tag_ids"] == ["172"]
+    assert env.row(lead)["status"] == "synced"
+
+
+def test_cancel_then_rebook_applies_cancelled_then_booked_again(env):
+    env.status_tags()
+    lead = env.lead()
+    pid = env.book(lead)
+    env.sync(lead)
+    env.db.execute("update stride_appointments set status='Cancel',updated_at=now() "
+                   "where practice_id=%s and patient_stride_id=%s", (env.practice_id, pid))
+    env.db.execute("update leads set status='needs_attention' where id=%s", (lead,))
+    env.keap.requests.clear()
+    env.sync(lead)
+    assert _tag_calls(env) == ["/tags/196/contacts:applyTags"]
+    assert env.contact(lead)["tag_ids"] == ["196"]
+    env.appt(pid, type_id=2, days=6)
+    env.db.execute("update leads set status='booked' where id=%s", (lead,))
+    env.keap.requests.clear()
+    env.sync(lead)
+    assert _tag_calls(env) == ["/tags/180/contacts:applyTags"]
+    assert env.contact(lead)["tag_ids"] == ["180"]
+
+
+def test_a_no_show_applies_noshow(env):
+    env.status_tags()
+    lead = env.lead()
+    pid = env.book(lead)
+    env.sync(lead)
+    env.db.execute("update stride_appointments set status='No Show',updated_at=now() "
+                   "where practice_id=%s and patient_stride_id=%s", (env.practice_id, pid))
+    env.db.execute("update leads set status='needs_attention' where id=%s", (lead,))
+    env.sync(lead)
+    assert env.contact(lead)["tag_ids"] == ["198"]
+
+
+@pytest.mark.parametrize("status,tag", [("do_not_contact", "192"), ("invalid_phone", "194"),
+                                        ("transferred_human", "168")])
+def test_closing_statuses_get_their_tag_new_or_already_in_keap(env, status, tag):
+    env.status_tags()
+    fresh = env.lead(status=status)
+    env.sync(fresh)
+    assert env.contact(fresh)["tag_ids"] == [tag]  # created straight away with its tag
+    known = env.lead(name="Ravi Iyer", email="ravi@example.test", phone="+15555550102")
+    env.sync(known)
+    env.db.execute("update leads set status=%s where id=%s", (status, known))
+    env.sync(known)
+    assert env.contact(known)["tag_ids"] == [tag]
+
+
+def test_apply_only_mode_syncs_twice_without_writes(env):
+    env.status_tags()
+    lead = env.lead()
+    env.book(lead)
+    env.sync(lead)
+    writes = len(env.keap.writes())
+    assert env.sync(lead) == "synced"
+    assert len(env.keap.writes()) == writes
+
+
+def test_a_contact_recreated_in_keap_gets_its_tag_again(env):
+    # What we last sent was for the old contact: the new one starts empty.
+    env.status_tags()
+    lead = env.lead()
+    pid = env.book(lead)
+    env.sync(lead)
+    old = env.row(lead)["keap_contact_id"]
+    del env.keap.contacts[old]
+    _move_visit(env, pid)
+    env.sync(lead)
+    assert env.row(lead)["keap_contact_id"] != old
+    assert env.contact(lead)["tag_ids"] == ["180"]
+
+
+def test_a_tag_staff_remove_by_hand_is_not_re_applied(env):
+    # Keap is the clinic's to change; we only say what is new (E-57, now by design).
+    env.status_tags()
+    lead = env.lead()
+    pid = env.book(lead)
+    env.sync(lead)
+    env.contact(lead)["tag_ids"].remove("180")
+    _move_visit(env, pid)
+    env.sync(lead)
+    assert env.contact(lead)["tag_ids"] == []
+
+
+def test_switching_to_apply_only_sends_only_what_is_new(env):
+    # The demo moves from the remove mode with the person already synced.
+    lead = env.lead()
+    pid = env.book(lead)
+    env.sync(lead)
+    env.status_tags()
+    env.keap.requests.clear()
+    env.db.execute("update stride_appointments set status='Cancel',updated_at=now() "
+                   "where practice_id=%s and patient_stride_id=%s", (env.practice_id, pid))
+    env.db.execute("update leads set status='needs_attention' where id=%s", (lead,))
+    env.sync(lead)
+    assert _tag_calls(env) == ["/tags/196/contacts:applyTags"]
+
+
+def _check_in(env, pid):
+    env.db.execute("update stride_appointments set status='Checked In',updated_at=now() "
+                   "where practice_id=%s and patient_stride_id=%s", (env.practice_id, pid))
+
+
+def test_booked_and_completed_new_in_one_sync_go_on_booked_first(env):
+    # Keap acts on the tag applied last: Completed after Booked, so its automation takes Booked off.
+    env.status_tags()
+    env.keap.automations["172"] = {"180"}
+    lead = env.lead()
+    env.sync(lead)
+    pid = env.book(lead)
+    _check_in(env, pid)
+    env.keap.requests.clear()
+    env.sync(lead)
+    assert _tag_calls(env) == ["/tags/180/contacts:applyTags", "/tags/172/contacts:applyTags"]
+    assert env.contact(lead)["tag_ids"] == ["172"]
+
+
+def test_tags_applied_by_a_requeued_attempt_are_never_applied_again(env, monkeypatch):
+    env.status_tags()
+    env.keap.automations["172"] = {"180"}
+    lead = env.lead()
+    env.sync(lead)
+    pid = env.book(lead)
+    _check_in(env, pid)
+    client = env.client()
+    original = client.apply_tag
+
+    def apply_then_replan(trace, tag_id, contact_id):
+        original(trace, tag_id, contact_id)
+        if tag_id == "172":  # the plan changes while we send (e.g. a new visit time)
+            env.db.execute("update keap_sync set desired_hash='changed',status='syncing' "
+                           "where lead_id=%s", (lead,))
+
+    monkeypatch.setattr(client, "apply_tag", apply_then_replan)
+    assert env.sync(lead, client) == "requeued"
+    env.keap.requests.clear()
+    _move_visit(env, pid)
+    assert env.sync(lead) == "synced"
+    assert _tag_calls(env) == [] and env.contact(lead)["tag_ids"] == ["172"]
+
+
+def test_a_recreated_contact_gets_its_tag_even_after_a_failed_attempt(env, monkeypatch):
+    env.status_tags()
+    lead = env.lead()
+    pid = env.book(lead)
+    env.sync(lead)
+    old = env.row(lead)["keap_contact_id"]
+    del env.keap.contacts[old]
+    _move_visit(env, pid)
+    client = env.client()
+
+    def fail(*_a, **_k):
+        raise RuntimeError("tag call lost")
+
+    monkeypatch.setattr(client, "apply_tag", fail)
+    assert env.sync(lead, client) == "retrying"
+    new = env.row(lead)["keap_contact_id"]
+    assert new and new != old and env.keap.contacts[new]["tag_ids"] == []
+    env.db.execute("update keap_sync set status='pending' where lead_id=%s", (lead,))
+    env.sync(lead, plan=False)
+    assert env.contact(lead)["tag_ids"] == ["180"]
+
+
+def test_a_failure_partway_keeps_the_tags_already_applied_as_sent(env, monkeypatch):
+    env.status_tags()
+    env.keap.automations["172"] = {"180"}
+    lead = env.lead()
+    env.sync(lead)
+    pid = env.book(lead)
+    _check_in(env, pid)
+    client = env.client()
+    original = client.apply_tag
+
+    def apply_then_fail(trace, tag_id, contact_id):
+        original(trace, tag_id, contact_id)
+        if tag_id == "172":
+            raise RuntimeError("answer lost after Keap applied it")
+
+    monkeypatch.setattr(client, "apply_tag", apply_then_fail)
+    assert env.sync(lead, client) == "retrying"
+    env.db.execute("update keap_sync set status='pending' where lead_id=%s", (lead,))
+    env.keap.requests.clear()
+    env.sync(lead, plan=False)
+    assert _tag_calls(env) == [] and env.contact(lead)["tag_ids"] == ["172"]
+
+
+def test_bad_phone_never_sends_the_wrong_number_to_keap(env):
+    env.status_tags()
+    fresh = env.lead(status="invalid_phone")  # email only reaches Keap
+    env.sync(fresh)
+    assert env.contact(fresh)["tag_ids"] == ["194"]
+    assert not env.contact(fresh).get("phone_numbers")
+    known = env.lead(name="Ravi Iyer", email=None, phone="+15555550102")
+    env.sync(known)
+    env.db.execute("update leads set status='invalid_phone' where id=%s", (known,))
+    env.sync(known)  # phone-only person already in Keap: still found and tagged
+    assert env.contact(known)["tag_ids"] == ["194"]

@@ -109,7 +109,9 @@ def chain(request, monkeypatch, tmp_path):
         "update practice_settings set stride_location_timezone='America/Los_Angeles',"
         "keap_pending_tag_id=%s,keap_gave_up_tag_id=%s,keap_sync_start_at=now()-interval '1 day',"
         "keap_include_existing_patients=true,keap_remove_pending_when_booked=true,"
-        "keap_remove_booked_on_cancel=true where practice_id=%s", (PENDING, GAVE_UP, practice))
+        "keap_remove_booked_on_cancel=true,keap_remove_old_tags=true,keap_handed_off_tag_id=null,"
+        "keap_abandoned_tag_id=null,keap_bad_phone_tag_id=null,keap_cancelled_tag_id=null,"
+        "keap_no_show_tag_id=null where practice_id=%s", (PENDING, GAVE_UP, practice))
     for type_id, booked, done in ((2, IE_BOOKED, IE_DONE), (1, FU_BOOKED, FU_DONE), (3, "174", "156")):
         db.execute(
             "insert into keap_appointment_types(practice_id,stride_appointment_type_id,label,"
@@ -318,12 +320,17 @@ def chain(request, monkeypatch, tmp_path):
     db.execute(
         "update practice_settings set stride_location_timezone=%s,keap_pending_tag_id=%s,"
         "keap_gave_up_tag_id=%s,keap_sync_start_at=%s,keap_include_existing_patients=%s,"
-        "keap_remove_pending_when_booked=%s,keap_remove_booked_on_cancel=%s where practice_id=%s",
+        "keap_remove_pending_when_booked=%s,keap_remove_booked_on_cancel=%s,keap_remove_old_tags=%s,"
+        "keap_handed_off_tag_id=%s,keap_abandoned_tag_id=%s,keap_bad_phone_tag_id=%s,"
+        "keap_cancelled_tag_id=%s,keap_no_show_tag_id=%s where practice_id=%s",
         (saved_settings["stride_location_timezone"], saved_settings["keap_pending_tag_id"],
          saved_settings["keap_gave_up_tag_id"], saved_settings["keap_sync_start_at"],
          saved_settings["keap_include_existing_patients"],
          saved_settings["keap_remove_pending_when_booked"],
-         saved_settings["keap_remove_booked_on_cancel"], practice))
+         saved_settings["keap_remove_booked_on_cancel"], saved_settings["keap_remove_old_tags"],
+         saved_settings["keap_handed_off_tag_id"], saved_settings["keap_abandoned_tag_id"],
+         saved_settings["keap_bad_phone_tag_id"], saved_settings["keap_cancelled_tag_id"],
+         saved_settings["keap_no_show_tag_id"], practice))
     db.execute("delete from service_heartbeats where service in ('keap-worker','stride-worker')")
     db.close()
     get_pool.cache_clear()
@@ -858,3 +865,176 @@ def test_the_clinics_own_tags_and_fields_survive_every_step(fake_only):
     assert "999" in contact["tag_ids"]
     assert {f["id"]: f["content"] for f in contact["custom_fields"]}["4"] == "keep me"
     assert chain.row_of(lead)["keap_contact_id"] == cid
+
+
+# --- the Keap admin's STATUS tags, apply only (Michelle, 2026-11-10) ------------------------------
+# Fake only: the sandbox has none of the clinic's automations, so nothing would take old tags off.
+
+HANDED_OFF, ABANDONED, BAD_PHONE, CANCELLED, NO_SHOW = "168", "192", "194", "196", "198"
+STATUS = {PENDING, GAVE_UP, HANDED_OFF, ABANDONED, BAD_PHONE, CANCELLED, NO_SHOW} | BOOKED_TAGS
+
+
+@pytest.fixture
+def michelle(fake_only):
+    chain = fake_only
+    chain.db.execute(
+        "update practice_settings set keap_handed_off_tag_id=%s,keap_abandoned_tag_id=%s,"
+        "keap_bad_phone_tag_id=%s,keap_cancelled_tag_id=%s,keap_no_show_tag_id=%s,"
+        "keap_remove_old_tags=false where practice_id=%s",
+        (HANDED_OFF, ABANDONED, BAD_PHONE, CANCELLED, NO_SHOW, chain.practice))
+    # Her automations: a status tag takes the other status tags off; Completed takes Booked off.
+    chain.fake.automations = {tag: STATUS - {tag} for tag in STATUS}
+    chain.fake.automations[IE_DONE] = {IE_BOOKED}
+    chain.fake.automations[FU_DONE] = {FU_BOOKED}
+
+    def agree(lead_id):
+        """Keap's one status tag says what the dashboard says."""
+        lead = chain.dashboard(lead_id)
+        have = chain.tags(chain.contact(lead_id)) & STATUS
+        assert len(have) <= 1, f"two status tags at once: {have}"
+        if lead["status"] == "booked":
+            assert have <= BOOKED_TAGS, f"dashboard booked, Keap {have}"
+        if lead["status"] in {"new", "in_progress", "callback_scheduled"}:
+            assert have == {PENDING}, f"dashboard {lead['status']}, Keap {have}"
+
+    chain.agree_status = agree
+    return chain
+
+
+def _removes(chain):
+    return [path for _, path in chain.fake.requests if path.endswith(":removeTags")]
+
+
+def _review(chain, lead_id, choice):
+    response = chain.http.post(f"/api/v1/dashboard/review/{lead_id}/resolve", json={"choice": choice},
+                               headers={"X-Dashboard-Token": TOKEN, "X-Dashboard-User-ID": "chain-test",
+                                        "X-Dashboard-User-Name": "Chain",
+                                        "X-Dashboard-User-Role": "super_admin"})
+    assert response.status_code == 200, response.text
+
+
+def test_status_journey_pending_booked_completed_and_nothing_is_ever_removed(michelle):
+    chain = michelle
+    name = f"Chain{chain.run}"
+    lead = chain.sheet_lead("Journey", name, email=f"journey.{chain.run}@example.test")
+    chain.keap_tick()
+    assert chain.tags(chain.contact(lead)) == {PENDING}
+    chain.agree_status(lead)
+    pid = chain.stride_patient("Journey", name)
+    aid = chain.stride_appt(pid, 3)
+    chain.stride_tick(); chain.keap_tick()
+    assert chain.tags(chain.contact(lead)) == {IE_BOOKED}
+    chain.agree_status(lead)
+    chain.stride_appt(pid, 3, aid=aid, status="Checked In")
+    chain.stride_tick(); chain.keap_tick()
+    assert chain.tags(chain.contact(lead)) == {IE_DONE}  # Keap took Booked off
+    # A visit time change later: the date goes out, Booked is NOT put back.
+    chain.fake.requests.clear()
+    chain.stride_appt(pid, 3, aid=aid, status="Checked In", start="2:00 PM", end="3:00 PM")
+    chain.stride_tick(); chain.keap_tick()
+    assert chain.tags(chain.contact(lead)) == {IE_DONE}
+    assert not [p for _, p in chain.fake.requests if p.endswith(":applyTags")]
+    assert _removes(chain) == []
+
+
+@pytest.mark.parametrize("how", ["Cancel", "Late Cancel", "delete"])
+def test_a_stride_cancel_shows_cancelled_and_a_rebook_shows_booked(michelle, how):
+    chain = michelle
+    name = f"Chain{chain.run}"
+    lead = chain.sheet_lead("Cancel", name, email=f"cancel.{chain.run}@example.test")
+    pid = chain.stride_patient("Cancel", name)
+    aid = chain.stride_appt(pid, 4)
+    chain.stride_tick(); chain.keap_tick()
+    if how == "delete":
+        chain.stride_appt(pid, 4, aid=aid, action="Delete")
+    else:
+        chain.stride_appt(pid, 4, aid=aid, status=how)
+    chain.stride_tick(); chain.keap_tick()
+    assert chain.dashboard(lead)["status"] == "needs_attention"
+    contact = chain.contact(lead)
+    assert chain.tags(contact) == {CANCELLED}
+    assert not chain.field(contact, "6") and not chain.field(contact, "8")
+    chain.stride_appt(pid, 9, type_id=1)
+    chain.stride_tick(); chain.keap_tick()
+    assert chain.dashboard(lead)["status"] == "booked"
+    assert chain.tags(chain.contact(lead)) == {FU_BOOKED}
+    chain.agree_status(lead)
+    assert _removes(chain) == []
+
+
+def test_a_no_show_shows_noshow_so_keap_and_the_dashboard_agree(michelle):
+    # E-12 fixed: Keap no longer says Booked while the dashboard says needs attention.
+    chain = michelle
+    name = f"Chain{chain.run}"
+    lead = chain.sheet_lead("Missed", name, email=f"missed.{chain.run}@example.test")
+    pid = chain.stride_patient("Missed", name)
+    aid = chain.stride_appt(pid, 2)
+    chain.stride_tick(); chain.keap_tick()
+    chain.stride_appt(pid, 2, aid=aid, status="No Show")
+    chain.stride_tick(); chain.keap_tick()
+    assert chain.dashboard(lead)["status"] == "needs_attention"
+    assert chain.tags(chain.contact(lead)) == {NO_SHOW}
+
+
+def test_a_restart_after_a_cancel_goes_back_to_pending(michelle):
+    chain = michelle
+    name = f"Chain{chain.run}"
+    lead = chain.sheet_lead("Again", name, email=f"again.{chain.run}@example.test")
+    pid = chain.stride_patient("Again", name)
+    aid = chain.stride_appt(pid, 4)
+    chain.stride_tick(); chain.keap_tick()
+    chain.stride_appt(pid, 4, aid=aid, status="Cancel")
+    chain.stride_tick(); chain.keap_tick()
+    assert chain.tags(chain.contact(lead)) == {CANCELLED}
+    _review(chain, lead, "restart_cadence")
+    chain.keap_tick()
+    assert chain.dashboard(lead)["status"] in {"new", "in_progress"}
+    assert chain.tags(chain.contact(lead)) == {PENDING}
+    chain.agree_status(lead)
+    # Stride re-sends the cancelled visit with a later edit: the restart still stands.
+    chain.fake.requests.clear()
+    chain.stride_appt(pid, 4, aid=aid, status="Cancel", clinician="Other Clinician")
+    chain.stride_tick(); chain.keap_tick()
+    assert chain.tags(chain.contact(lead)) == {PENDING}
+    assert not [p for _, p in chain.fake.requests if p.endswith(":applyTags")]
+
+
+def test_front_desk_closing_a_cancel_keeps_cancelled(michelle):
+    chain = michelle
+    name = f"Chain{chain.run}"
+    lead = chain.sheet_lead("Desk", name, email=f"desk.{chain.run}@example.test")
+    pid = chain.stride_patient("Desk", name)
+    aid = chain.stride_appt(pid, 4)
+    chain.stride_tick(); chain.keap_tick()
+    chain.stride_appt(pid, 4, aid=aid, status="Cancel")
+    chain.stride_tick(); chain.keap_tick()
+    chain.fake.requests.clear()
+    _review(chain, lead, "front_desk")
+    chain.keap_tick()
+    assert chain.dashboard(lead)["status"] == "closed_no_response"
+    assert chain.tags(chain.contact(lead)) == {CANCELLED}  # not AI Gave Up
+    assert not [p for _, p in chain.fake.requests if "contacts:" in p]
+
+
+def test_do_not_contact_from_the_sheet_shows_abandoned_lead(michelle):
+    chain = michelle
+    lead = chain.sheet_lead("Stop", f"Chain{chain.run}", email=f"stop.{chain.run}@example.test")
+    chain.keap_tick()
+    response = chain.sheet("do_not_contact", lead_id=lead, **chain.lead_data(lead))
+    assert response.status_code in (200, 201), response.text
+    chain.keap_tick()
+    assert chain.dashboard(lead)["status"] == "do_not_contact"
+    assert chain.tags(chain.contact(lead)) == {ABANDONED}
+
+
+def test_a_finished_cadence_still_shows_ai_gave_up(michelle):
+    chain = michelle
+    lead = chain.sheet_lead("Done", f"Chain{chain.run}", email=f"done.{chain.run}@example.test")
+    chain.keap_tick()
+    chain.db.execute("update leads set status='closed_no_response',cadence_state='completed' "
+                     "where id=%s", (lead,))
+    chain.keap_tick()
+    assert chain.tags(chain.contact(lead)) == {GAVE_UP}
+    writes = chain.writes()
+    chain.keap_tick()
+    assert chain.writes() == writes  # idle: nothing more goes out

@@ -2956,3 +2956,29 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
   drops the code (`readPhone`); before, the first 10 digits were kept (91 kept, last two digits lost).
 - Copy: the call comes first and the Day 0 text only after it (the worker holds a text while a call is in flight),
   so the page says "We'll call you within a minute … and text you if we miss you".
+
+
+### 2026-11-11 — Keap: the clinic's STATUS tags, apply only (Keap admin's reply of 2026-11-10; demo)
+
+- Migration 056: `practice_settings.keap_handed_off_tag_id`, `keap_abandoned_tag_id`, `keap_bad_phone_tag_id`,
+  `keap_cancelled_tag_id`, `keap_no_show_tag_id`, `keap_remove_old_tags` (default false). A null tag keeps the old rule.
+- `keap_desired.compute_desired`: one status per person: Do Not Contact -> Abandoned Lead (also with a visit booked);
+  booked -> Booked (+ Completed); `invalid_phone` (incl. wrong person) -> Bad Phone; last visit cancelled / deleted /
+  no-show and nothing booked -> Cancelled / NoShow, unless outreach was restarted after it (latest
+  `outreach_events.created_at` later than the visit's `updated_at`) -> Pending again; ended -> AI Gave Up;
+  `transferred_human` -> Handed off to Human (not Needs Review cards, owner 2026-11-11); else Pending ("STATUS: New
+  Evaluation Booked", confirmed by the Keap admin). DNC and wrong-number people are no longer kept out of Keap once
+  their tag is set. A no-show no longer counts as a live booking once the NoShow tag is set (fixes E-12).
+- `keap_sync.sync_one`: with `remove_old_tags` false (doc v2) we never remove a tag; we apply only tags not in what we
+  last sent to this contact (`keap_sync.synced.tags`) and not already on it. Keap's automations remove the old status
+  tag; a tag they (or staff) took off is never re-applied by an unrelated change (re-applying fires the automation
+  again). A recreated contact gets all its tags again. `keap_remove_old_tags=true` = the old behaviour.
+- Sandbox (puq284): created STATUS: Abandoned Lead 192, Bad Phone 194, Cancelled 196, NoShow 198 (Funnels);
+  existing New Evaluation Booked 180, Handed off to Human 168. `supabase/dev/keap_sandbox_mapping.sql` updated.
+- Tests: unit (`test_keap_desired.py`), sync (`test_keap_sync_integration.py`, `env.status_tags()`), chain
+  (`test_keap_chain_integration.py`, `michelle` fixture); `fake_keap.FakeKeap.automations` mimics the clinic's
+  automations. Old tests run with `keap_remove_old_tags=true`. Edge cases E-05..E-15, E-57, E-62..E-70.
+- After an independent review: a cancel counts against a restart by the visit's first-seen time (Stride re-sends a
+  cancelled visit on later edits); tags go on in `tag_order` (Pending, status, Booked, Completed last); a new
+  contact id clears `synced`; tags applied by a failed or re-planned attempt are noted as sent (`_note_sent`); Bad
+  Phone never sends the lead's number. Open: E-69 (switching a tag on later re-tags old history), E-70.

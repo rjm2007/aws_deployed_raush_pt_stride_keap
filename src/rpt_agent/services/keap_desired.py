@@ -23,17 +23,22 @@ import psycopg
 
 from ..config import get_settings
 from .review import REPLACED_REASONS
-from .stride_import import CANCELLED_STATUSES
+from .stride_import import CANCELLED_STATUSES, NO_SHOW_STATUSES
 
-DOC_VERSION = 1
+# 2: remove_old_tags (Keap admin, 2026-11-10: Keap removes the old status tag itself).
+DOC_VERSION = 2
 CHECKED_IN_STATUSES = {"checked in", "c"}
-# Lead statuses that mean "our follow-up ended without a booking". Do Not Contact,
-# invalid phone and transferred-to-human are deliberately NOT here: the client has
-# not chosen their Keap tags yet, so those people are left unchanged.
+# Lead statuses that mean "our follow-up ended without a booking".
 ENDED_LEAD_STATUSES = {"closed_no_response", "declined"}
-# People who asked us to stop, or whose number is wrong, never go to Keap: a Pending tag there can
-# start marketing emails or texts. Already in Keap -> left exactly as it is (spec 0.4 / R4).
+# People who asked us to stop, or whose number is wrong, never go to Keap while their tag
+# (keap_abandoned_tag_id / keap_bad_phone_tag_id) is not set: a Pending tag there can start
+# marketing emails or texts. Already in Keap -> left exactly as it is (spec 0.4 / R4). With the
+# tag set they go to Keap with that tag only (Keap admin, 2026-11-10).
 KEEP_OUT_LEAD_STATUSES = {"do_not_contact", "invalid_phone"}
+# Sent to the front desk on a call (the transfer statuses end as transferred_human; owner,
+# 2026-11-11: Needs Review cards do not count, they often go back to the cadence).
+HANDED_OFF_LEAD_STATUSES = {"transferred_human"}
+_KEEP_OUT_TAG = {"do_not_contact": "keap_abandoned_tag_id", "invalid_phone": "keap_bad_phone_tag_id"}
 # A repeat patient comes back as a new lead on the same number; the newest lead owns the
 # person's Keap contact (keap_sync.claim_contact hands it over).
 REPLACED_SKIP = "replaced by a newer referral: the newer lead owns the Keap contact"
@@ -70,7 +75,9 @@ def load_settings(conn, practice_id: int) -> dict[str, Any]:
     row = conn.execute(
         "select keap_pending_tag_id,keap_gave_up_tag_id,keap_contact_type,keap_sync_start_at,"
         "keap_include_existing_patients,keap_include_existing_leads,keap_remove_pending_when_booked,"
-        "keap_remove_booked_on_cancel,stride_location_timezone from practice_settings "
+        "keap_remove_booked_on_cancel,keap_handed_off_tag_id,keap_abandoned_tag_id,"
+        "keap_bad_phone_tag_id,keap_cancelled_tag_id,keap_no_show_tag_id,keap_remove_old_tags,"
+        "stride_location_timezone from practice_settings "
         "where practice_id=%s",
         (practice_id,),
     ).fetchone()
@@ -180,7 +187,8 @@ def compute_desired(
         patient = None
     if lead is None and patient is None:
         return Built(skip_reason="no lead or patient left")
-    if lead is not None and lead.get("status") in KEEP_OUT_LEAD_STATUSES:
+    if lead is not None and lead.get("status") in KEEP_OUT_LEAD_STATUSES and not settings.get(
+            _KEEP_OUT_TAG[lead["status"]]):
         return Built(freeze=True) if synced_before else Built(
             skip_reason="do not contact / wrong number: kept out of Keap")
     if lead is not None and lead.get("superseded"):
@@ -197,13 +205,18 @@ def compute_desired(
     email = _first_valid_email(
         p.get("preferred_email"), p.get("personal_email"), p.get("work_email"), lead.get("email")
     )
+    # Bad Phone: the lead's number reaches someone else (wrong number / wrong person), so it never
+    # goes to Keap, where a text campaign would reach that stranger (review, 2026-11-11). It still
+    # finds the contact we made before; Stride's own numbers may be right.
+    bad_number = lead.get("status") == "invalid_phone"
     phone = _first_phone(
-        lead.get("phone_e164"), p.get("preferred_phone"), p.get("mobile_phone"),
-        p.get("home_phone"), p.get("work_phone"),
+        None if bad_number else lead.get("phone_e164"), p.get("preferred_phone"),
+        p.get("mobile_phone"), p.get("home_phone"), p.get("work_phone"),
     )
+    match_phone = phone or (_first_phone(lead.get("phone_e164")) if bad_number else None)
     birth = p.get("date_of_birth") or lead.get("date_of_birth")
     address = None if (email or phone) else _address(patient)
-    if not (email or phone or address):
+    if not (email or phone or address) and not (bad_number and synced_before and match_phone):
         return Built(skip_reason="no contact details")
 
     contact = {
@@ -217,8 +230,8 @@ def compute_desired(
     }
     match = {
         "email": email,
-        "phone": phone,
-        "phone_digits": _digits(phone) or None,
+        "phone": match_phone,
+        "phone_digits": _digits(match_phone) or None,
         "given_name": given,
         "family_name": family,
     }
@@ -226,6 +239,8 @@ def compute_desired(
     # --- appointments that count ---
     by_type = {int(m["stride_appointment_type_id"]): m for m in mapping}
     remove_booked_on_cancel = settings.get("keap_remove_booked_on_cancel", True)
+    cancelled_tag = settings.get("keap_cancelled_tag_id")
+    no_show_tag = settings.get("keap_no_show_tag_id")
     live: list[dict[str, Any]] = []
     cancelled_pool: list[dict[str, Any]] = []
     for a in appointments:
@@ -234,49 +249,91 @@ def compute_desired(
         if (a.get("booked_at") or a["start_utc"]) < start_at:
             continue  # history before go-live never tags anyone (our bookings: when made)
         status = (a.get("status") or "").strip().lower()
-        if a.get("deleted_at") is None and status not in CANCELLED_STATUSES:
+        # A no-show is a booking that fell through once it has its own tag (E-12: Keap said
+        # Booked while the dashboard said needs attention); without the tag it stays Booked.
+        no_show = bool(no_show_tag) and status in NO_SHOW_STATUSES
+        if a.get("deleted_at") is None and status not in CANCELLED_STATUSES and not no_show:
             live.append(a)
         else:
             cancelled_pool.append(a)
     tag_pool = live if remove_booked_on_cancel else live + cancelled_pool
 
+    # Cancelled / NoShow: the person's last booking fell through and nothing is booked now. Once
+    # our outreach starts again after it (a restart plans new steps), the lead is back to Pending
+    # (owner, 2026-11-11). "After" = the visit was first seen before the new steps were planned: a
+    # restart is refused while a lead is booked, so it can only follow the fall-through. Not the
+    # visit's updated_at: Stride re-sends a cancelled visit on any later edit (review, 2026-11-11).
+    missed_tag = None
+    if cancelled_pool and not live and lead.get("status") != "booked":
+        last = max(cancelled_pool, key=lambda a: (a.get("updated_at") or a["start_utc"], a["start_utc"]))
+        restarted = lead.get("outreach_planned_at")
+        seen = last.get("first_seen_at") or last.get("booked_at") or last["start_utc"]
+        if not (restarted and restarted > seen):
+            kind = (last.get("status") or "").strip().lower()
+            missed_tag = (no_show_tag if last.get("deleted_at") is None and kind in NO_SHOW_STATUSES
+                          else cancelled_tag)
+
     # --- tags ---
     pending_tag = settings.get("keap_pending_tag_id")
     gave_up_tag = settings.get("keap_gave_up_tag_id")
+    abandoned_tag = settings.get("keap_abandoned_tag_id")
+    bad_phone_tag = settings.get("keap_bad_phone_tag_id")
+    handed_off_tag = settings.get("keap_handed_off_tag_id")
     # The Sheet's gender wins; without it, Stride's. "Other" gets the male tag for now (owner,
     # 2026-10-20, until Emma decides).
     sex = (lead.get("gender") or p.get("gender") or "").strip().lower()
     is_male = sex in {"m", "male", "o", "other"}
     tags: set[str] = set()
-    for a in tag_pool:
-        m = by_type[a["appointment_type_id"]]
-        tags.add(str((is_male and m.get("male_booked_tag_id")) or m["booked_tag_id"]))
-    for a in live:
-        completed = by_type[a["appointment_type_id"]].get("completed_tag_id")
-        if completed and (a.get("status") or "").strip().lower() in CHECKED_IN_STATUSES:
-            tags.add(str(completed))
-    if lead:
-        status = lead.get("status")
+    status = lead.get("status")
+    if status == "do_not_contact":
+        # Only reached with the tag set. They asked us to stop: the one tag whose automation stops
+        # all marketing, even with a visit booked.
+        tags.add(str(abandoned_tag))
+    else:
+        for a in tag_pool:
+            m = by_type[a["appointment_type_id"]]
+            tags.add(str((is_male and m.get("male_booked_tag_id")) or m["booked_tag_id"]))
+        for a in live:
+            completed = by_type[a["appointment_type_id"]].get("completed_tag_id")
+            if completed and (a.get("status") or "").strip().lower() in CHECKED_IN_STATUSES:
+                tags.add(str(completed))
+    if lead and status != "do_not_contact":
         # A lead closed because another lead took its number did not give up: the patient is
         # still being worked on that number (tester 2026-10-26: a restart put "gave up" on the
         # contact while the restarted lead was being called). It keeps Pending, as before.
         replaced = lead.get("status_reason") in REPLACED_REASONS
-        ended = status in ENDED_LEAD_STATUSES and gave_up_tag and not live and not replaced
-        if ended:
-            tags.add(str(gave_up_tag))
-        elif pending_tag:
-            if settings.get("keap_remove_pending_when_booked", True):
-                if status != "booked" and not live:
-                    tags.add(str(pending_tag))
-            else:
+        if live or status == "booked":
+            if pending_tag and not settings.get("keap_remove_pending_when_booked", True):
                 tags.add(str(pending_tag))
-    owned_tags = {str(t) for t in (pending_tag, gave_up_tag) if t}
+        elif status == "invalid_phone":  # only reached with the Bad Phone tag set
+            tags.add(str(bad_phone_tag))
+        elif missed_tag:
+            tags.add(str(missed_tag))
+        elif status in ENDED_LEAD_STATUSES and gave_up_tag and not replaced:
+            tags.add(str(gave_up_tag))
+        elif status in HANDED_OFF_LEAD_STATUSES and handed_off_tag:
+            tags.add(str(handed_off_tag))
+        elif pending_tag:
+            tags.add(str(pending_tag))
+    elif not lead and missed_tag:  # a Stride-only patient: no outreach, so never Pending
+        tags.add(str(missed_tag))
+    owned_tags = {
+        str(t) for t in (pending_tag, gave_up_tag, abandoned_tag, bad_phone_tag, handed_off_tag,
+                         cancelled_tag, no_show_tag) if t
+    }
     for m in mapping:
         owned_tags.add(str(m["booked_tag_id"]))
         if m.get("male_booked_tag_id"):
             owned_tags.add(str(m["male_booked_tag_id"]))
         if m.get("completed_tag_id"):
             owned_tags.add(str(m["completed_tag_id"]))
+    # Apply order when several tags are new at once: Keap's automations act on the tag applied last,
+    # so Pending first, then the other status tags, Booked, and Completed last (a Completed applied
+    # before Booked would leave Booked on and fire its automation; review, 2026-11-11).
+    completed_tags = {str(m["completed_tag_id"]) for m in mapping if m.get("completed_tag_id")}
+    booked_tags = {str(t) for m in mapping for t in (m["booked_tag_id"], m.get("male_booked_tag_id")) if t}
+    rank = {str(pending_tag): 0, **{t: 2 for t in booked_tags}, **{t: 3 for t in completed_tags}}
+    tag_order = sorted(tags, key=lambda t: (rank.get(t, 1), t))
 
     # --- one shared date/time/clinician set: next upcoming, else latest past ---
     tz = settings.get("stride_location_timezone") or "America/Los_Angeles"
@@ -309,6 +366,8 @@ def compute_desired(
         "match": match,
         "tags": sorted(tags),
         "owned_tags": sorted(owned_tags),
+        "remove_old_tags": bool(settings.get("keap_remove_old_tags")),
+        "tag_order": tag_order,
         "fields": fields,
         "owned_fields": sorted(fields),
         "sources": {
@@ -445,7 +504,8 @@ def _load_context(conn, practice_id, rows, settings, mapping):
         r["id"]: dict(r)
         for r in conn.execute(
             "select id,full_name,first_name,last_name,email,phone_e164,date_of_birth,gender,status,"
-            "status_reason,is_test,exists(select 1 from leads n where n.practice_id=l.practice_id "
+            "status_reason,is_test,(select max(e.created_at) from outreach_events e where e.lead_id=l.id) "
+            "as outreach_planned_at,exists(select 1 from leads n where n.practice_id=l.practice_id "
             " and n.phone_e164=l.phone_e164 and n.id<>l.id and n.created_at>l.created_at "
             " and " + _SAME_FIRST_NAME + ") as superseded from leads l where id=any(%s)",
             (lead_ids,),
@@ -466,7 +526,8 @@ def _load_context(conn, practice_id, rows, settings, mapping):
     if patient_ids and type_ids:
         for r in conn.execute(
             "select stride_id,patient_stride_id,appointment_type_id,status,start_utc,starts_at_local,"
-            "clinician_id,clinician_name,deleted_at from stride_appointments "
+            "clinician_id,clinician_name,deleted_at,updated_at,created_at as first_seen_at "
+            "from stride_appointments "
             "where practice_id=%s and patient_stride_id=any(%s) and appointment_type_id=any(%s) "
             "and start_utc>=%s",
             (practice_id, patient_ids, type_ids, settings["keap_sync_start_at"]),
@@ -479,7 +540,8 @@ def _load_context(conn, practice_id, rows, settings, mapping):
     if lead_ids and type_ids:
         for r in conn.execute(
             "select a.lead_id,a.stride_appointment_id,ct.stride_appointment_type_id as appointment_type_id,"
-            "a.state,a.start_utc,a.created_at as booked_at,a.clinician_id,c.display_name as clinician_name "
+            "a.state,a.start_utc,a.created_at as booked_at,a.updated_at,a.clinician_id,"
+            "c.display_name as clinician_name "
             "from appointments a join case_types ct on ct.id=a.case_type_id "
             "left join clinicians c on c.practice_id=a.practice_id and c.stride_user_id=a.clinician_id "
             "where a.practice_id=%s and a.lead_id=any(%s) and a.start_utc is not null "
