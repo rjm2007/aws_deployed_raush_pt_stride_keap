@@ -185,8 +185,12 @@ def stride_patient(conn, practice_id: int, stride_id: int) -> dict | None:
     ).fetchone()
     if not row:
         return None
+    # timezone: the clinic's own on Stride's location id, else the practice's, as on the calendar.
     visits = conn.execute(
-        "select sa.stride_id,sa.start_utc,sa.appointment_type,sa.status,sa.clinician_name,sa.location_name "
+        "select sa.stride_id,sa.start_utc,sa.appointment_type,sa.status,sa.clinician_name,sa.location_name,"
+        "coalesce((select bl.timezone from booking_locations bl where bl.practice_id=sa.practice_id "
+        "and bl.stride_location_id=sa.location_id order by bl.is_active desc,bl.id limit 1),"
+        "(select p.timezone from practices p where p.id=sa.practice_id)) as timezone "
         "from stride_appointments sa where sa.practice_id=%s and sa.patient_stride_id=%s "
         "and sa.deleted_at is null order by sa.start_utc desc nulls last limit 200",
         (practice_id, stride_id),
@@ -203,7 +207,7 @@ def stride_patient(conn, practice_id: int, stride_id: int) -> dict | None:
         "visits": [{
             "id": v["stride_id"], "start_utc": v["start_utc"], "type": v["appointment_type"],
             "status": stride_status(v["status"]), "clinician": v["clinician_name"],
-            "location": v["location_name"],
+            "location": v["location_name"], "timezone": v.get("timezone"),
         } for v in visits],
     }
 

@@ -138,6 +138,7 @@ def test_list_mixes_sheet_leads_and_unlinked_stride_patients(env):  # noqa: F811
     view = dashboard.dashboard_stride_patient(102, actor)
     assert view["patient"]["clinic"] == "Rausch PT - Dana Point" and view["patient"]["date_of_birth"]
     assert [v["id"] for v in view["visits"]] == [9002] and view["visits"][0]["status"] == "unmarked"
+    assert view["visits"][0]["timezone"] == "America/New_York"  # no clinic on it: the practice's zone
     # A linked patient is the lead's, not a Stride row.
     with pytest.raises(Exception) as missing:
         dashboard.dashboard_stride_patient(101, actor)

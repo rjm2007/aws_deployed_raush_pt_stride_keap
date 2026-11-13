@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -115,6 +115,26 @@ def test_activity_feed_names_the_source_and_shows_each_event_once():
     assert len(activity) == len(lines)  # one line per event
     stop = next(e for e in activity if e["actor_name"] == "Patient")
     assert stop["details"] == {"reason": "STOP", "from": "in_progress", "to": "do_not_contact"}
+
+
+def test_appointment_activity_line_carries_the_visits_clinic_zone():
+    """The frontend shows the visit time in its clinic's zone, the time the patient was told."""
+    start = datetime(2026, 7, 25, 14, tzinfo=UTC)
+    rows = [{"id": 7, "state": "scheduled", "booked_at": start - timedelta(days=3), "start_utc": start,
+             "booking_source": "voice_agent", "timezone": "America/New_York"},
+            {"id": 8, "state": "cancelled", "booked_at": start - timedelta(days=4), "start_utc": start,
+             "booking_source": "manual"}]
+    activity = dashboard_routes._build_activity([], [], [], rows)
+    assert [e["details"] for e in activity] == [{"start": start, "timezone": "America/New_York"},
+                                                {"start": start}]
+
+
+def test_board_booking_carries_the_visit_zone():
+    record = {"start_utc": "2026-07-25T14:00:00+00:00", "timezone": "America/New_York",
+              "state": "scheduled", "tag": "elliot", "type": "Initial Evaluation",
+              "practitioner_name": "Synthetic Clinician", "lead_id": "x"}
+    assert dashboard_routes._board_booking(record) == {
+        key: record[key] for key in ("start_utc", "timezone", "state", "tag", "type", "practitioner_name")}
 
 
 class Result:

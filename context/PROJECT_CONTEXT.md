@@ -2986,3 +2986,25 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
   was created (was: only while still in the future), so a returning patient stays Booked / gets Completed after
   the visit; carried cancels and no-shows are skipped; `_SELECT_ROWS` re-plans the new lead when an older
   same-number lead's visit changes.
+
+### 2026-11-13 — Dashboard shows each visit in its clinic's own zone (owner-approved; demo)
+
+- Why: the demo's three clinics point to a New York Stride location (`booking_locations.timezone` America/New_York).
+  Elliot (text and voice) gives the clinic's time ("Sat Jul 25 at 10:00 AM", 14:00 UTC); the dashboard formatted
+  every visit in Pacific and showed 7:00 AM.
+- `services/appointment_views.py`: every booking record has `timezone`: ours = its booking location's
+  (`appointments.booking_location_id`), Stride's = the clinic on its Stride location id, else our booking's location,
+  else `practices.timezone` (the import reads Stride clock times in the Stride zone, so the clock matches Stride).
+  `open_slots` gives clock times, days and `timezone` in each clinic's zone too, so an open time and the visit booked
+  into it line up. The calendar's window, its "today" and its own `timezone` stay the practice's (2026-10-28 rule).
+- `routes/dashboard.py`: board `booking` carries `timezone`; lead detail `appointments` rows carry it and the
+  appointment Activity line has `details.timezone`. `services/lead_list.py`: Stride patient `visits[].timezone`.
+- Frontend (`rpt_frontend`, same branch): home Next Appointments, board cards, lead booking card, Stride patient
+  Visits, the Activity "Start" value and the Appointments calendar show the visit in its zone, labelled "ET" when
+  not Pacific (Pacific looks as before). The calendar grid places each visit and open time on its clinic's clock;
+  its zone label is the zone they all share (ET on the demo), else "Clinic time".
+- Known edge: the calendar window is California days, so an Eastern visit between midnight and 3 AM at the edge of
+  a range is not drawn (no clinic visits then).
+- Tests: `test_appointment_views.py`, `test_dashboard.py`, `test_dashboard_calendar.py`,
+  `test_appointment_views_integration.py` (`test_each_visit_and_open_time_is_in_its_clinics_own_zone`),
+  `test_lead_list_integration.py`.

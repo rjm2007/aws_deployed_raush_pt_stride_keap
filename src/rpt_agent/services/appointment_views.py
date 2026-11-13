@@ -20,6 +20,8 @@ TAG_ELLIOT, TAG_SHEET_LEAD, TAG_STRIDE_ONLY = "elliot", "sheet_lead", "stride_on
 BOOKED_STATUSES = {"o", "open", "u", "unmarked", "confirmed"}
 COMPLETED_STATUSES = {"checked in", "c"}
 ACTIVE_STATES = {"booking", "scheduled", "unknown"}
+# The dashboard's zone when nothing better is known (frontend display.ts CLINIC_TZ).
+DEFAULT_TIMEZONE = "America/Los_Angeles"
 # Every booking our engine makes is a new patient's first visit.
 NATIVE_VISIT_TYPE = "Initial Evaluation"
 # The calendar's source: who the visit belongs to (same split as the tag, shorter words).
@@ -153,6 +155,9 @@ def record(row, *, imported: bool, first_visit_types=frozenset()) -> dict:
         "full_name": row.get("full_name") or "Patient name unavailable",
         "start_utc": start,
         "end_utc": end,
+        # The clinic's own zone (its booking location's), so the dashboard shows the time the
+        # patient was told (Elliot texts and says clinic time); the practice zone when unknown.
+        "timezone": row.get("timezone") or DEFAULT_TIMEZONE,
         "duration_minutes": duration if duration and duration > 0 else None,
         "practitioner_id": practitioner_id,
         "practitioner_name": practitioner_name,
@@ -182,6 +187,17 @@ def record(row, *, imported: bool, first_visit_types=frozenset()) -> dict:
     }
 
 
+# A visit's zone (2026-11-13): its clinic's own (booking_locations.timezone), else the practice's.
+# The demo's clinics are on a New York Stride location, so Elliot texts "10:00 AM" Eastern; the
+# dashboard showed that visit at 7:00 AM Pacific. Ours: our booking's location. Stride's: the
+# clinic on its Stride location id (the import reads Stride's clock in the Stride zone, so the
+# visit then shows the clock Stride shows), else our booking's location when it is one of ours.
+_STRIDE_CLINIC_ZONE = (
+    "(select bls.timezone from booking_locations bls where bls.practice_id=sa.practice_id "
+    "and bls.stride_location_id=sa.location_id order by bls.is_active desc,bls.id limit 1)"
+)
+
+
 # Our booking row, when we made the visit, and the call it was made on.
 _OURS = (
     "a.booking_source,a.created_at as hold_at,cl.id as call_log_id,"
@@ -204,6 +220,7 @@ def load_records(conn, practice_id: int, *, lower: datetime | None = None,
     if lead_filter == []:
         return [], False
     tables = optional_tables(conn)
+    booking = tables["booking"]
     window = (lower, lower, upper, upper)
     # Once Stride has the visit, its copy (even a removed one) is the truth, not ours.
     mirror_filter = (
@@ -215,9 +232,12 @@ def load_records(conn, practice_id: int, *, lower: datetime | None = None,
         "select a.id,a.lead_id,l.full_name,l.first_name,l.last_name,a.appointment_type_id,a.start_utc,a.end_utc,a.clinician_id,"
         "a.location_id,l.location,coalesce(ct.name,l.lead_type) as case_title,"
         "l.source_system as lead_source,a.state,a.needs_staff_review,a.stride_appointment_id,"
-        "coalesce(a.confirmed_at,a.booked_at,a.created_at) as booked_at," + _OURS + " "
+        "coalesce(a.confirmed_at,a.booked_at,a.created_at) as booked_at," + _OURS + ","
+        + ("coalesce(bl.timezone,p.timezone)" if booking else "p.timezone") + " as timezone "
         "from appointments a join leads l on l.id=a.lead_id "
-        "left join case_types ct on ct.id=a.case_type_id "
+        "join practices p on p.id=a.practice_id "
+        + ("left join booking_locations bl on bl.id=a.booking_location_id " if booking else "")
+        + "left join case_types ct on ct.id=a.case_type_id "
         "left join call_logs cl on a.call_id is not null and cl.vapi_call_id=a.call_id "
         "where a.practice_id=%s and (%s::timestamptz is null or a.start_utc>=%s) "
         "and (%s::timestamptz is null or a.start_utc<%s) "
@@ -241,8 +261,10 @@ def load_records(conn, practice_id: int, *, lower: datetime | None = None,
             "sa.appointment_type as type,sa.status as state,l.source_system as lead_source,"
             "sa.stride_id as stride_appointment_id,"
             "coalesce(a.confirmed_at,a.booked_at,sa.stride_created_at,sa.created_at) as booked_at,"
-            + _OURS + " "
-            "from stride_appointments sa "
+            + _OURS + ","
+            + (f"coalesce({_STRIDE_CLINIC_ZONE},abl.timezone,p.timezone)" if booking else "p.timezone")
+            + " as timezone "
+            "from stride_appointments sa join practices p on p.id=sa.practice_id "
             "left join stride_patients sp on sp.practice_id=sa.practice_id "
             "and sp.stride_id=sa.patient_stride_id and sp.deleted_at is null "
             "left join stride_cases sc on sc.practice_id=sa.practice_id "
@@ -252,7 +274,8 @@ def load_records(conn, practice_id: int, *, lower: datetime | None = None,
             "and su.stride_id=sa.clinician_id and su.deleted_at is null "
             "left join appointments a on a.practice_id=sa.practice_id "
             "and a.stride_appointment_id=sa.stride_id "
-            "left join call_logs cl on a.call_id is not null and cl.vapi_call_id=a.call_id "
+            + ("left join booking_locations abl on abl.id=a.booking_location_id " if booking else "")
+            + "left join call_logs cl on a.call_id is not null and cl.vapi_call_id=a.call_id "
             "where sa.practice_id=%s and sa.deleted_at is null "
             "and (%s::timestamptz is null or sa.start_utc>=%s) "
             "and (%s::timestamptz is null or sa.start_utc<%s) "
@@ -425,13 +448,16 @@ def open_slots(conn, practice_id: int, lower: datetime, upper: datetime, timezon
     `location`) and clinic-local day. Nothing is estimated: the calendar draws these open and
     everything else closed. Each slot once per clinic; clinics sharing one Stride location (the
     demo's three) each list it, so a location filter shows only that clinic's open time. Only as
-    fresh as the last sync, and only inside the cache window (today to 90 days ahead)."""
+    fresh as the last sync, and only inside the cache window (today to 90 days ahead).
+    Clock times and days are the clinic's own zone (`timezone`, its booking location's, else
+    `timezone` given), like its visits, so an open time and the visit booked into it line up."""
     if not optional_tables(conn)["booking"]:
         return []
     rows = conn.execute(
         "select distinct c.stride_user_id as id,c.display_name as name,bl.id as location_id,"
-        "bl.name as location,s.start_utc at time zone %s as start_local,"
-        "s.end_utc at time zone %s as end_local "
+        "bl.name as location,bl.timezone as zone,"
+        "s.start_utc at time zone coalesce(bl.timezone,%s) as start_local,"
+        "s.end_utc at time zone coalesce(bl.timezone,%s) as end_local "
         "from availability_slots s join clinicians c on c.id=s.clinician_id "
         "join booking_locations bl on bl.id=s.booking_location_id "
         "where s.practice_id=%s and c.is_active and s.status='open' and s.start_utc>=%s and s.start_utc<%s "
@@ -443,7 +469,8 @@ def open_slots(conn, practice_id: int, lower: datetime, upper: datetime, timezon
         key = (str(r["id"]), r["start_local"].date(), r["location_id"])
         day = days.setdefault(key, {"date": key[1].isoformat(), "practitioner_id": key[0],
                                     "practitioner_name": r["name"], "location_id": r["location_id"],
-                                    "location": r["location"], "slots": []})
+                                    "location": r["location"],
+                                    "timezone": r.get("zone") or timezone, "slots": []})
         day["slots"].append({"start_local": r["start_local"].isoformat(timespec="minutes"),
                              "end_local": r["end_local"].isoformat(timespec="minutes")})
     return list(days.values())

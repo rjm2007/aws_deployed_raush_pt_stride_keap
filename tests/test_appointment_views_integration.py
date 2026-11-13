@@ -18,6 +18,7 @@ from test_stride_import_integration import (  # noqa: F401 (env is a fixture)
     patient,
 )
 
+from rpt_agent.routes import dashboard
 from rpt_agent.routes import dashboard_calendar as calendar
 from rpt_agent.security import DashboardActor
 from rpt_agent.services import appointment_views as av
@@ -148,11 +149,12 @@ def _at(day: str, hour: int, minute: int = 0) -> datetime:
     return datetime.combine(date.fromisoformat(day), time(hour, minute), NY)
 
 
-def _ours(ctx, lead, start, stride_id=None, case=None):
+def _ours(ctx, lead, start, stride_id=None, case=None, location=None):
     ctx.db.execute(
         "insert into appointments(lead_id,practice_id,booking_source,state,start_utc,end_utc,clinician_id,"
-        "location_id,case_type_id,stride_appointment_id) values(%s,%s,'voice_agent','scheduled',%s,%s,3,2,%s,%s)",
-        (lead, ctx.practice_id, start, start + timedelta(hours=1), case, stride_id))
+        "location_id,case_type_id,stride_appointment_id,booking_location_id) "
+        "values(%s,%s,'voice_agent','scheduled',%s,%s,3,2,%s,%s,%s)",
+        (lead, ctx.practice_id, start, start + timedelta(hours=1), case, stride_id, location))
 
 
 def test_elliot_booking_waits_for_approval_until_the_stride_export_shows_it(booked):
@@ -275,14 +277,15 @@ def test_open_slots_are_the_cached_open_ones_once_per_clinician_and_day(booked):
         datetime.now(UTC).date() - timedelta(days=2), date.fromisoformat(next_day), lead_id=lead)
     assert [r["lead_id"] for r in result["appointments"]] == [lead]  # the lead filter is for visits only
     joe = {"practitioner_id": "3", "practitioner_name": "Joe Smith"}
+    ny = {"timezone": "America/New_York"}
     # Grouped by clinic, so a location filter shows only that clinic's open time.
     assert result["open_slots"] == [
-        {"date": day, **joe, "location_id": dana, "location": "Dana Point", "slots": [
+        {"date": day, **joe, "location_id": dana, "location": "Dana Point", **ny, "slots": [
             {"start_local": f"{day}T09:00", "end_local": f"{day}T10:00"}]},
-        {"date": day, **joe, "location_id": laguna, "location": "Laguna Niguel", "slots": [
+        {"date": day, **joe, "location_id": laguna, "location": "Laguna Niguel", **ny, "slots": [
             {"start_local": f"{day}T09:00", "end_local": f"{day}T09:30"},
             {"start_local": f"{day}T09:00", "end_local": f"{day}T10:00"}]},
-        {"date": next_day, **joe, "location_id": laguna, "location": "Laguna Niguel", "slots": [
+        {"date": next_day, **joe, "location_id": laguna, "location": "Laguna Niguel", **ny, "slots": [
             {"start_local": f"{next_day}T10:30", "end_local": f"{next_day}T11:30"}]},
     ]
     # A clinician we no longer book for: their cached open slots are not shown.
@@ -293,40 +296,54 @@ def test_open_slots_are_the_cached_open_ones_once_per_clinician_and_day(booked):
     assert result["open_slots"] == []
 
 
-def test_calendar_shows_clinic_time_when_the_stride_location_is_another_zone(booked):
-    """Demo: Stride location US/Eastern, clinic California. The calendar showed a 2:00 PM PT visit
-    at 5:00 PM (2026-10-28); now its days, open slots and zone are the clinic's, like the lead page."""
+def test_each_visit_and_open_time_is_in_its_clinics_own_zone(booked):
+    """Demo: clinics on a New York Stride location, practice California. Elliot texts 10:00 AM
+    (Eastern); the dashboard showed 7:00 AM Pacific (2026-11-13). Every visit and open time now
+    carries its clinic's zone (booking location), else the practice's. The calendar's days and its
+    own `timezone` stay the practice's (California), as decided 2026-10-28."""
     ctx = booked
     case = _booking_setup(ctx)  # booking location and Stride zone: America/New_York
     db, practice = ctx.db, ctx.practice_id
     db.execute("update practices set timezone='America/Los_Angeles' where id=%s", (practice,))
     clinician = db.execute("select id from clinicians where practice_id=%s", (practice,)).fetchone()["id"]
     laguna = db.execute("select id from booking_locations where practice_id=%s", (practice,)).fetchone()["id"]
-    pt = ZoneInfo("America/Los_Angeles")
     day = date.fromisoformat(future_day(5))
-    afternoon = datetime.combine(day, time(17), NY)                     # 5:00 PM Eastern = 2:00 PM PT
+    morning = datetime.combine(day, time(10), NY)                       # 10:00 AM Eastern = 7:00 AM PT
     late = datetime.combine(day + timedelta(days=1), time(1), NY)       # 01:00 Eastern = 22:00 PT the day before
     lead, other = ctx.lead("Ada Lovelace", phone="+15552010002"), ctx.lead("Grace Hopper", phone="+15552010003")
-    _ours(ctx, lead, afternoon, case=case)
-    _ours(ctx, other, late, case=case)
+    _ours(ctx, lead, morning, case=case, location=laguna)
+    _ours(ctx, other, late, case=case)  # no booking location: the practice's zone
+    # A front-desk visit in Stride at its location 2 (Laguna Niguel's): Stride's 11:00 AM is Eastern.
+    ctx.drop("patients_20261001100000.csv", csv_bytes(PATIENT_HEADER, [
+        patient("102", "Walk", "In", "1985-05-05", mobile="(555) 201-0099")]))
+    ctx.drop("appointments_20261001100000.csv", csv_bytes(APPOINTMENT_HEADER, [
+        appointment("9002", "102", "7002", day.isoformat(), start="11:00 AM", end="12:00 PM")]))
+    ctx.tick()
     db.execute(
         "insert into availability_slots(practice_id,clinician_id,booking_location_id,duration_minutes,"
         "start_utc,end_utc,local_date,local_time,timezone,status) values(%s,%s,%s,60,%s,%s,%s,%s,"
         "'America/New_York','open')",
-        (practice, clinician, laguna, late, late + timedelta(hours=1), late.date(), late.time()))
+        (practice, clinician, laguna, morning + timedelta(hours=2), morning + timedelta(hours=3),
+         day, time(12)))
     actor = DashboardActor("review", "review@example.test", practice_id=practice)
 
     result = calendar.appointment_calendar(actor, day, day)
     assert result["timezone"] == "America/Los_Angeles"
-    assert [r["lead_id"] for r in result["appointments"]] == [lead, other]  # both on the California day
-    assert [r["start_utc"].astimezone(pt).hour for r in result["appointments"]] == [14, 22]
+    zones = {r["lead_id"] or r["id"]: r["timezone"] for r in result["appointments"]}
+    assert zones == {lead: "America/New_York", other: "America/Los_Angeles",
+                     "stride:9002": "America/New_York"}
+    clocks = {r["lead_id"] or r["id"]: r["start_utc"].astimezone(ZoneInfo(r["timezone"])).strftime("%H:%M")
+              for r in result["appointments"]}
+    assert clocks == {lead: "10:00", other: "22:00", "stride:9002": "11:00"}  # what the patient was told
     assert result["open_slots"] == [{
         "date": day.isoformat(), "practitioner_id": "3", "practitioner_name": "Joe Smith",
-        "location_id": laguna, "location": "Laguna Niguel",
-        "slots": [{"start_local": f"{day}T22:00", "end_local": f"{day}T23:00"}]}]
-    # The next California day does not show the 01:00 Eastern visit or slot.
-    following = calendar.appointment_calendar(actor, day + timedelta(days=1), day + timedelta(days=1))
-    assert [r["lead_id"] for r in following["appointments"]] == [] and following["open_slots"] == []
+        "location_id": laguna, "location": "Laguna Niguel", "timezone": "America/New_York",
+        "slots": [{"start_local": f"{day}T12:00", "end_local": f"{day}T13:00"}]}]
+    # The lead page (booking card and the Activity line) carries the same zone.
+    detail = dashboard.dashboard_lead(lead, actor)
+    assert detail["booking"]["timezone"] == "America/New_York"
+    (line,) = [e for e in detail["activity"] if e["action"] == "appointment.scheduled"]
+    assert line["details"] == {"start": morning, "timezone": "America/New_York"}
     # Stride's own zone is unchanged: the import and the booking engine still read Eastern.
     assert db.execute("select stride_location_timezone from practice_settings where practice_id=%s",
                       (practice,)).fetchone()["stride_location_timezone"] == "America/New_York"

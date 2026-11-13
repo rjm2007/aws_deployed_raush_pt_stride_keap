@@ -647,7 +647,8 @@ def _build_activity(audits, events, status_history, appointments, reviews=(),
             actor_name=BOOKING_ACTORS.get(str(row.get("booking_source") or ""), SYSTEM),
             category="appointments",
             title=f"Appointment {str(row['state']).replace('_', ' ')}",
-            details={"start": row.get("start_utc")},
+            details={"start": row.get("start_utc"),
+                     **({"timezone": row["timezone"]} if row.get("timezone") else {})},
         ))
     return sorted(
         (entry for entry in entries if entry["occurred_at"]),
@@ -957,7 +958,8 @@ def dashboard_snapshot(actor: Actor):
 def _board_booking(record):
     if not record:
         return None
-    return {key: record[key] for key in ("start_utc", "state", "tag", "type", "practitioner_name")}
+    return {key: record.get(key) for key in ("start_utc", "timezone", "state", "tag", "type",
+                                             "practitioner_name")}
 
 
 @router.get("/stride-sync")
@@ -1220,10 +1222,14 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
             "where cl.lead_id=%s order by cl.dialed_at desc,cl.id desc",
             (lead_id,),
         ).fetchall()
+        # timezone: the visit's clinic zone (its booking location's, else the practice's), so the
+        # Activity line shows the time the patient was told (2026-11-13).
         appointments = conn.execute(
-            "select id,state,start_utc,end_utc,booked_at,location_id,appointment_type_id,"
-            "needs_staff_review,booking_source from appointments where lead_id=%s "
-            "order by booked_at desc",
+            "select a.id,a.state,a.start_utc,a.end_utc,a.booked_at,a.location_id,a.appointment_type_id,"
+            "a.needs_staff_review,a.booking_source,coalesce(bl.timezone,p.timezone) as timezone "
+            "from appointments a join practices p on p.id=a.practice_id "
+            "left join booking_locations bl on bl.id=a.booking_location_id where a.lead_id=%s "
+            "order by a.booked_at desc",
             (lead_id,),
         ).fetchall()
         booking = appointment_views.booking_card(conn, row["practice_id"], lead_id, datetime.now(UTC))

@@ -169,6 +169,7 @@ def test_booking_card_reads_names_tags_and_the_call_moment():
     assert card["location"] == "Laguna Niguel"  # Stride location id wins over free text
     assert card["quote"] == "I'd prefer Joe if he is free please."
     assert card["dob_check"] == {"on_file": "1990-08-09", "said": "1990-08-19"}
+    assert card["timezone"] == "America/Los_Angeles"  # no zone on the row: the dashboard's default
     # Every query is scoped to the practice and the lead, and nothing is written.
     for sql, params in conn.queries:
         assert not sql.lstrip().lower().startswith(("insert", "update", "delete"))
@@ -176,6 +177,11 @@ def test_booking_card_reads_names_tags_and_the_call_moment():
             assert params == (lead,)  # one lead's own booking
         elif "from appointments a join leads" in sql or "from stride_appointments sa" in sql:
             assert params[0] == 7 and params[5] == [str(lead)]
+
+
+def test_record_keeps_the_clinics_own_zone():
+    row = _row(lead_id=uuid4(), timezone="America/New_York")
+    assert av.record(row, imported=False)["timezone"] == "America/New_York"
 
 
 def test_no_leads_means_no_queries():

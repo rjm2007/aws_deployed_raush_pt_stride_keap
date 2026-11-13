@@ -109,9 +109,10 @@ def test_calendar_deduplicates_bookings_and_keeps_sheet_link_and_stride_cancella
     assert (record["source"], record["approval"], record["stride_status"]) == ("sheet", "in_stride", "late_cancel")
     assert result["open_slots"] == [{
         "date": "2026-10-13", "practitioner_id": "12", "practitioner_name": "Synthetic Clinician",
-        "location_id": 5, "location": "Synthetic Clinic",
+        "location_id": 5, "location": "Synthetic Clinic", "timezone": "America/Los_Angeles",
         "slots": [{"start_local": "2026-10-13T09:00", "end_local": "2026-10-13T10:00"}],
     }]
+    assert record["timezone"] == "America/Los_Angeles"  # no clinic zone known: the practice's
     assert result["practitioners"] == [{"id": "12", "name": "Synthetic Clinician",
                                         "location": "Synthetic Clinic", "role": "PT"}]
     assert not any(sql.lstrip().startswith(("insert", "update", "delete")) for sql, _ in conn.queries)
@@ -135,7 +136,40 @@ def test_calendar_days_and_slots_are_clinic_time_not_the_stride_zone(monkeypatch
     (visits,) = [p for sql, p in conn.queries if "from appointments a" in sql]
     assert datetime(2026, 11, 2, 8, tzinfo=UTC) in visits and datetime(2026, 11, 3, 8, tzinfo=UTC) in visits
     (slots,) = [p for sql, p in conn.queries if "from availability_slots s" in sql]
-    assert slots[:2] == ("America/Los_Angeles", "America/Los_Angeles")  # open-slot clock times
+    assert slots[:2] == ("America/Los_Angeles", "America/Los_Angeles")  # open-slot fallback zone
+
+
+def test_visits_and_open_slots_carry_their_clinics_own_zone(monkeypatch):
+    """The demo's clinics are on a New York Stride location: Elliot texts 10:00 AM (Eastern) and the
+    calendar showed 7:00 AM Pacific (2026-11-13). Each visit and open time now says its clinic's zone."""
+    class EasternClinic(CalendarConnection):
+        def execute(self, sql, params=None):
+            result = super().execute(sql, params)
+            if "from appointments a" in sql or "from stride_appointments sa" in sql:
+                result.rows = [{**row, "timezone": "America/New_York"} for row in result.rows]
+            if "from availability_slots s" in sql:
+                result.rows = [{**row, "zone": "America/New_York"} for row in result.rows]
+            return result
+
+    conn = EasternClinic()
+
+    @contextmanager
+    def transaction():
+        yield conn
+
+    monkeypatch.setattr(calendar, "transaction", transaction)
+    result = calendar.appointment_calendar(DashboardActor("review", "review@example.test", practice_id=7),
+                                           date(2026, 10, 13), date(2026, 10, 13))
+    assert result["timezone"] == "America/Los_Angeles"  # the calendar's own (today, the now line)
+    assert result["appointments"][0]["timezone"] == "America/New_York"
+    assert result["open_slots"][0]["timezone"] == "America/New_York"
+    visits, stride, slots = (next(sql for sql, _ in conn.queries if marker in sql) for marker in (
+        "from appointments a join leads", "from stride_appointments sa join", "from availability_slots s"))
+    assert "coalesce(bl.timezone,p.timezone) as timezone" in visits
+    assert "left join booking_locations bl on bl.id=a.booking_location_id" in visits
+    # Stride's copy: the clinic on its Stride location, else our booking's location, else the practice.
+    assert "bls.stride_location_id=sa.location_id" in stride and "abl.timezone,p.timezone)" in stride
+    assert "at time zone coalesce(bl.timezone,%s) as start_local" in slots
 
 
 def test_calendar_routes_require_staff_authentication(monkeypatch):
