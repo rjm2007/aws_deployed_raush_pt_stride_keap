@@ -1026,8 +1026,11 @@ def test_sandbox_promise_of_the_front_desk_without_a_hand_off_is_not_sent(env):
                for item in client.responses.requests[1]["input"] if isinstance(item, dict))
 
 
-def test_sandbox_tomorrow_search_names_the_day_on_the_calendar(env):
-    # book-12 (round 3): the pinned calendar's tomorrow (Tue Jun 16) is named in the reply.
+def test_sandbox_tomorrow_search_names_the_day_on_the_calendar(env, monkeypatch):
+    # book-12 (round 3): the pinned calendar's tomorrow (Tue Jun 16) is named in the reply. Real
+    # today is a Monday like the pinned day, so tomorrow keeps its weekday (2026-11-13).
+    from rpt_agent.services import slot_booking
+    monkeypatch.setattr(slot_booking, "clinic_real_today", lambda now_local: date(2026, 11, 16))
     env.open_and_sync()
     setup = SandboxSetup(clinic="Laguna Niguel", first_name="Sam", practice_slug=env.practice_slug)
     from rpt_agent.services.sms_agent import sandbox_lead
@@ -1040,6 +1043,21 @@ def test_sandbox_tomorrow_search_names_the_day_on_the_calendar(env):
                                    "said tomorrow).")
     morning = call_tool(tools, "find_times", {"when": "tomorrow"})
     assert morning.output.startswith("OPENINGS: Searched tomorrow, Tue Jun 16. Name that day")
+
+
+def test_sandbox_friday_said_on_a_thursday_searches_friday_on_the_calendar(env, monkeypatch):
+    # Emma 2026-11-12 (a Thursday): "Friday mornings are best" was searched as tomorrow and the
+    # pinned Mon 15 June calendar answered for Tue 16 June. Tomorrow is now Friday there too.
+    from rpt_agent.services import slot_booking
+    monkeypatch.setattr(slot_booking, "clinic_real_today", lambda now_local: date(2026, 11, 12))
+    env.open_and_sync()
+    setup = SandboxSetup(clinic="Laguna Niguel", first_name="Sam", practice_slug=env.practice_slug)
+    from rpt_agent.services.sms_agent import sandbox_lead
+    tools = SandboxTools(env.trace, lead=sandbox_lead(setup),
+                         history=[Turn("patient", "Friday mornings are best", None)],
+                         practice_id=env.practice_id, now_local=None, settings=env.settings())
+    found = call_tool(tools, "find_times", {"when": "tomorrow", "time_of_day": "morning"})
+    assert found.output.split(". ")[0].endswith("Searched tomorrow, Fri Jun 19"), found.output
 
 
 # --- birthday step (owner, 2026-11-03) ---------------------------------------------------------------

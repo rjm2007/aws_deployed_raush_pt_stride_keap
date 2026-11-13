@@ -340,6 +340,11 @@ def date_window(
     raise ValueError(f"BAD_WHEN: when must be one of {', '.join(WHEN_VALUES)}.")
 
 
+def clinic_real_today(now_local: datetime) -> date:
+    """The real date at the clinic (never the pinned demo day); one place, so tests can set it."""
+    return datetime.now(now_local.tzinfo).date()
+
+
 def pinned_calendar_date(asked: date | None, now_local: datetime, pinned: date | None,
                          horizon_days: int, real_today: date | None = None) -> date | None:
     """A day the agent named, moved onto the pinned demo calendar (BOOKING_TODAY_OVERRIDE).
@@ -354,11 +359,28 @@ def pinned_calendar_date(asked: date | None, now_local: datetime, pinned: date |
         return asked
     if pinned <= asked <= pinned + timedelta(days=horizon_days):
         return asked
-    real_today = real_today or datetime.now(now_local.tzinfo).date()
+    real_today = real_today or clinic_real_today(now_local)
     if asked < real_today:
         # A real past day is past, even if it is after the pinned day (Oct 1 with June 15 pinned
         # was called "too far ahead").
         raise ValueError(f"PAST_DATE: {_spoken_date(asked)} has already passed. Ask for another day.")
+    moved = pinned + timedelta(days=(asked - real_today).days)
+    return moved + timedelta(days=(asked.weekday() - moved.weekday()) % 7)
+
+
+def pinned_today_or_tomorrow(when: str, now_local: datetime, pinned: date | None,
+                             horizon_days: int, real_today: date | None = None) -> date | None:
+    """The day a today / tomorrow search looks at on the pinned demo calendar (None: no pin, or
+    another search).
+
+    Emma's test 2026-11-12 (a Thursday): "Friday mornings are best" was searched as tomorrow, and
+    tomorrow on the calendar pinned to Wed Jul 15 is Thu Jul 16, so Elliot said "nothing Thu Jul 16
+    morning". Today and tomorrow now keep their real day of the week, like a named day does.
+    """
+    if pinned is None or when not in ("today", "tomorrow"):
+        return None
+    real_today = real_today or clinic_real_today(now_local)
+    asked = real_today + timedelta(days=1 if when == "tomorrow" else 0)
     moved = pinned + timedelta(days=(asked - real_today).days)
     return moved + timedelta(days=(asked.weekday() - moved.weekday()) % 7)
 
@@ -375,7 +397,7 @@ def pinned_calendar_month(asked: date | None, now_local: datetime, pinned: date 
         return asked
     if pinned.replace(day=1) <= asked <= pinned + timedelta(days=cache_days - 1):
         return asked
-    real_month = (real_today or datetime.now(now_local.tzinfo).date()).replace(day=1)
+    real_month = (real_today or clinic_real_today(now_local)).replace(day=1)
     if asked < real_month:
         raise ValueError(
             f"PAST_DATE: {_spoken_month(asked)} has already passed. Ask for another month."
@@ -654,6 +676,12 @@ def _search(context: BookingContext, settings: Settings, *, when: str,
              if month and month != asked_month else "")
     start, end = date_window(when, context.now_local, settings.booking_horizon_days,
                              specific_date, month)
+    day = pinned_today_or_tomorrow(when, context.now_local, settings.booking_today_override,
+                                   settings.booking_horizon_days)
+    if day is not None:
+        start = end = day
+        # With the year, so the SMS agent can name the day searched (sms_agent_tools.name_search_day).
+        moved = f" (on the booking calendar: {_long_date(day)})"
     pool = context.clinicians
     if clinician_name:
         pool = match_clinicians(context.clinicians, clinician_name)

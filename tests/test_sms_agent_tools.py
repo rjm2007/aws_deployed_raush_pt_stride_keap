@@ -914,6 +914,17 @@ def test_other_searches_and_codes_are_unchanged(output, searched):
     assert name_search_day(output, asked=searched, searched=searched) == output
 
 
+def test_a_pinned_tomorrow_search_names_the_day_it_searched():
+    # Emma 2026-11-12: on the demo's pinned calendar tomorrow keeps its real weekday (Fri Jul 17),
+    # not the day after the pinned Wed Jul 15.
+    from rpt_agent.services.sms_agent_tools import name_search_day
+
+    output = ("NOTHING_IN_RANGE: no Physical Therapy at Dana Point openings (on the booking calendar: "
+              "Friday, July 17, 2026) for that time. Calendar today: Wednesday, July 15, 2026.")
+    assert name_search_day(output, asked="tomorrow", searched="tomorrow").startswith(
+        "NOTHING_IN_RANGE: Searched tomorrow, Fri Jul 17. Name that day")
+
+
 def test_a_reply_without_the_calendar_note_still_says_what_was_searched():
     from rpt_agent.services.sms_agent_tools import calendar_today, name_search_day
 

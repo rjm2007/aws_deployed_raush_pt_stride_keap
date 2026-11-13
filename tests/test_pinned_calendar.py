@@ -11,6 +11,7 @@ from rpt_agent.services.slot_booking import (
     date_window,
     pinned_calendar_date,
     pinned_calendar_month,
+    pinned_today_or_tomorrow,
 )
 
 NOW = datetime(2026, 6, 15, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles"))  # pinned day, a Monday
@@ -40,6 +41,24 @@ def test_a_real_past_day_is_past_even_after_the_pinned_day():
     """Oct 1 (real past, after the pinned June 15) was called "too far ahead" (QA 2026-10-22)."""
     with pytest.raises(ValueError, match="PAST_DATE: Thursday, October 1 has already passed"):
         pinned_calendar_date(date(2026, 10, 1), NOW, PINNED, 31, real_today=REAL_TODAY)
+
+
+@pytest.mark.parametrize(("when", "real_today", "expected"), [
+    # Emma 2026-11-12 (Thu, pinned Wed Jul 15): "Friday mornings" searched as tomorrow was Thu Jul 16.
+    ("tomorrow", date(2026, 11, 12), date(2026, 7, 17)),
+    ("today", date(2026, 11, 12), date(2026, 7, 16)),
+    ("today", date(2026, 11, 11), date(2026, 7, 15)),     # same weekday as the pinned day: the pinned day
+    ("tomorrow", date(2026, 11, 14), date(2026, 7, 19)),  # Sunday stays Sunday
+])
+def test_today_and_tomorrow_keep_their_real_weekday_on_the_pinned_calendar(when, real_today, expected):
+    day = pinned_today_or_tomorrow(when, NOW, date(2026, 7, 15), 31, real_today=real_today)
+    assert day == expected
+    assert day.weekday() == (real_today.weekday() + (when == "tomorrow")) % 7
+
+
+def test_today_and_tomorrow_unchanged_without_a_pin_or_for_other_searches():
+    assert pinned_today_or_tomorrow("tomorrow", NOW, None, 31) is None
+    assert pinned_today_or_tomorrow("earliest", NOW, PINNED, 31, real_today=REAL_TODAY) is None
 
 
 # A named month (when=specific_month, owner 2026-10-23), same rule as a named day.

@@ -238,7 +238,10 @@ def test_find_by_therapist_and_unknown_therapist(env):
     assert unknown.startswith("NO_SUCH_THERAPIST") and "Alan Rome, Thao Nguyen" in unknown
 
 
-def test_find_windows_time_of_day_and_fallback(env):
+def test_find_windows_time_of_day_and_fallback(env, monkeypatch):
+    # Real today a Monday like the pinned Mon 15 June, so tomorrow stays Tue 16 June (today and
+    # tomorrow keep their real weekday on the pinned calendar, 2026-11-13).
+    monkeypatch.setattr(slot_booking, "clinic_real_today", lambda now_local: date(2026, 11, 16))
     open_days(env, c5981={DAY1: ["09:00:00", "14:00:00"], DAY3: ["10:00:00"]})
     env.sync()
     lead = env.lead()

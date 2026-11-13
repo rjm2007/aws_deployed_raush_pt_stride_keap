@@ -189,6 +189,19 @@ def calendar_today(output: str) -> date | None:
         return None
 
 
+_PINNED_DAY = re.compile(r"on the booking calendar: (\w+, \w+ \d{1,2}, \d{4})\)")
+
+
+def pinned_search_day(output: str) -> date | None:
+    match = _PINNED_DAY.search(output or "")
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%A, %B %d, %Y").replace(tzinfo=UTC).date()
+    except ValueError:
+        return None
+
+
 def name_search_day(output: str, *, asked: str, searched: str) -> str:
     """An OPENINGS / NOTHING_IN_RANGE reply to a today or tomorrow search, with the day searched
     named first: "NOTHING_IN_RANGE: Searched tomorrow, Thu Nov 5 (the patient said tomorrow). ..."
@@ -198,6 +211,9 @@ def name_search_day(output: str, *, asked: str, searched: str) -> str:
         return output
     today = calendar_today(output)
     day = today + timedelta(days=1 if searched == "tomorrow" else 0) if today else None
+    # The demo's pinned calendar moves today / tomorrow to the same weekday (slot_booking.
+    # pinned_today_or_tomorrow): the reply names that day, which is the one searched.
+    day = pinned_search_day(output) or day
     label = f"Searched {searched}" + (f", {texts.card_day(day)}" if day else "")
     if asked != searched:
         label += f" (the patient said {searched})"
