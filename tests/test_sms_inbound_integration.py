@@ -251,6 +251,16 @@ def test_a_booked_lead_beats_an_old_closed_one(db):
     assert sms_inbound.active_lead_id(db.db, phone) == booked
 
 
+def test_a_test_lead_has_no_daily_cap(db):
+    phone = db.phone()
+    db.lead(phone)
+    for _ in range(5):  # cap 3 in this fixture
+        db.text(phone, "hello")
+        db.make_due(phone)
+        db.tick()
+    assert len(db.twilio.sent) == 5
+
+
 def test_a_non_test_lead_gets_nothing_while_test_leads_only(db):
     phone = db.phone()
     lead = db.lead(phone, is_test=False)
@@ -294,9 +304,13 @@ def test_a_call_in_flight_puts_the_job_back_for_a_minute(db):
     assert len(db.twilio.sent) == 1
 
 
-def test_the_daily_cap_stops_replies_and_flags_staff_once(db):
+def test_the_daily_cap_sends_one_closing_text_and_flags_staff_once(db, monkeypatch):
+    # Emma's test 2026-11-11: replies are counted (not text parts), the limit ends with one closing
+    # text and the card, then nothing more that day. Real patients only.
+    monkeypatch.setenv("SMS_AGENT_TEST_LEADS_ONLY", "false")
+    get_settings.cache_clear()
     phone = db.phone()
-    lead = db.lead(phone)
+    lead = db.lead(phone, is_test=False)
     for _ in range(3):  # SMS_AGENT_DAILY_REPLY_CAP=3 in this fixture
         db.text(phone, "hello")
         db.make_due(phone)
@@ -306,7 +320,7 @@ def test_the_daily_cap_stops_replies_and_flags_staff_once(db):
         db.text(phone, "hello again")
         db.make_due(phone)
         db.tick()
-    assert len(db.twilio.sent) == 3
+    assert len(db.twilio.sent) == 4 and db.twilio.sent[-1][1].startswith("<reply_limit>")
     assert [j["outcome"] for j in db.jobs(phone)][-2:] == ["reply_cap", "reply_cap"]
     reviews = db.db.execute("select code from lead_reviews where lead_id=%s", (lead,)).fetchall()
     assert [r["code"] for r in reviews] == [sms_inbound.REVIEW_REPLY_CAP]

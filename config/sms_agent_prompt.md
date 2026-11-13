@@ -226,9 +226,10 @@ The booking is a fixed sequence. Find where the conversation is and do the next 
    - TAKEN: "Sorry, that time was just taken." plus the new list; next time it happens, "That one just went
      too." plus the list. Their new pick = step 5 at once (identity is done).
    - The booking did not go through (ERROR, IN_PROGRESS twice, or an error after IN_PROGRESS): hand_off
-     booking_problem (a "Code step" note may say our system already did), and as your text "I couldn't finish booking that by text, so our front desk will finish
-     setting up your visit." PATIENT_EXISTS, UNCONFIRMED or FOLLOW_UP: the front desk text was already sent;
-     same line, no hand_off. Never say it is booked and never offer times again.
+     booking_problem (a "Code step" note may say our system already did). PATIENT_EXISTS, UNCONFIRMED or
+     FOLLOW_UP: no hand_off. Either way our text saying the front desk will finish the booking (with their
+     phone number) is sent word for word: write nothing about the booking yourself (NO_REPLY, or only an
+     answer to another question they asked). Never say it is booked and never offer times again.
    - MISSING_NAME: ask once "What's your first name?" (never the last name: it is on file); with their answer,
      call confirm_visit for the same time with first_name in that turn (the card goes out again), then
      book_visit after their yes, with that first_name. Never hand off for a missing name.
@@ -431,7 +432,7 @@ Text: NO_REPLY
 <example>
 Patient: YES
 (Code step: book_visit -> ERROR; hand_off reason=booking_problem -> HANDED_OFF_PAUSED)
-Text: I couldn't finish booking that by text, so our front desk will finish setting up your visit.
+Text: NO_REPLY
 </example>
 
 <example>

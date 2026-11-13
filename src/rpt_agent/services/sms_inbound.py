@@ -136,7 +136,7 @@ class ReplyFacts:
     unknown_number_recent: bool = False
     staff_texted_recently: bool = False
     call_in_flight: bool = False
-    ai_replies_today: int = 0
+    ai_replies_today: int = 0  # replies (jobs that sent a text) today, not text parts
     cap_flagged_today: bool = False
     has_new_text: bool = True
     media_only: bool = False
@@ -147,7 +147,7 @@ class Decision:
     action: Literal["agent", "fixed_text", "skip", "retry"]
     reason: str  # job outcome for skip / retry / fixed_text; 'agent' for the agent
     text_key: str | None = None  # sms_agent_texts key for a fixed text
-    flag_review: bool = False  # open a Needs Review card (the reply cap, once a day)
+    flag_review: bool = False  # open a Needs Review card (the reply limit, once a day)
 
 
 def hard_stop(facts: ReplyFacts) -> str | None:
@@ -198,8 +198,14 @@ def should_reply(facts: ReplyFacts, settings: Settings) -> Decision:
         return Decision("skip", "staff_took_over")
     if facts.call_in_flight:
         return Decision("retry", "call_in_progress")
-    if facts.ai_replies_today >= settings.sms_agent_daily_reply_cap:
-        return Decision("skip", "reply_cap", flag_review=not facts.cap_flagged_today)
+    # Emma's test (2026-11-11): 10 texts a day per phone (every text part, over all her test leads)
+    # left her insurance and front desk questions unanswered. Now: replies, not text parts; no limit
+    # for test leads; at the limit one closing text with the card, then nothing more that day.
+    if (not lead.get("is_test")
+            and facts.ai_replies_today >= settings.sms_agent_daily_reply_cap):
+        if facts.cap_flagged_today:
+            return Decision("skip", "reply_cap")
+        return Decision("fixed_text", "reply_cap", text_key="reply_limit", flag_review=True)
     if not facts.has_new_text:
         return Decision("skip", "nothing_to_answer")
     if facts.media_only:
@@ -247,8 +253,8 @@ def load_facts(conn, job: dict[str, Any], lead_id: str | None, settings: Setting
         f"exists(select 1 from outreach_events where lead_id in {_PHONE_LEADS} and channel='call' "
         "  and status in ('in_flight','attempted') "
         "  and coalesce(executed_at,updated_at)>now()-%(call_window)s::interval) as call_live,"
-        f"(select count(*) from sms_messages where lead_id in {_PHONE_LEADS} and direction='outbound' "
-        "  and sender='ai' and occurred_at>="
+        "(select count(*) from sms_agent_jobs where phone_e164=%(phone)s and id<>%(job_id)s "
+        "  and reply_message_id is not null and finished_at>="
         "  (date_trunc('day',now() at time zone %(tz)s) at time zone %(tz)s)) as ai_today,"
         "exists(select 1 from lead_reviews where lead_id=%(lead_id)s and code=%(cap_code)s "
         "  and created_at>=(date_trunc('day',now() at time zone %(tz)s) at time zone %(tz)s)) "

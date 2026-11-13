@@ -103,12 +103,30 @@ def test_a_call_in_flight_retries_later():
     assert should_reply(_facts(call_in_flight=True), _settings()) == Decision("retry", "call_in_progress")
 
 
-def test_the_daily_cap_sends_nothing_and_flags_once():
-    first = should_reply(_facts(ai_replies_today=10), _settings())
-    again = should_reply(_facts(ai_replies_today=12, cap_flagged_today=True), _settings())
-    assert (first.action, first.reason, first.flag_review) == ("skip", "reply_cap", True)
-    assert (again.action, again.flag_review) == ("skip", False)
-    assert should_reply(_facts(ai_replies_today=9), _settings()).action == "agent"
+def _real(**overrides) -> ReplyFacts:
+    """A real patient's job, with the test-leads-only switch off."""
+    return _facts(lead=_lead(is_test=False), **overrides)
+
+
+REAL = {"sms_agent_test_leads_only": False}
+
+
+def test_the_daily_cap_sends_one_closing_text_and_flags_once():
+    # Emma's test 2026-11-11: at the cap she got no answer at all. Now one closing text and the card.
+    first = should_reply(_real(ai_replies_today=10), _settings(**REAL))
+    again = should_reply(_real(ai_replies_today=12, cap_flagged_today=True), _settings(**REAL))
+    assert first == Decision("fixed_text", "reply_cap", text_key="reply_limit", flag_review=True)
+    assert (again.action, again.reason, again.flag_review) == ("skip", "reply_cap", False)
+    assert should_reply(_real(ai_replies_today=9), _settings(**REAL)).action == "agent"
+
+
+def test_test_leads_have_no_daily_cap():
+    # Owner 2026-11-13: testers share one phone over many test leads; no limit for them.
+    assert should_reply(_facts(ai_replies_today=500), _settings()).action == "agent"
+
+
+def test_the_default_cap_is_25_replies():
+    assert Settings(_env_file=None).sms_agent_daily_reply_cap == 25
 
 
 def test_a_photo_with_no_words_gets_the_text_only_line():
@@ -146,7 +164,8 @@ def test_a_call_in_flight_beats_the_cap_and_a_photo():
 
 
 def test_the_cap_beats_the_text_only_line():
-    assert should_reply(_facts(ai_replies_today=10, media_only=True), _settings()).reason == "reply_cap"
+    assert should_reply(_real(ai_replies_today=10, media_only=True),
+                        _settings(**REAL)).reason == "reply_cap"
 
 
 def test_hard_stop_is_what_still_blocks_a_reply_already_written():
@@ -394,10 +413,11 @@ def test_worker_skips_without_calling_the_agent(worker):
     assert worker["twilio"].sent == [] and _finished(worker)[-1][:2] == ("skipped", "staff_took_over")
 
 
-def test_worker_reply_cap_flags_staff(worker):
-    worker["facts"] = [_facts(ai_replies_today=10)]
-    assert _run(worker) == "reply_cap"
-    assert worker["flags"] == [sms_inbound.REVIEW_REPLY_CAP] and worker["twilio"].sent == []
+def test_worker_reply_cap_flags_staff_and_sends_the_closing_text(worker):
+    worker["facts"] = [_real(ai_replies_today=25), _real(ai_replies_today=25)]
+    assert _run(worker, _settings(**REAL, sms_agent_daily_reply_cap=25)) == "reply_cap"
+    assert worker["flags"] == [sms_inbound.REVIEW_REPLY_CAP]
+    assert worker["twilio"].sent == ["<reply_limit>"]
 
 
 def test_worker_puts_the_job_back_while_a_call_is_live(worker):
@@ -551,8 +571,8 @@ def test_an_agent_error_on_a_finished_lead_reaches_staff(worker, lead_row):
 def test_the_reply_cap_on_a_booked_lead_reaches_staff(worker):
     worker["lead_row"] = {"status": "booked", "cadence_state": "completed", "sms_opt_out": False,
                           "sms_disabled": False}
-    worker["facts"] = [_facts(ai_replies_today=10)]
-    assert _run(worker) == "reply_cap"
+    worker["facts"] = [_real(ai_replies_today=25), _real(ai_replies_today=25)]
+    assert _run(worker, _settings(**REAL, sms_agent_daily_reply_cap=25)) == "reply_cap"
     assert [code for code, _ in worker["cards"]] == [sms_inbound.REVIEW_REPLY_CAP]
 
 

@@ -211,6 +211,29 @@ def _is_empty_answer(text: str) -> bool:
     return text.upper().strip(" .") in _EMPTY_ANSWERS
 
 
+# Emma's test (2026-11-11): a failed booking sent our booking_problem text and Elliot's own "I couldn't
+# finish booking that by text, so our front desk will finish setting up your visit." at once. The
+# prompt says to add nothing; these lines are dropped in code too, the rest of his text is kept.
+_BOOKING_PROBLEM_LINE = re.compile(r"\bcouldn'?t (?:finish|complete|make)\b|\bwasn'?t able to (?:finish|"
+                                   r"complete|book)\b|\bunable to (?:finish|complete|book)\b")
+_SENTENCE = re.compile(r"[^.!?\n]+[.!?]*\s*")
+
+
+def booking_problem_sent(actions: list[AgentAction]) -> bool:
+    """This reply already carries the booking_problem text (a failed booking or its hand-off)."""
+    return any(action.result_code in FRONT_DESK_CODES
+               or (action.reason == "booking_problem"
+                   and (action.result_code or "").startswith("HANDED_OFF"))
+               for action in actions)
+
+
+def without_booking_problem_lines(text: str) -> str:
+    """The model's text without sentences that repeat the booking_problem text."""
+    kept = [part for part in _SENTENCE.findall(text or "")
+            if not (_BOOKING_PROBLEM_LINE.search(part.lower()) or promises_front_desk(part))]
+    return "".join(kept).strip()
+
+
 def _finish(sent_first: list[str], text: str, sent_last: list[str],
             actions: list[AgentAction], opted_out: bool = False) -> AgentReply:
     """The texts in sending order: fixed texts, then the model's own (if any), the card last
@@ -803,6 +826,8 @@ def run_agent(*, lead: LeadView, history: list[Turn], tools: AgentTools, now: da
                     answer):
                 # Our question names the time and goes last; the model's own copy would ask twice.
                 answer = ""
+            if booking_problem_sent(actions):
+                answer = without_booking_problem_lines(answer)
             verdict = _check_answer(answer, lead=lead, history=history, actions=actions,
                                     fixed=bool(sent_first or sent_last),
                                     today=now.astimezone(CLINIC_TZ).date(),
@@ -978,7 +1003,7 @@ _DONE_AFTER = {"HANDED_OFF": "hand_off:front_desk", "HANDED_OFF_PAUSED": "hand_o
                "REPORTED_CASE_CHANGE": "case_change"}
 _HAND_OFF_CODES = {"HANDED_OFF", "HANDED_OFF_PAUSED", "ALREADY_HANDED_OFF"}
 # The fixed texts hand_off sends (sms_agent_tools._hand_off_text).
-_HAND_OFF_KEYS = ("front_desk", "english_only", "cancel_visit")
+_HAND_OFF_KEYS = ("front_desk", "english_only", "cancel_visit", "booking_problem")
 
 
 def earlier_in_chat(history: list[Turn], prior_actions: list[Any] | None,

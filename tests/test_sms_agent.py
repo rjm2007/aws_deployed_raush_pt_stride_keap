@@ -890,7 +890,8 @@ def test_a_booking_that_did_not_go_through_hands_off_in_code(bookings):
     reply = run(client, tools, history=YES_TO_CARD)
     assert [name for name, _ in tools.calls] == ["book_visit"] * len(bookings) + ["hand_off"]
     assert tools.calls[-1][1] == {"reason": "booking_problem"}
-    assert reply.texts[0] == "FRONT DESK TEXT" and len(reply.texts) == 2
+    # Emma 2026-11-11: the model's own "I couldn't finish booking..." repeated the fixed text.
+    assert reply.texts == ["FRONT DESK TEXT"]
     # The model's own second hand-off is answered without running it.
     names = [spec["name"] for spec in client.responses.requests[0]["tools"]]
     assert "book_visit" not in names and "hand_off" not in names
@@ -1288,6 +1289,13 @@ def test_a_front_desk_promise_without_a_hand_off_is_rerun_with_a_note():
     client = FakeClient(text(NO_HAND_OFF), calls(("hand_off", {"reason": "booking_problem"})),
                         text(NO_HAND_OFF))
     reply = run(client, FakeTools(hand_off=handed), history=ASKED_NAME)
+    # The booking_problem text already says it (Emma 2026-11-11): his copy is not sent.
+    assert reply.texts == ["FRONT DESK TEXT"] and reply.error is None
+    handed = ToolResult("HANDED_OFF: sent", "hand_off", "card", fixed_texts=["FRONT DESK TEXT"],
+                        action_code="HANDED_OFF_PAUSED", reason="wants_person")
+    client = FakeClient(text(NO_HAND_OFF), calls(("hand_off", {"reason": "wants_person"})),
+                        text(NO_HAND_OFF))
+    reply = run(client, FakeTools(hand_off=handed), history=ASKED_NAME)
     assert reply.texts == ["FRONT DESK TEXT", NO_HAND_OFF] and reply.error is None
 
 
@@ -1300,8 +1308,6 @@ def test_a_second_front_desk_promise_sends_nothing_invented():
     # A hand-off in this run.
     ("hand_off", ToolResult("HANDED_OFF: sent", "hand_off", "c", fixed_texts=["FD"],
                             action_code="HANDED_OFF_PAUSED"), {}, []),
-    # A failed booking's own card (the engine opened it).
-    ("book_visit", ToolResult("FOLLOW_UP: not booked", "book", "f", fixed_texts=["FD"]), {}, []),
     # A review that stops booking: the prompt's own line.
     ("book_visit", ToolResult("REVIEW_OPEN: in review", "book", "r"), {}, []),
     # A callback reported in this run: "our team will call you at 10".
@@ -1321,6 +1327,26 @@ def test_a_true_front_desk_promise_passes(tool, result, lead_update, history_ext
     reply = run(FakeClient(*script, text(answer)), tools,
                 history=[*history_extra, *ASKED_NAME], lead=lead(**lead_update))
     assert answer in reply.texts and reply.error is None
+
+
+@pytest.mark.parametrize("code", ["PATIENT_EXISTS", "FOLLOW_UP", "UNCONFIRMED"])
+def test_a_failed_booking_sends_one_text_not_two(code):
+    # Emma's test 2026-11-11 (PATIENT_EXISTS): the front desk text and Elliot's own "I couldn't finish
+    # booking that by text..." went out together. Only the fixed text goes; another answer stays.
+    failed = ToolResult(f"{code}: not booked", "book", "f", fixed_texts=["BOOKING PROBLEM TEXT"])
+    reply = run(FakeClient(calls(("book_visit", {"date": "2026-11-05", "time": "10:30 AM"})), text(
+        "I couldn't finish booking that by text, so our front desk will finish setting up your "
+        "visit. We're open until 7 PM today.")), FakeTools(book_visit=failed))
+    assert reply.texts == ["BOOKING PROBLEM TEXT", "We're open until 7 PM today."]
+    reply = run(FakeClient(calls(("book_visit", {"date": "2026-11-05", "time": "10:30 AM"})), text(
+        "Sorry, I wasn't able to book that. Our front desk team will reach out to you.")),
+        FakeTools(book_visit=failed))
+    assert reply.texts == ["BOOKING PROBLEM TEXT"] and reply.error is None
+
+
+def test_the_booking_problem_hand_off_sends_its_own_text():
+    assert sms_agent.without_booking_problem_lines("I couldn't finish that. See you!") == "See you!"
+    assert sms_agent.without_booking_problem_lines("Our hours are 7 to 7.") == "Our hours are 7 to 7."
 
 
 # --- eval 2026-11-03 (x-04): never ask for a last name that is on file ---------------------------------

@@ -186,7 +186,7 @@ def _flag(conn, lead_id: str | None, reason: str, code: str, details: dict | Non
 # The texts a tool sends word for word (sms_agent_texts). The worker tells them apart from Elliot's
 # own words by their template: AgentReply carries the texts in sending order only.
 _OTHER_FIXED_KEYS = ("intro", "new_person_intro", "front_desk", "english_only", "text_only",
-                     "unknown_number", "cancel_visit")
+                     "unknown_number", "cancel_visit", "booking_problem", "reply_limit")
 _PLACEHOLDER = re.compile(r"\{[a-z_]+\}")
 _NOT_WORD = re.compile(r"[^0-9a-z]+")
 # A Studio template with almost no fixed words would match anything: not used to recognise texts.
@@ -256,11 +256,11 @@ def process_job(
         facts = sms_inbound.load_facts(conn, job, lead_id, settings)
         decision = sms_inbound.should_reply(facts, settings)
         trace.log("sms_agent_decision", job_id=job_id, action=decision.action, reason=decision.reason)
+        if decision.flag_review:
+            _flag(conn, lead_id, "SMS agent reached today's reply limit for this patient",
+                  sms_inbound.REVIEW_REPLY_CAP,
+                  {"cap": settings.sms_agent_daily_reply_cap})
         if decision.action == "skip":
-            if decision.flag_review:
-                _flag(conn, lead_id, "SMS agent reached today's reply limit for this patient",
-                      sms_inbound.REVIEW_REPLY_CAP,
-                      {"cap": settings.sms_agent_daily_reply_cap})
             _finish(conn, job_id, "skipped", decision.reason)
             return decision.reason
         if decision.action == "retry":

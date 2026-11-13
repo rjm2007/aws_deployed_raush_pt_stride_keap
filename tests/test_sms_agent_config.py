@@ -182,7 +182,7 @@ def test_prompt_keeps_the_eval_fixes():
         "closed Saturday and Sunday",                 # Mission Viejo hours
         "this is Elliot from Rausch Physical Therapy. Could you ask",  # family member
         "Want me to find you a time?",                # new person with a question
-        "our front desk will finish\n     setting up your visit",       # failed booking
+        "write nothing about the booking yourself (NO_REPLY",            # failed booking (Emma 11-11)
     ):
         assert rule in PROMPT, rule
 

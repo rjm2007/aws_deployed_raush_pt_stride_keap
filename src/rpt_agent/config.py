@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     # Texts that arrive within this many seconds of each other get one reply.
     sms_agent_quiet_seconds: int = Field(default=15, ge=0, le=300)
     # A runaway chat (another bot, an auto-reply loop) stops here and goes to staff.
-    sms_agent_daily_reply_cap: int = Field(default=10, ge=1, le=100)
+    sms_agent_daily_reply_cap: int = Field(default=25, ge=1, le=100)
     sms_agent_timeout_seconds: float = Field(default=35.0, ge=5.0, le=120.0)
     sms_agent_max_rounds: int = Field(default=5, ge=1, le=10)
     sms_agent_poll_seconds: float = Field(default=2.0, ge=0.5, le=60.0)
