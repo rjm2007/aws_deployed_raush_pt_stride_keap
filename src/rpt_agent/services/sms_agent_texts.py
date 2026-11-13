@@ -61,13 +61,13 @@ DRAFTS = {
         "Got it, I've passed that to our front desk. Your visit stays booked until they confirm the "
         "change with you. You can also call them at {front_desk_phone}."
     ),
-    # Migration 056 (Emma's test, 2026-11-11: a failed booking sent the front desk text and Elliot's
+    # Migration 057 (Emma's test, 2026-11-11: a failed booking sent the front desk text and Elliot's
     # own "I couldn't finish booking that by text..." at once): one text for every failed booking.
     "booking_problem": (
         "I couldn't finish booking that by text, so our front desk will finish setting up your "
         "visit. You can also call them at {front_desk_phone}."
     ),
-    # Migration 056 (Emma's test, 2026-11-11: at the daily reply limit she got no answer at all).
+    # Migration 057 (Emma's test, 2026-11-11: at the daily reply limit she got no answer at all).
     "reply_limit": (
         "I've passed your messages to our front desk. They'll reach out to you, or you can call "
         "them at {front_desk_phone}."

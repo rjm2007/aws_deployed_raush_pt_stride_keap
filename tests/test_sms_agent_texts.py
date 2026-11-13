@@ -14,7 +14,7 @@ from rpt_agent.services import sms_agent_texts as texts
 MIGRATIONS = Path(__file__).resolve().parents[1] / "supabase" / "migrations"
 # The Studio texts' seeds: 054, and 055 (sms_agent.cancel_visit, 2026-11-07).
 MIGRATION_FILES = ("054_sms_agent.sql", "055_sms_agent_cancel_text.sql",
-                   "056_sms_agent_booking_problem_reply_limit.sql")
+                   "057_sms_agent_booking_problem_reply_limit.sql")
 
 
 class Conn:
