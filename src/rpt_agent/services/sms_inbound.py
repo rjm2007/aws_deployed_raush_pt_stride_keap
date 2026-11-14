@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Literal
+from uuid import uuid4
 
 from ..config import Settings, get_settings
 from .review import REPLACED_REASONS
@@ -76,6 +77,25 @@ limit 1
 def active_lead_id(conn, phone: str) -> str | None:
     row = conn.execute(ACTIVE_LEAD_SQL, {"phone": phone, "replaced": list(REPLACED_REASONS)}).fetchone()
     return str(row["id"]) if row else None
+
+
+# Texts typed in the dashboard test tab as a live test lead (2026-11-14): stored and answered like a
+# real text (hold, limits, booking), but the replies are only saved, never texted. Our tester's
+# Indian phone cannot text the US number, so the tab plays the patient.
+DASHBOARD_TEXT_SID_PREFIX = "dashboard-test:"
+
+
+def dashboard_sid() -> str:
+    return f"{DASHBOARD_TEXT_SID_PREFIX}{uuid4().hex}"
+
+
+def answers_dashboard_text(conn, job_id: int) -> bool:
+    """The newest text this job answers was typed in the dashboard test tab."""
+    row = conn.execute(
+        "select sm.provider_message_id from sms_agent_jobs j join sms_messages sm on sm.id=j.last_inbound_id "
+        "where j.id=%s", (job_id,),
+    ).fetchone()
+    return bool(row and str(row["provider_message_id"] or "").startswith(DASHBOARD_TEXT_SID_PREFIX))
 
 
 # One pending job per phone (migration 054's partial unique index). A new text while it waits

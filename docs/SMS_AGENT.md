@@ -514,6 +514,24 @@ gpt-6.1-sol, gpt-5.4-mini (`TEST_MODELS`); any other model is a 422. Limits: the
 "Start a new chat with the same setup" (a 422 there cannot be retried). A text over max_text_chars is refused
 in words; nothing is trimmed.
 
+### Live test lead (2026-11-14, `services/sms_live_test.py`)
+
+The sandbox cannot show the real system (the cadence hold, several texts answered together, a booking on the
+dashboard), and our tester's Indian phone cannot text the US number. So the tab's third choice plays the patient
+of a real **test** lead (`is_test`, same practice; anything else is a 404):
+- `GET /live/leads` -> the newest 50 test leads with a phone (`id, name, phone_last4, status, status_label,
+  cadence_state, needs_review, created_at`).
+- `POST /live/leads/{id}/texts` `{text}` -> runs the Twilio webhook's own handler (`routes/twilio._handle_inbound_sms`:
+  keywords, stored as a patient text, reply queued) with a `dashboard-test:` sid. 409 if another lead now holds the
+  phone (the text would be filed there) or Elliot is off. Shares the per-user rate limit.
+- `GET /live/leads/{id}/chat` (read only) -> `lead`, the last 200 `messages` (`from_dashboard`), the cadence `steps`
+  (a hold skip has note "patient was texting with Elliot"), Elliot's `actions`, `elliot_typing` (a pending or
+  running job), `hold_until`.
+- The sms-agent-worker saves a reply whose job answers a dashboard text (`sms_inbound.answers_dashboard_text`:
+  the job's newest text) as an `ai` text with status `delivered`, **never texted**. A real text from the phone
+  after it is answered by text as usual. Calls and schedule texts still go to the lead's phone; a booking is
+  real (demo Stride).
+
 ## Rules
 
 - Booking while a review is open (owner, 2026-11-02): any open review stops `confirm_visit` / `book_visit`

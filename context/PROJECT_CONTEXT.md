@@ -3034,3 +3034,16 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
   `test_texting_hold_integration.py` (real schema: 24 h / 10 min holds, other lead on the phone, agent off,
   test-leads-only, 0 = off, Emma's run, a new text restarts the hold, calling hours, opt-outs / review / pause /
   suppression keep their rules, resume).
+
+### 2026-11-14 — SMS agent test tab: live test lead (demo)
+
+- Why: our tester (Yajat) has an Indian phone and cannot text the US number, and the sandbox chat cannot test the
+  real system: the cadence hold while texting, several texts in a row, the booked time on the dashboard.
+- Backend: `GET /live/leads`, `POST /live/leads/{id}/texts`, `GET /live/leads/{id}/chat` on the test chat router
+  (`services/sms_live_test.py`); only `is_test` leads of the actor's practice. A typed text runs the Twilio
+  webhook's own handler with a `dashboard-test:` sid; the sms-agent-worker saves the reply (`ai`, `delivered`) and
+  never texts it. Calls and schedule texts still go to the lead's phone. Details in `docs/SMS_AGENT.md`.
+- Frontend: the tab's third "Who is texting" choice, "Live test lead" (polls the chat, never blocks typing).
+- Tests: `test_sms_inbound.py` (worker never texts a dashboard reply), `test_sms_agent_test_route.py` (off switch,
+  auth), `test_sms_inbound_integration.py` (real schema: three texts one job, reply saved not texted, a real text
+  after it is texted, hold skip shown in the chat, real / other-practice / replaced leads refused).

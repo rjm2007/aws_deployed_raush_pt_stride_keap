@@ -537,3 +537,17 @@ def test_a_birthday_a_year_back_is_accepted_and_the_message_says_why_not(agent):
     response = client.post(REPLY, headers=_headers(),
                            json=_setup(date_of_birth=datetime.now(UTC).date().isoformat()))
     assert response.status_code == 422 and "at least 1 year ago" in response.text
+
+
+@pytest.mark.parametrize("method,path", [
+    ("get", "/api/v1/dashboard/sms-agent-test/live/leads"),
+    ("get", "/api/v1/dashboard/sms-agent-test/live/leads/abc/chat"),
+    ("post", "/api/v1/dashboard/sms-agent-test/live/leads/abc/texts"),
+])
+def test_live_test_lead_routes_follow_the_off_switch_and_auth(monkeypatch, agent, method, path):
+    kwargs = {"json": {"text": "hi"}} if method == "post" else {}
+    assert getattr(client, method)(path, **kwargs).status_code == 401
+    monkeypatch.setenv("SMS_AGENT_TEST_ENABLED", "false")
+    get_settings.cache_clear()
+    response = getattr(client, method)(path, headers=_headers(), **kwargs)
+    assert response.status_code == 404 and "SMS_AGENT_TEST_ENABLED" in response.json()["detail"]

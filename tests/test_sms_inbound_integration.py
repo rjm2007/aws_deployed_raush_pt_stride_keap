@@ -581,3 +581,108 @@ def test_every_sms_messages_insert_names_its_sender():
             if "sender" not in columns.split(","):
                 missing.append(f"{path.name}: {columns}")
     assert missing == []
+
+
+# Live test lead in the dashboard test tab (2026-11-14): the tab plays a real test lead's patient
+# (our tester's Indian phone cannot text the US number). Texts go the webhook's way; replies are
+# saved, never texted.
+
+def _live(db, monkeypatch):
+    from rpt_agent.routes import sms_agent_test
+    from rpt_agent.security import DashboardActor
+
+    monkeypatch.setenv("SMS_AGENT_TEST_ENABLED", "true")
+    get_settings.cache_clear()
+    sms_agent_test.rate_limiter.reset()
+    actor = DashboardActor(user_id="tester", email="", practice_id=db.practice_id)
+    return sms_agent_test, actor
+
+
+def test_live_test_lead_texts_are_answered_in_the_dashboard_never_texted(db, monkeypatch):
+    routes, actor = _live(db, monkeypatch)
+    phone = db.phone()
+    lead = db.lead(phone)
+    body = routes.LiveTextRequest
+    for text in ("hi", "can I book", "next week"):  # several in a row: one job answers them all
+        assert routes.sms_agent_live_text(lead, body(text=text), actor)["ok"]
+    inbound = db.db.execute("select provider_message_id,sender from sms_messages where lead_id=%s "
+                            "and direction='inbound' order by id", (lead,)).fetchall()
+    assert [r["sender"] for r in inbound] == ["patient"] * 3
+    assert all(r["provider_message_id"].startswith(sms_inbound.DASHBOARD_TEXT_SID_PREFIX)
+               for r in inbound)
+    assert len(db.jobs(phone)) == 1
+    chat = routes.sms_agent_live_chat(lead, actor)
+    assert chat["elliot_typing"] and chat["hold_until"] is not None
+    assert [m["from_dashboard"] for m in chat["messages"]] == [True] * 3
+
+    db.agent_replies.append(_Reply(texts=["Happy to help!", "Which day?"]))
+    db.make_due(phone)
+    db.tick()
+    assert db.twilio.sent == []
+    rows = db.ai_rows(lead)
+    assert [r["body"] for r in rows] == ["Happy to help!", "Which day?"]
+    assert {r["delivery_status"] for r in rows} == {"delivered"}
+    assert db.jobs(phone)[-1]["outcome"] == "replied"
+    chat = routes.sms_agent_live_chat(lead, actor)
+    assert not chat["elliot_typing"]
+    assert [m["sender"] for m in chat["messages"]] == ["patient"] * 3 + ["ai"] * 2
+
+
+def test_a_real_text_after_a_dashboard_one_is_answered_by_text(db, monkeypatch):
+    routes, actor = _live(db, monkeypatch)
+    phone = db.phone()
+    lead = db.lead(phone)
+    routes.sms_agent_live_text(lead, routes.LiveTextRequest(text="hi"), actor)
+    db.text(phone, "from my phone")
+    db.make_due(phone)
+    db.tick()
+    assert [body for _, body in db.twilio.sent] == ["Hi from Elliot"]
+
+
+def test_live_text_holds_the_cadence_like_a_real_text(db, monkeypatch):
+    from rpt_agent.worker import TEXTING_HOLD_REASON, skip_steps_held_by_texting
+
+    routes, actor = _live(db, monkeypatch)
+    phone = db.phone()
+    lead = db.lead(phone)
+    step = db.db.execute(
+        "insert into outreach_events(lead_id,attempt_no,channel,status,scheduled_for) "
+        "values(%s,1,'call','planned',now()-interval '1 second') returning id", (lead,)).fetchone()["id"]
+    routes.sms_agent_live_text(lead, routes.LiveTextRequest(text="hi"), actor)
+    skip_steps_held_by_texting(db.db, get_settings())
+    row = db.db.execute("select status,failure_reason from outreach_events where id=%s",
+                        (step,)).fetchone()
+    assert (row["status"], row["failure_reason"]) == ("skipped", TEXTING_HOLD_REASON)
+    steps = routes.sms_agent_live_chat(lead, actor)["steps"]
+    assert [(s["status"], s["note"]) for s in steps] == [("skipped", TEXTING_HOLD_REASON)]
+
+
+def test_live_test_lead_refuses_real_leads_other_practices_and_replaced_leads(db, monkeypatch):
+    from fastapi import HTTPException
+
+    routes, actor = _live(db, monkeypatch)
+    real = db.lead(db.phone(), is_test=False)
+    for call in (lambda: routes.sms_agent_live_text(real, routes.LiveTextRequest(text="hi"), actor),
+                 lambda: routes.sms_agent_live_chat(real, actor),
+                 lambda: routes.sms_agent_live_chat(str(uuid4()), actor),
+                 lambda: routes.sms_agent_live_chat("not-a-uuid", actor)):
+        with pytest.raises(HTTPException) as refused:
+            call()
+        assert refused.value.status_code == 404
+    other = types.SimpleNamespace(**{**vars(actor), "practice_id": actor.practice_id + 10_000})
+    test_lead = db.lead(db.phone())
+    with pytest.raises(HTTPException) as refused:
+        routes.sms_agent_live_chat(test_lead, other)
+    assert refused.value.status_code == 404
+    listed = {row["id"] for row in routes.sms_agent_live_leads(actor)["leads"]}
+    assert test_lead in listed and real not in listed
+
+    phone = db.phone()
+    old = db.lead(phone, created_at="2026-01-01T00:00:00Z")
+    new = db.lead(phone)
+    with pytest.raises(HTTPException) as refused:
+        routes.sms_agent_live_text(old, routes.LiveTextRequest(text="hi"), actor)
+    assert refused.value.status_code == 409
+    assert routes.sms_agent_live_text(new, routes.LiveTextRequest(text="hi"), actor)["ok"]
+    assert db.db.execute("select count(*) as n from sms_messages where lead_id=%s",
+                         (old,)).fetchone()["n"] == 0

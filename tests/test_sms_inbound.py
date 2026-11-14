@@ -406,6 +406,17 @@ def test_worker_sends_the_agents_texts_as_ai_and_records_the_actions(worker):
     assert _finished(worker)[-1][:2] == ("done", "replied")
 
 
+def test_worker_saves_a_reply_to_a_dashboard_text_without_texting_it(worker, monkeypatch):
+    # Live test lead in the test tab (2026-11-14): the tester plays the patient in the dashboard.
+    monkeypatch.setattr(sms_inbound, "answers_dashboard_text", lambda conn, job_id: True)
+    worker["reply"] = _Reply(texts=["Happy to help!"])
+    assert _run(worker) == "replied"
+    assert worker["twilio"].sent == []
+    inserts = [p for sql, p in worker["log"] if "insert into sms_messages" in sql]
+    assert len(inserts) == 1 and inserts[0][2].startswith(sms_inbound.DASHBOARD_TEXT_SID_PREFIX)
+    assert inserts[0][3] == "delivered"
+
+
 def test_worker_skips_without_calling_the_agent(worker):
     worker["facts"] = [_facts(staff_texted_recently=True)]
     worker["reply"] = AssertionError("the agent must not run")

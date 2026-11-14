@@ -351,11 +351,14 @@ def process_job(
         if not texts:
             _finish(conn, job_id, "done", sms_inbound.OUTCOME_NO_REPLY)
             return sms_inbound.OUTCOME_NO_REPLY
+        dashboard = sms_inbound.answers_dashboard_text(conn, job_id)
 
     last_id = None
     for index, body in enumerate(texts):
         try:
-            sid = _send(trace, providers, job["phone_e164"], body)
+            # A reply to a text typed in the dashboard test tab is saved, never texted.
+            sid = (sms_inbound.dashboard_sid() if dashboard
+                   else _send(trace, providers, job["phone_e164"], body))
         except ProviderError as exc:
             booked_unsent = any(text in booked_texts for text in texts[index:])
             with transaction() as conn:
@@ -372,10 +375,10 @@ def process_job(
         # Each text is recorded as soon as it is sent, so a crash never loses one that went out.
         with transaction() as conn:
             row = conn.execute(
-                "insert into sms_messages(lead_id,direction,body,occurred_at,delivery_status,"
-                "provider_message_id,sender) values(%s,'outbound',%s,now(),'queued',%s,'ai') "
+                "insert into sms_messages(lead_id,direction,body,occurred_at,provider_message_id,"
+                "delivery_status,sender) values(%s,'outbound',%s,now(),%s,%s,'ai') "
                 "on conflict(provider_message_id) do nothing returning id",
-                (lead_id, body, sid),
+                (lead_id, body, sid, "delivered" if dashboard else "queued"),
             ).fetchone()
             last_id = row["id"] if row else last_id
     with transaction() as conn:

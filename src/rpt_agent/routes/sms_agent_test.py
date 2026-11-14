@@ -3,6 +3,10 @@
 A stateless sandbox: the browser sends the made-up lead, the chat so far and the new text; the agent
 answers with SandboxTools. Nothing here writes to the database or sends a text: chats live only in the
 viewer's browser, so the route stays a thin pass-through to services.sms_agent.reply_sandbox.
+
+The one exception is a live test lead (`/live/...`, 2026-11-14, services/sms_live_test.py): the tab
+plays a real test lead's patient, so its texts are stored and answered like Twilio's; Elliot's
+replies are saved, never texted.
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ from ..config import get_settings
 from ..db import transaction
 from ..observability import WorkflowTrace, trace_id_var
 from ..security import DashboardActor, require_dashboard_auth
+from ..services import sms_inbound, sms_live_test
+from .twilio import _handle_inbound_sms
 
 router = APIRouter(prefix="/api/v1/dashboard/sms-agent-test", tags=["dashboard"])
 Actor = Annotated[DashboardActor, Depends(require_dashboard_auth)]
@@ -379,3 +385,79 @@ def sms_agent_test_reply(payload: ReplyRequest, actor: Actor):
     return ReplyResponse(
         texts=list(reply.texts), actions=actions, no_reply=bool(reply.no_reply), model=model, ms=ms
     )
+
+
+_STATUS_LABELS = dict(LEAD_STATUSES)
+
+
+class LiveTextRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=MAX_TEXT_CHARS)
+
+    _text = field_validator("text")(_plain_text)
+
+
+def _live_lead(conn, actor: DashboardActor, lead_id: str) -> dict:
+    lead = sms_live_test.test_lead(conn, actor.practice_id, lead_id)
+    if not lead:
+        # Only test leads: a real patient's chat is never played from here.
+        raise HTTPException(status_code=404, detail="Test lead not found.")
+    return lead
+
+
+@router.get("/live/leads")
+def sms_agent_live_leads(actor: Actor):
+    _require_enabled()
+    with transaction() as conn:
+        conn.execute("set transaction read only")
+        rows = sms_live_test.test_leads(conn, actor.practice_id)
+    return {"leads": [
+        {"id": str(row["id"]), "name": row["full_name"], "phone_last4": row["phone_last4"],
+         "status": row["status"], "status_label": _STATUS_LABELS.get(row["status"], row["status"]),
+         "cadence_state": row["cadence_state"], "needs_review": bool(row["needs_review"]),
+         "created_at": row["created_at"]}
+        for row in rows
+    ]}
+
+
+@router.get("/live/leads/{lead_id}/chat")
+def sms_agent_live_chat(lead_id: str, actor: Actor):
+    _require_enabled()
+    with transaction() as conn:
+        conn.execute("set transaction read only")
+        lead = _live_lead(conn, actor, lead_id)
+        data = sms_live_test.chat(conn, lead, get_settings())
+    info = data["lead"]
+    data["lead"] = {
+        "id": str(info["id"]), "name": info["full_name"], "status": info["status"],
+        "status_label": _STATUS_LABELS.get(info["status"], info["status"]),
+        "cadence_state": info["cadence_state"], "needs_review": bool(info["needs_review"]),
+        "review_reason": info["review_reason"],
+    }
+    return data
+
+
+@router.post("/live/leads/{lead_id}/texts")
+def sms_agent_live_text(lead_id: str, payload: LiveTextRequest, actor: Actor):
+    _require_enabled()
+    settings = get_settings()
+    if not settings.sms_agent_enabled:
+        raise HTTPException(status_code=409, detail="Elliot is turned off (SMS_AGENT_ENABLED).")
+    if not rate_limiter.allow(actor.user_id, settings.sms_agent_test_requests_per_minute):
+        raise HTTPException(status_code=429, detail="Too many test messages. Wait a minute and try again.",
+                            headers={"Retry-After": "60"})
+    with transaction() as conn:
+        lead = _live_lead(conn, actor, lead_id)
+        phone = lead["phone_e164"]
+        # The text is filed under the phone's active lead, as a real one would be.
+        if sms_inbound.active_lead_id(conn, phone) != str(lead["id"]):
+            raise HTTPException(status_code=409, detail="Another lead now uses this phone number, so "
+                                "texts would go to that lead. Pick the newest lead for this number.")
+    trace = WorkflowTrace("sms_agent_live_test", "api", trace_id_var.get())
+    trace.log("request_parsed", actor_id=actor.user_id, lead_id=str(lead["id"]))
+    sid = sms_inbound.dashboard_sid()
+    # The same path as Twilio's inbound webhook: keywords, storing, queueing the reply.
+    _handle_inbound_sms(trace, phone, payload.text, sid)
+    with transaction() as conn:
+        row = conn.execute("select id from sms_messages where provider_message_id=%s", (sid,)).fetchone()
+    trace.complete()
+    return {"ok": True, "message_id": row["id"] if row else None}
