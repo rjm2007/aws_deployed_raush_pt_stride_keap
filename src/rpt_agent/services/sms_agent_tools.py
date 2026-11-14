@@ -911,7 +911,7 @@ class _BaseTools:
     def _hand_off_text(self, reason: str) -> str:
         with self._conn() as conn:
             key = {"other_language": "english_only", "cancel_visit": "cancel_visit",
-                   "booking_problem": "booking_problem"}
+                   "booking_problem": "booking_problem", "insurance": "insurance"}
             return self._render(conn, key.get(reason, "front_desk"))
 
     @staticmethod

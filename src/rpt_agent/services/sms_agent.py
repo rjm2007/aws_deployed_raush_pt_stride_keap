@@ -234,6 +234,31 @@ def without_booking_problem_lines(text: str) -> str:
     return "".join(kept).strip()
 
 
+# Hand-off reasons that send the general front desk text (sms_agent_tools._hand_off_text).
+_GENERAL_HAND_OFFS = {"wants_person", "unknown_question", "other", "different_case"}
+
+
+@dataclass
+class _HandOffTexts:
+    general: set[str] = field(default_factory=set)  # general front desk texts in this reply
+    insurance: bool = False                          # the insurance text is in this reply
+
+
+def _add_fixed(bucket: list[str], result: ToolResult, seen: _HandOffTexts) -> None:
+    """Add a tool's fixed texts to the reply. Emma's retest (2026-11-13): "Can I talk to someone at
+    the front desk" and "What insurance do you take" got one general front desk text, so the
+    insurance question looked unanswered. The insurance text names it and also says the front desk
+    will reach out, so it stands in for the general text in the same reply."""
+    if result.kind == "hand_off" and result.reason == "insurance":
+        bucket[:] = [text for text in bucket if text not in seen.general]
+        seen.insurance = True
+    elif result.kind == "hand_off" and result.reason in _GENERAL_HAND_OFFS:
+        if seen.insurance:
+            return
+        seen.general.update(result.fixed_texts)
+    bucket.extend(text for text in result.fixed_texts if text not in bucket)
+
+
 def _finish(sent_first: list[str], text: str, sent_last: list[str],
             actions: list[AgentAction], opted_out: bool = False) -> AgentReply:
     """The texts in sending order: fixed texts, then the model's own (if any), the card last
@@ -731,6 +756,7 @@ def run_agent(*, lead: LeadView, history: list[Turn], tools: AgentTools, now: da
     actions: list[AgentAction] = []
     sent_first: list[str] = []
     sent_last: list[str] = []
+    hand_off_texts = _HandOffTexts()
     opted_out = False
     try:
         client = client or default_client(settings)
@@ -768,8 +794,7 @@ def run_agent(*, lead: LeadView, history: list[Turn], tools: AgentTools, now: da
     for step in steps:
         actions.append(AgentAction(kind=step.kind, summary=step.summary,
                                    result_code=step.action_code or step.code, reason=step.reason))
-        bucket = sent_last if step.send_last else sent_first
-        bucket.extend(text for text in step.fixed_texts if text not in bucket)
+        _add_fixed(sent_last if step.send_last else sent_first, step, hand_off_texts)
     if steps:
         items.append({"role": "developer", "content": CODE_STEP_NOTE.format(
             steps="\n".join(f"- {_TOOL_OF_KIND.get(step.kind, step.kind)} -> {step.output}"
@@ -884,8 +909,7 @@ def run_agent(*, lead: LeadView, history: list[Turn], tools: AgentTools, now: da
                                        result_code=result.action_code or result.code,
                                        reason=result.reason))
             opted_out = opted_out or result.opted_out
-            bucket = sent_last if result.send_last else sent_first
-            bucket.extend(text for text in result.fixed_texts if text not in bucket)
+            _add_fixed(sent_last if result.send_last else sent_first, result, hand_off_texts)
             items.append({"type": "function_call_output", "call_id": _get(call, "call_id"),
                           "output": result.output})
     return failed("round_cap")  # not reached: the last round offers no tools
@@ -1003,7 +1027,7 @@ _DONE_AFTER = {"HANDED_OFF": "hand_off:front_desk", "HANDED_OFF_PAUSED": "hand_o
                "REPORTED_CASE_CHANGE": "case_change"}
 _HAND_OFF_CODES = {"HANDED_OFF", "HANDED_OFF_PAUSED", "ALREADY_HANDED_OFF"}
 # The fixed texts hand_off sends (sms_agent_tools._hand_off_text).
-_HAND_OFF_KEYS = ("front_desk", "english_only", "cancel_visit", "booking_problem")
+_HAND_OFF_KEYS = ("front_desk", "english_only", "cancel_visit", "booking_problem", "insurance")
 
 
 def earlier_in_chat(history: list[Turn], prior_actions: list[Any] | None,

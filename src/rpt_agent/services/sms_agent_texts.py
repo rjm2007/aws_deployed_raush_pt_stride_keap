@@ -22,7 +22,7 @@ from ..config import Settings, get_settings
 
 PREFIX = "sms_agent."
 KEYS = ("intro", "new_person_intro", "booked", "front_desk", "english_only", "text_only",
-        "unknown_number", "cancel_visit", "booking_problem", "reply_limit")
+        "unknown_number", "cancel_visit", "booking_problem", "reply_limit", "insurance")
 
 # The same drafts as migration 054 (kept equal by tests/test_sms_agent_texts.py).
 DRAFTS = {
@@ -71,6 +71,12 @@ DRAFTS = {
     "reply_limit": (
         "I've passed your messages to our front desk. They'll reach out to you, or you can call "
         "them at {front_desk_phone}."
+    ),
+    # Migration 058 (Emma's retest, 2026-11-13: "What insurance do you take" got the general front desk
+    # text, which never names insurance, so the question looked unanswered).
+    "insurance": (
+        "Our front desk can answer your insurance question. You can call them at {front_desk_phone}, "
+        "or they'll reach out to you as soon as they're available."
     ),
     "unknown_number": (
         "Hi, this is Rausch Physical Therapy! You can book your first visit online here: "

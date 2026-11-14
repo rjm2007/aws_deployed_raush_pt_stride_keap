@@ -355,7 +355,8 @@ def test_hand_off_opens_the_sms_front_desk_card_and_staff_can_resolve_it(env):
     tools = env.live(lead_id, [], job_id=7)
     result = call_tool(tools, "hand_off", {"reason": "insurance", "notes": "asked about Aetna"})
     assert result.code == "HANDED_OFF"
-    assert result.fixed_texts == [texts.render(None, "front_desk")]
+    # Its own text since Emma's retest (2026-11-13): the general one never named insurance.
+    assert result.fixed_texts == [texts.render(None, "insurance")]
     lead = env.one("select status,cadence_state,needs_review from leads where id=%s", lead_id)
     assert lead == {"status": "needs_attention", "cadence_state": "paused", "needs_review": True}
     review = env.one("select code,source,details from lead_reviews where lead_id=%s", lead_id)

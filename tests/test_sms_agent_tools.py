@@ -1144,6 +1144,19 @@ def test_cancel_visit_sends_its_own_text_and_keeps_booking_open():
     assert "stays booked" in text and "(949) 276-5401" in text
 
 
+def test_insurance_sends_its_own_text():
+    """Emma's retest, 2026-11-13: the general front desk text never named insurance."""
+    tools = SandboxTools(WorkflowTrace("test", "test"), lead=lead(), history=ANSWERED,
+                         practice_id=1, now_local=None)
+    tools._conn = lambda: nullcontext(None)
+    tools._render = lambda conn, key, **values: f"TEXT:{key}"
+    handed = call_tool(tools, "hand_off", {"reason": "insurance"})
+    assert handed.code == "HANDED_OFF" and handed.fixed_texts == ["TEXT:insurance"]
+    text = texts.render(None, "insurance", settings=get_settings().model_copy(
+        update={"clinic_front_desk_phone": "(949) 276-5401"}))
+    assert "insurance question" in text and "(949) 276-5401" in text
+
+
 def test_already_handed_off_gives_the_number_when_asked():
     """Yajat's test, 2026-11-05: "I want to talk to the front desk" after a hand-off got "Our front
     desk already has your request" without the number."""

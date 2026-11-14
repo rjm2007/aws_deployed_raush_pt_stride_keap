@@ -186,7 +186,8 @@ def _flag(conn, lead_id: str | None, reason: str, code: str, details: dict | Non
 # The texts a tool sends word for word (sms_agent_texts). The worker tells them apart from Elliot's
 # own words by their template: AgentReply carries the texts in sending order only.
 _OTHER_FIXED_KEYS = ("intro", "new_person_intro", "front_desk", "english_only", "text_only",
-                     "unknown_number", "cancel_visit", "booking_problem", "reply_limit")
+                     "unknown_number", "cancel_visit", "booking_problem", "reply_limit",
+                     "insurance")
 _PLACEHOLDER = re.compile(r"\{[a-z_]+\}")
 _NOT_WORD = re.compile(r"[^0-9a-z]+")
 # A Studio template with almost no fixed words would match anything: not used to recognise texts.

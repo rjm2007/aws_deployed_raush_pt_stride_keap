@@ -1329,6 +1329,32 @@ def test_a_true_front_desk_promise_passes(tool, result, lead_update, history_ext
     assert answer in reply.texts and reply.error is None
 
 
+class HandOffTools(FakeTools):
+    """hand_off answers like the real tools: the general front desk text, or insurance's own."""
+
+    def hand_off(self, *, reason, notes=None):
+        self.calls.append(("hand_off", {"reason": reason}))
+        text = "INSURANCE TEXT" if reason == "insurance" else "FRONT DESK TEXT"
+        return ToolResult("HANDED_OFF: sent", "hand_off", "card", fixed_texts=[text],
+                          action_code="HANDED_OFF", reason=reason)
+
+
+@pytest.mark.parametrize("order", [("wants_person", "insurance"), ("insurance", "wants_person")])
+def test_the_insurance_text_stands_in_for_the_general_front_desk_text(order):
+    # Emma's retest 2026-11-13: "Can I talk to someone at the front desk" + "What insurance do you
+    # take" got one general front desk text, so the insurance question looked unanswered.
+    client = FakeClient(calls(*[("hand_off", {"reason": reason}) for reason in order]),
+                        text("Our Laguna Niguel office is at 30100 Town Center Drive."))
+    reply = run(client, HandOffTools())
+    assert reply.texts == ["INSURANCE TEXT", "Our Laguna Niguel office is at 30100 Town Center Drive."]
+
+
+def test_a_general_hand_off_alone_keeps_the_general_text():
+    reply = run(FakeClient(calls(("hand_off", {"reason": "wants_person"})), text("NO_REPLY")),
+                HandOffTools())
+    assert reply.texts == ["FRONT DESK TEXT"]
+
+
 @pytest.mark.parametrize("code", ["PATIENT_EXISTS", "FOLLOW_UP", "UNCONFIRMED"])
 def test_a_failed_booking_sends_one_text_not_two(code):
     # Emma's test 2026-11-11 (PATIENT_EXISTS): the front desk text and Elliot's own "I couldn't finish
