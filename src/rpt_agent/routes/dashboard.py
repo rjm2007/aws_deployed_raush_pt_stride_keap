@@ -57,7 +57,7 @@ from ..services.sheet_direct import label_result, pt_clock
 from ..services.sheet_sync import enqueue_sheet_update
 from ..services.stride_sync_status import stride_sync_status
 from ..services.twilio_service import TwilioService
-from ..worker import format_phone, materialize_cadence, next_due_soon
+from ..worker import TEXTING_HOLD_REASON, format_phone, materialize_cadence, next_due_soon
 
 router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
 Actor = Annotated[DashboardActor, Depends(require_dashboard_auth)]
@@ -558,11 +558,24 @@ def _build_activity(audits, events, status_history, appointments, reviews=(),
     already_booked_at = {row["changed_at"] for row in status_history
                          if str(row.get("reason") or "").startswith(ALREADY_BOOKED_REASON)}
     for event in events:
+        is_call = event["channel"] == "call"
+        # A step skipped because the patient was texting with Elliot has no other line (2026-11-13).
+        if event["status"] == "skipped" and event.get("step_reason") == TEXTING_HOLD_REASON:
+            entries.append(_activity_entry(
+                entry_id=f"outreach-{event['id']}",
+                action="outreach.skipped",
+                occurred_at=event.get("updated_at") or event.get("scheduled_for"),
+                actor_type="automation",
+                actor_name=SYSTEM,
+                category="calls" if is_call else "messages",
+                title=f"{'Call' if is_call else 'Text'} skipped: {TEXTING_HOLD_REASON}",
+                details={"cadence": event.get("cadence_version_name"), "step": event.get("description")},
+            ))
+            continue
         # planned: not done yet. skipped: a step cancelled by another event (booked, restart, ...),
         # which has its own line.
         if event["status"] in {"planned", "skipped"}:
             continue
-        is_call = event["channel"] == "call"
         if is_call and event.get("settled_at") and event.get("outcome"):
             call_settled_at.add(event["settled_at"])
         # A text's carrier status (sms_messages) is the honest one; the step's own 'delivered' only
@@ -1197,7 +1210,7 @@ def dashboard_lead(lead_id: UUID, actor: Actor):
             # text the patient never received.
             "select oe.id,oe.cadence_step_id,oe.cadence_version_id,oe.channel,oe.day_offset,"
             "oe.status,oe.scheduled_for,oe.created_at,oe.executed_at,oe.settled_at,oe.outcome,"
-            "cs.description,"
+            "oe.updated_at,oe.failure_reason as step_reason,cs.description,"
             "cv.name as cadence_version_name,"
             "(select count(*) from cadence_steps expected "
             "where expected.cadence_version_id=oe.cadence_version_id and expected.is_active) "

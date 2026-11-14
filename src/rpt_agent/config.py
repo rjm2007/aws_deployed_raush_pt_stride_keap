@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     # Staff texting a patient from the dashboard takes over: no AI reply to that lead for this long.
     sms_agent_staff_quiet_hours: int = Field(default=24, ge=1, le=720)
     sms_agent_test_requests_per_minute: int = Field(default=30, ge=1, le=120)
+    # Emma's test (2026-11-13): after a patient texts us, the cadence skips that lead's calls and texts
+    # that come due for this long (each new text starts it again), while Elliot answers the lead.
+    # TEST_MODE test leads use the minutes (24 compressed hours = 24 minutes). 0 = no hold.
+    cadence_hold_after_text_hours: int = Field(default=24, ge=0, le=720)
+    cadence_hold_after_text_test_minutes: int = Field(default=10, ge=0, le=1440)
     clinic_front_desk_phone: str = "(949) 276-5401"
     dashboard_public_url: str = ""
     # The Google Sheet is the only way leads come in (client, 2026-10-15): the dashboard's "Add

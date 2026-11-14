@@ -3008,3 +3008,29 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
 - Tests: `test_appointment_views.py`, `test_dashboard.py`, `test_dashboard_calendar.py`,
   `test_appointment_views_integration.py` (`test_each_visit_and_open_time_is_in_its_clinics_own_zone`),
   `test_lead_list_integration.py`.
+
+### 2026-11-14 — A patient's text holds the cadence while Elliot answers (client's option A; demo)
+
+- Why (Emma's test, 2026-11-13): a test lead texted "Yes" two minutes after it was created and kept chatting with
+  Elliot, but the Day 3 call, Day 5 call and Day 5 text still went out within five minutes, and Elliot's replies
+  waited 2-4 minutes behind each call (`call_in_progress` retry, unchanged).
+- `worker.py`: `skip_steps_held_by_texting()` runs `TEXTING_HOLD_SQL` in `claim_jobs`, just before `CLAIM_SQL` in
+  the same transaction. A planned step that is due while the patient texted us within the hold (an inbound
+  `sms_messages` row on any lead with the same phone) is set `skipped` with `failure_reason` "patient was texting
+  with Elliot": never sent later, so nothing bunches up; later steps go out on their normal times; every new
+  text starts the hold again. Only while Elliot answers the lead (`SMS_AGENT_ENABLED`, and
+  `SMS_AGENT_TEST_LEADS_ONLY` off or an `is_test` lead); without the agent nothing changes. A step held back by a
+  pause, a review, an opt-out, calls only, a closed status or a suppressed number keeps its own rule and reason;
+  calling hours still apply after the hold. Resume restores only pause skips, so held steps stay skipped; restart
+  deletes them as before. `CLAIM_SQL` / `ELIGIBLE_SQL` / `next_due_soon` are unchanged.
+- Settings: `CADENCE_HOLD_AFTER_TEXT_HOURS` (default 24, real leads) and `CADENCE_HOLD_AFTER_TEXT_TEST_MINUTES`
+  (default 10, `TEST_MODE` test leads: 24 compressed hours would be 24 minutes). 0 turns that hold off.
+- Dashboard: the lead's events carry `step_reason` (the step's `failure_reason`) and `updated_at`; Activity shows
+  "Call skipped: patient was texting with Elliot" / "Text skipped: ..." (System) at the time it was skipped. Other
+  skips stay hidden as before.
+- Known effect: if the hold skips a lead's last steps, the sweeper closes the lead as "no response" as for any
+  finished cadence (Elliot still answers closed leads).
+- Tests: `test_worker.py` (SQL, settings, order before the claim), `test_dashboard.py` (Activity line),
+  `test_texting_hold_integration.py` (real schema: 24 h / 10 min holds, other lead on the phone, agent off,
+  test-leads-only, 0 = off, Emma's run, a new text restarts the hold, calling hours, opt-outs / review / pause /
+  suppression keep their rules, resume).

@@ -36,6 +36,7 @@ Optional suites, skipped by default:
 | `test_keap_sync_worker.py`, `test_keap_sync_integration.py` | keap-worker commits new keap_sync rows before planning and `mark_booked` locks `for no key update` (a booking waited 58 s behind the hourly plan, 2026-10-26); Keap phase 2B sync against a real schema and `fake_keap` |
 | `test_live_column_types_integration.py` | Sheet paths on the live text types of `lead_action_requests` |
 | `test_lead_list_integration.py` | Leads page on a real schema: `STAGE_SQL` equals `stage_of()` for every status x cadence state x review x events combination, list paging / search / owner / location / source and Stride rows (unlinked patients only, view only), board per-column totals and paging, snapshot counts, owners and leads-created-per-day over every lead and old flagged leads kept; `test_dashboard.py` checks bad lead-list / lead-board input is a 422 |
+| `test_texting_hold_integration.py` | A patient's text holds the cadence while Elliot answers (2026-11-13, real schema): 24 h / 10 min test holds, another lead on the phone, agent off / test-leads-only / 0 = no hold, held steps never sent later, a new text restarts it, calling hours, opt-outs / review / pause / suppression keep their rules, resume |
 | `test_security.py` | Dashboard headers, HMAC, Vapi/Twilio auth |
 | `test_api_contract.py`, `test_vapi_contract.py`, `test_vapi_tool_config.py` | HTTP and Vapi tool contracts |
 | `test_availability_offers.py`, `test_providers.py`, `test_mock_server.py` | Booking slots, provider clients, mocks |

@@ -1771,3 +1771,25 @@ def test_already_booked_close_is_named_on_the_card_and_in_activity():
     assert titles == ["Call: already booked or already a patient"]
     titles = [e["title"] for e in dashboard_routes._build_activity([], [call], [], [])]
     assert titles == ["Call: not interested"]
+
+
+def test_a_step_skipped_while_the_patient_texted_has_its_own_activity_line():
+    """Emma's test (2026-11-13): a held step shows why it was not sent; other skips stay hidden."""
+    from datetime import UTC, datetime
+
+    from rpt_agent.worker import TEXTING_HOLD_REASON
+
+    at = datetime(2026, 11, 13, 12, 34, tzinfo=UTC)
+    events = [
+        {"id": 1, "channel": "call", "status": "skipped", "step_reason": TEXTING_HOLD_REASON,
+         "updated_at": at, "created_at": at, "description": "Day 3 call"},
+        {"id": 2, "channel": "sms", "status": "skipped", "step_reason": TEXTING_HOLD_REASON,
+         "updated_at": at, "created_at": at, "description": "Day 5 text"},
+        {"id": 3, "channel": "call", "status": "skipped", "step_reason": "paused_for_review",
+         "updated_at": at, "created_at": at},
+    ]
+    activity = dashboard_routes._build_activity([], events, [], [])
+    assert [(e["title"], e["category"], e["occurred_at"]) for e in activity] == [
+        ("Call skipped: patient was texting with Elliot", "calls", at),
+        ("Text skipped: patient was texting with Elliot", "messages", at),
+    ]
