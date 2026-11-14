@@ -346,6 +346,53 @@ from due where oe.id=due.id
 """
 
 
+# Emma's test (2026-11-13): the cadence kept calling and texting a patient while she was texting with
+# Elliot (Day 3 call, Day 5 call and text within 5 minutes of her "Yes"), and his replies waited
+# behind each call. Client's option A: after the patient texts us (an inbound text to any lead on
+# the phone), a step that comes due during the hold is skipped, never sent later, so nothing bunches
+# up; later steps go out on their normal times; every new text starts the hold again. Only while
+# Elliot answers this lead (SMS_AGENT_ENABLED, and SMS_AGENT_TEST_LEADS_ONLY off or a test lead):
+# without the agent a text must never pause the cadence silently. Runs just before CLAIM_SQL in
+# the same transaction, so a held step is never claimed. The same lead rules as ELIGIBLE_SQL: a
+# step held back by a pause, a review, an opt-out, calls only or a suppressed number keeps its own
+# reason (those rules still win).
+TEXTING_HOLD_REASON = "patient was texting with Elliot"
+TEXTING_HOLD_SQL = """
+update outreach_events oe set status='skipped',failure_reason=%(reason)s,updated_at=now()
+from leads l
+where l.id=oe.lead_id and oe.status='planned' and oe.scheduled_for<=now()
+ and l.cadence_state='active' and not l.needs_review
+ and l.status not in ('booked','declined','do_not_contact','invalid_phone')
+ and ((oe.channel='call' and not l.call_opt_out)
+      or (oe.channel='sms' and not l.sms_opt_out and not l.sms_disabled))
+ and not exists(select 1 from suppressed_numbers s where s.phone_e164=l.phone_e164)
+ and (%(all_leads)s or l.is_test)
+ and exists(
+   select 1 from sms_messages sm join leads peer on peer.id=sm.lead_id
+   where peer.phone_e164=l.phone_e164 and sm.direction='inbound'
+   and sm.occurred_at > now() - case when %(test_mode)s and l.is_test
+                                     then %(test_hold)s::interval else %(hold)s::interval end
+ )
+returning oe.id,oe.lead_id,oe.channel,oe.day_offset
+"""
+
+
+def skip_steps_held_by_texting(conn, settings=None) -> list[dict]:
+    """Skip the due steps of leads whose patient texted us within the hold (see above)."""
+    settings = settings or get_settings()
+    hold = timedelta(hours=settings.cadence_hold_after_text_hours)
+    test_hold = timedelta(minutes=settings.cadence_hold_after_text_test_minutes)
+    if not settings.sms_agent_enabled or not (hold or test_hold):
+        return []
+    return conn.execute(TEXTING_HOLD_SQL, {
+        "reason": TEXTING_HOLD_REASON,
+        "all_leads": not settings.sms_agent_test_leads_only,
+        "test_mode": settings.test_mode,
+        "hold": hold,
+        "test_hold": test_hold,
+    }).fetchall()
+
+
 # A restart must not race a step that is about to go out (owner, 2026-10-26): a Sheet Restart
 # picked the same seconds a Day-5 call was claimed gave the patient two calls 30 s apart.
 RESTART_DUE_WINDOW = timedelta(minutes=5)
@@ -389,6 +436,9 @@ def claim_jobs(trace: WorkflowTrace, limit: int = 20) -> list[Job]:
         # Migration 025 permits only workers that identify with this claim protocol.
         # Stale deployments are unable to move planned outreach to in_flight.
         conn.execute("select set_config('rpt.worker_claim_protocol','v1',true)")
+        held = skip_steps_held_by_texting(conn)
+        if held:
+            trace.log("outreach_held_while_texting", skipped=len(held))
         rows = conn.execute(
             CLAIM_SQL, {"limit": limit, "test_mode": get_settings().test_mode}
         ).fetchall()

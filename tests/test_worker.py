@@ -402,3 +402,85 @@ def test_a_refused_text_becomes_a_text_review_with_twilios_code():
     call = Job(10, "lead-1", "call", "+15550000000", "Asha", None, None, 3, None, None)
     assert _dispatch_review(call, "failed", "vapi returned HTTP 400")["code"] == "call_failed"
     assert _dispatch_review(call, "unknown", "timed out")["code"] == "dispatch_unconfirmed"
+
+
+class _HoldConn:
+    def __init__(self):
+        self.calls = []
+
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
+        conn = self
+
+        class _Rows:
+            def fetchall(self):
+                return [{"id": 1}] if "set status='skipped'" in conn.calls[-1][0] else []
+
+            def fetchone(self):
+                return None
+
+        return _Rows()
+
+
+def _hold_settings(**overrides):
+    base = {"sms_agent_enabled": True, "sms_agent_test_leads_only": True, "test_mode": True,
+            "cadence_hold_after_text_hours": 24, "cadence_hold_after_text_test_minutes": 10}
+    return get_settings().model_copy(update={**base, **overrides})
+
+
+def test_texting_hold_skips_due_steps_with_its_own_reason():
+    """Emma's test (2026-11-13): no cadence call or text while the patient texts with Elliot."""
+    from datetime import timedelta
+
+    from rpt_agent.worker import TEXTING_HOLD_REASON, TEXTING_HOLD_SQL, skip_steps_held_by_texting
+
+    conn = _HoldConn()
+    assert skip_steps_held_by_texting(conn, _hold_settings()) == [{"id": 1}]
+    (sql, params), = conn.calls
+    assert sql == TEXTING_HOLD_SQL
+    assert params == {"reason": TEXTING_HOLD_REASON, "all_leads": False, "test_mode": True,
+                      "hold": timedelta(hours=24), "test_hold": timedelta(minutes=10)}
+    flat = " ".join(TEXTING_HOLD_SQL.split())
+    # Skipped (never sent later), only due planned steps, any lead on the phone, the patient's texts.
+    assert "set status='skipped'" in flat and "oe.status='planned' and oe.scheduled_for<=now()" in flat
+    assert "peer.phone_e164=l.phone_e164 and sm.direction='inbound'" in flat
+    # Pause, review, opt-outs, calls only and suppression keep their own rule and reason.
+    for rule in ("l.cadence_state='active'", "not l.needs_review", "not l.call_opt_out",
+                 "not l.sms_opt_out", "not l.sms_disabled", "suppressed_numbers"):
+        assert rule in flat
+
+
+@pytest.mark.parametrize("overrides", [
+    {"sms_agent_enabled": False},
+    {"cadence_hold_after_text_hours": 0, "cadence_hold_after_text_test_minutes": 0},
+])
+def test_no_texting_hold_without_elliot_or_when_set_to_zero(overrides):
+    from rpt_agent.worker import skip_steps_held_by_texting
+
+    conn = _HoldConn()
+    assert skip_steps_held_by_texting(conn, _hold_settings(**overrides)) == []
+    assert conn.calls == []
+
+
+def test_texting_hold_runs_before_the_claim_in_the_same_transaction(monkeypatch):
+    from contextlib import contextmanager
+
+    from rpt_agent import worker
+
+    conn = _HoldConn()
+
+    @contextmanager
+    def fake_transaction():
+        yield conn
+
+    monkeypatch.setattr(worker, "transaction", fake_transaction)
+    monkeypatch.setattr(worker, "get_settings", lambda: _hold_settings())
+    assert worker.claim_jobs(WorkflowTrace("worker", "test")) == []
+    sqls = [sql for sql, _ in conn.calls]
+    assert sqls.index(worker.TEXTING_HOLD_SQL) < sqls.index(worker.CLAIM_SQL)
+
+
+def test_settings_hold_defaults():
+    settings = Settings(_env_file=None)
+    assert settings.cadence_hold_after_text_hours == 24
+    assert settings.cadence_hold_after_text_test_minutes == 10

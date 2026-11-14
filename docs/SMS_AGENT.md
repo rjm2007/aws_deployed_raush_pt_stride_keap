@@ -446,7 +446,14 @@ lead replaced by a newer lead on the phone -> use the active lead · staff texte
 never for `is_test` leads) -> the `reply_limit` text once + one Needs Review card, then nothing that day
 (Emma's test 2026-11-11: 10 text parts over her test leads left her questions unanswered) · media only (MMS) ->
 `text_only` text · otherwise the agent. Declined / closed / link sent / cadence finished leads get the
-agent (owner). A patient's text does not pause the cadence yet (Emma decides; build it as a setting later).
+agent (owner).
+
+A patient's text holds the cadence (client's option A, Emma's test 2026-11-13): while Elliot answers the lead
+(`SMS_AGENT_ENABLED`, and `SMS_AGENT_TEST_LEADS_ONLY` off or a test lead), a call or cadence text that comes due
+within `CADENCE_HOLD_AFTER_TEXT_HOURS` (24) of the patient's last text to any lead on the phone is skipped, never
+sent later (`worker.skip_steps_held_by_texting`, just before the claim). Later steps go out on their normal times;
+each new text starts the hold again. `TEST_MODE` test leads use `CADENCE_HOLD_AFTER_TEXT_TEST_MINUTES` (10). 0 = off.
+Activity: "Call skipped: patient was texting with Elliot". The `call_in_progress` wait above is unchanged.
 
 Just before sending, `hard_stop` is checked again (opt-out, suppressed, calls only, staff texted). Two
 exceptions (owner, 2026-11-02): a booking made in this reply (`book` action with result BOOKED) always
