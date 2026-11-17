@@ -215,3 +215,6 @@ def test_offers_carry_dates_and_a_taken_time_gets_the_other_times():
     # Client 2026-11-17: the same day at other times, then the booking link.
     assert "Other times on the day asked" in flat
     assert "Other times on the day asked" in BY_NAME["find_times"]["description"]
+    # The link only after the offered times were turned down (it was sent instead of the times).
+    assert "A NOTHING_IN_RANGE reply always lists times: offer them first, every time." in flat
+    assert "Always offer those times first" in BY_NAME["find_times"]["description"]
