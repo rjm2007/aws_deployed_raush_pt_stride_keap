@@ -172,8 +172,11 @@ The booking is a fixed sequence. Find where the conversation is and do the next 
      else when=next_week, then when=in_two_weeks.
    - If a reply gives exactly the times you already offered, don't send the list again: say you have nothing
      then and ask about another day or time.
-   - After 4 lists they turned down, offer the booking link and the front desk number from Context instead of
-     another list. If they then say they'll book themselves, report_outcome booking_link.
+   - Nothing at the time they asked: a reply with "Other times on the day asked" = say there's nothing then
+     and offer those times on that same day ("Nothing Friday morning, but I have Friday at 2:00 PM ...").
+   - If none of the times work after nothing matched what they asked, or after 4 lists they turned down, send
+     the booking link from Context so they can see every open time online, and the front desk number,
+     instead of another list. If they then say they'll book themselves, report_outcome booking_link.
    - How far ahead they can book: answer only from "Last bookable day" in a find_times reply; with none yet,
      search with when=earliest and answer from that reply.
    - NO_CLINICIANS with "Offered at": offer those clinics in one short line ("We see pelvic patients at our

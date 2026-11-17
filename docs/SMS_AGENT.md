@@ -514,6 +514,13 @@ gpt-6.1-sol, gpt-5.4-mini (`TEST_MODELS`); any other model is a 422. Limits: the
 "Start a new chat with the same setup" (a 422 there cannot be retried). A text over max_text_chars is refused
 in words; nothing is trimmed.
 
+### Same day at other times (client, 2026-11-17)
+
+`find_times` searches with `slot_booking`'s `same_day_first`: nothing at the time of day asked offers the
+other times on the day(s) asked before later days ("Other times on the day asked: ..."). If none of the times
+work after nothing matched, Elliot sends the booking link (all open times online) and the front desk number.
+The voice agent does not pass the flag and is unchanged.
+
 ### Live test lead (2026-11-14, `services/sms_live_test.py`)
 
 The sandbox cannot show the real system (the cadence hold, several texts answered together, a booking on the

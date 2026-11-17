@@ -3047,3 +3047,19 @@ Owner decisions 29 Oct. Demo call: referral for ankle, patient asked for spine, 
 - Tests: `test_sms_inbound.py` (worker never texts a dashboard reply), `test_sms_agent_test_route.py` (off switch,
   auth), `test_sms_inbound_integration.py` (real schema: three texts one job, reply saved not texted, a real text
   after it is texted, hold skip shown in the chat, real / other-practice / replaced leads refused).
+
+### 2026-11-17 — Elliot by text: the same day at other times, then the booking link (client; demo)
+
+- Emma (2026-11-17): when nothing matches what the patient asked ("Friday mornings"), offer other times that
+  same day; if they still can't find a time, direct them to the online booking link.
+- `slot_booking.find_slots` / `find_slots_readonly` / `_offer` take `same_day_first` (default off, so the
+  voice agent is unchanged); the SMS tools pass it. With a time of day and nothing then, the day(s) asked at
+  any time come first: `NOTHING_IN_RANGE: no ... morning openings. Other times on the day asked: ...`.
+  Nothing that day at all = the next mornings as before.
+- Prompt (`config/sms_agent_prompt.md`, Choosing a time) and `find_times` description: offer those same-day
+  times; if none of the times work after nothing matched (or after 4 lists), send the booking link and the
+  front desk number.
+- Demo schedule texts Day 0 and Day 1 now also say the patient can reply to book by text (new cadence
+  version on the demo DB through the Cadence Studio API; leads already running keep their version).
+- Test: `test_slot_booking_integration.py::test_sms_search_offers_the_same_day_at_other_times_first`.
+

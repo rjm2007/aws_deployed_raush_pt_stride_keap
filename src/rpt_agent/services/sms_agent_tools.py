@@ -1024,7 +1024,8 @@ class LiveTools(_BaseTools):
                 self.trace, lead_id=self.lead_id, call_id=self.conversation, when=when,
                 specific_date=_parse_day(specific_date, "date"), month=_parse_day(month, "month"),
                 time_of_day=time_of_day, clinician_name=name, location_name=clinic,
-                case_type_name=service, settings=self.settings, providers=self.providers)
+                case_type_name=service, settings=self.settings, providers=self.providers,
+                same_day_first=True)
 
         output = search(therapist)
         if therapist and output.startswith("NO_SUCH_THERAPIST"):
@@ -1279,7 +1280,7 @@ class SandboxTools(_BaseTools):
             output = slot_booking.find_slots_readonly(
                 self.trace, conn, context, when=when,
                 specific_date=_parse_day(specific_date, "date"), month=_parse_day(month, "month"),
-                time_of_day=time_of_day, clinician_name=therapist)
+                time_of_day=time_of_day, clinician_name=therapist, same_day_first=True)
         return ToolResult(output, "find_times", f"Looked for times ({when}) in the real cache")
 
     def list_therapists(self, *, clinic: str | None = None) -> ToolResult:

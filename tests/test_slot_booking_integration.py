@@ -255,6 +255,27 @@ def test_find_windows_time_of_day_and_fallback(env, monkeypatch):
         env.find(lead, when="specific_date", specific_date=date(2026, 6, 1))
 
 
+def test_sms_search_offers_the_same_day_at_other_times_first(env):
+    # Client, 2026-11-17: nothing in the morning asked -> that same day's other times before later
+    # days; the voice agent (no same_day_first) keeps the next mornings.
+    open_days(env, c5981={DAY2: ["14:00:00"], DAY3: ["09:00:00"]})
+    env.sync()
+    lead = env.lead()
+    asked = date(2026, 6, 17)
+    sms = env.find(lead, call_id="sms-1", when="specific_date", specific_date=asked,
+                   time_of_day="morning", same_day_first=True)
+    assert sms.startswith("NOTHING_IN_RANGE: no ") and "morning openings" in sms
+    assert "Other times on the day asked:" in sms and "June 17" in sms and "2:00 PM" in sms
+    assert "June 22" not in sms
+    voice = env.find(lead, call_id="voice-1", when="specific_date", specific_date=asked,
+                     time_of_day="morning")
+    assert "Next openings:" in voice and "June 22" in voice and "June 17" not in voice
+    # Nothing at all that day: on to the next mornings as before.
+    empty = env.find(lead, call_id="sms-2", when="specific_date", specific_date=date(2026, 6, 18),
+                     time_of_day="morning", same_day_first=True)
+    assert "Other times on the day asked" not in empty and "June 22" in empty
+
+
 def test_find_uses_location_said_on_the_call_and_rejects_unknown_clinic(env):
     lead = env.lead(location_name="Dana Point")
     with pytest.raises(ValueError, match="UNKNOWN_LOCATION.*Laguna Niguel"):

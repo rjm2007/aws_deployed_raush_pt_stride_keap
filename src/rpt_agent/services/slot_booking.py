@@ -594,6 +594,7 @@ def find_slots(
     month: date | None = None,
     settings: Settings | None = None,
     providers: ProviderClients | None = None,
+    same_day_first: bool = False,
 ) -> str:
     settings = settings or get_settings()
     providers = providers or _fast_providers(settings)
@@ -614,10 +615,12 @@ def find_slots(
                                         min(search.end, _search_limit(context, search.end)))})
         stale = stale_chunks(context, needed)
         if not stale:
-            return _offer(trace, conn, context, call_key, search, time_of_day, clinician_name, when)
+            return _offer(trace, conn, context, call_key, search, time_of_day, clinician_name, when,
+                          same_day_first=same_day_first)
     refresh_cache(trace, context, providers, stale)
     with transaction() as conn:
-        return _offer(trace, conn, context, call_key, search, time_of_day, clinician_name, when)
+        return _offer(trace, conn, context, call_key, search, time_of_day, clinician_name, when,
+                      same_day_first=same_day_first)
 
 
 def find_slots_readonly(
@@ -630,6 +633,7 @@ def find_slots_readonly(
     time_of_day: str | None = None,
     clinician_name: str | None = None,
     month: date | None = None,
+    same_day_first: bool = False,
 ) -> str:
     """find_slots for the SMS agent's test chat: the same search and reply on the cached openings,
     but nothing is remembered and Stride is never called (the sandbox writes nothing)."""
@@ -639,7 +643,8 @@ def find_slots_readonly(
                      month=month, clinician_name=clinician_name)
     if isinstance(search, str):
         return search
-    return _offer(trace, conn, context, None, search, time_of_day, clinician_name, when)
+    return _offer(trace, conn, context, None, search, time_of_day, clinician_name, when,
+                  same_day_first=same_day_first)
 
 
 @dataclass
@@ -721,9 +726,13 @@ def _too_far_note(asked: str, booking_end: date) -> str:
 
 def _offer(
     trace: WorkflowTrace, conn, context: BookingContext, call_key: str | None, search: _Search,
-    time_of_day: str | None, clinician_name: str | None, when: str,
+    time_of_day: str | None, clinician_name: str | None, when: str, *, same_day_first: bool = False,
 ) -> str:
-    """The reply to a search; `call_key` None = read-only (the SMS test chat): nothing remembered."""
+    """The reply to a search; `call_key` None = read-only (the SMS test chat): nothing remembered.
+
+    `same_day_first` (SMS agent, client 2026-11-17): nothing at the time of day asked offers the
+    other times on the day(s) asked before any later day ("Friday mornings" -> Friday afternoon).
+    """
     start, end, pool, asked, moved = (search.start, search.end, search.pool, search.asked,
                                       search.moved)
     ids = [clinician["id"] for clinician in pool]
@@ -749,16 +758,18 @@ def _offer(
     # nearest times from today. Searching only after it said NO_OPENINGS when the asked day was
     # late in the window, or past it, although earlier days were open (QA 2026-10-22: Nov 26
     # asked, 35 days out; Thanksgiving, the last day).
-    tries = [] if too_far else [(end + timedelta(days=1), time_of_day, "Next")]
+    tries = [] if too_far else [(end + timedelta(days=1), horizon_end, time_of_day, "Next")]
+    if same_day_first and time_of_day and not too_far:
+        tries.insert(0, (start, min(end, horizon_end), None, "Same day"))
     if time_of_day and not too_far:
-        tries.append((start, None, "Next"))
-    tries.append((today, time_of_day, "Nearest"))
+        tries.append((start, horizon_end, None, "Next"))
+    tries.append((today, horizon_end, time_of_day, "Nearest"))
     if time_of_day:
-        tries.append((today, None, "Nearest"))
+        tries.append((today, horizon_end, None, "Nearest"))
     later: list[dict[str, Any]] = []
-    for since, wanted_time, label in tries:
-        if since <= horizon_end:
-            later = search_slots(conn, context, start=since, end=horizon_end, clinician_ids=ids,
+    for since, until, wanted_time, label in tries:
+        if since <= until:
+            later = search_slots(conn, context, start=since, end=until, clinician_ids=ids,
                                  time_of_day=wanted_time)
         if later:
             break
@@ -774,6 +785,11 @@ def _offer(
         return (
             f"NOTHING_IN_RANGE: {note}Tell the caller that, then offer the nearest openings for "
             f"{where}{who}: {_offer_text(later)}. {BOOK_HINT}{limits}"
+        )
+    if label == "Same day":
+        return (
+            f"NOTHING_IN_RANGE: no {where}{who} {time_of_day} openings{moved}. "
+            f"Other times on the day asked: {_offer_text(later)}. {BOOK_HINT}{limits}"
         )
     if label == "Nearest":
         return (
