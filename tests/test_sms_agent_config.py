@@ -203,3 +203,15 @@ def test_tool_descriptions_explain_the_codes_the_code_replies(name, codes):
         assert re.search(rf"\b{code}\b", BY_NAME[name]["description"]), (name, code)
     if name == "flag_emergency":
         assert "ALREADY_HANDED_OFF" not in BY_NAME[name]["description"]
+
+
+def test_offers_carry_dates_and_a_taken_time_gets_the_other_times():
+    # Browser test 2026-11-17: "Thursday at 6:00 PM" was next week's Thursday, and a NOT_AVAILABLE
+    # pick was handed to the front desk instead of offering the other times.
+    flat = " ".join(PROMPT.split())
+    assert "Every offered time carries its date, never a day name alone" in flat
+    assert "confirm_visit NOT_AVAILABLE or TAKEN = say that time isn't open and offer the other times" in flat
+    assert "never a hand_off for it" in BY_NAME["confirm_visit"]["description"]
+    # Client 2026-11-17: the same day at other times, then the booking link.
+    assert "Other times on the day asked" in flat
+    assert "Other times on the day asked" in BY_NAME["find_times"]["description"]
